@@ -10,8 +10,7 @@ from .spec import ModelSpec
 from ..data.asset import Asset
 
 def get_random_indices(n, m):
-    if m is None or m <= 0 or m >= n:
-        return None
+    assert m < n
     idx = np.random.permutation(n)[:m]
     return jt.array(idx).int32()
 
@@ -22,93 +21,83 @@ class VelocityModule(ModelSpec):
         
         cfg = self.model_config
         # geometry
-        self.attention_knn = cfg.get('attention_knn', cfg.get('frame_knn', 16))
-        self.input_dim = cfg.get('input_dim', 3)
-        self.input_expand_dim = cfg.get('input_expand_dim', 128)
-        self.feat_embedding_dim = cfg['feat_embedding_dim']
-        self.attention_blocks = cfg.get('attention_blocks', 4)
-        self.attention_weight_init = cfg.get('attention_weight_init', 1.0)
-        self.relative_position_bias_hidden_dim = cfg.get(
-            'relative_position_bias_hidden_dim',
-            32,
-        )
-        self.decoder_hidden_dim = cfg['decoder_hidden_dim']
-        
-        # patch-based prediction
-        self.predict_rounds = cfg.get('predict_rounds', 1)
-        self.denoise_num_steps = cfg.get('denoise_num_steps', 1)
-        self.predict_patch_size = cfg.get('predict_patch_size', 1000)
-        self.predict_seed_k = cfg.get('predict_seed_k', 6)
-        self.predict_seed_k_alpha = cfg.get('predict_seed_k_alpha', 1)
+        self.frame_knn = cfg['frame_knn']
+        self.num_train_points = cfg['num_train_points']
         
         # score-matching
         self.dsm_sigma = cfg['dsm_sigma']
-        self.num_train_points = cfg.get('num_train_points', 0)
         
         # networks
         self.encoder = FeatureExtraction(
-            knn_scales=self.attention_knn,
-            input_dim=self.input_dim,
-            input_expand_dim=self.input_expand_dim,
-            embedding_dim=self.feat_embedding_dim,
-            num_blocks=self.attention_blocks,
-            attention_weight_init=self.attention_weight_init,
-            relative_position_bias_hidden_dim=self.relative_position_bias_hidden_dim,
+            k=self.frame_knn,
+            input_dim=3,
+            embedding_dim=cfg['feat_embedding_dim']
         )
         
         self.decoder = Decoder(
             z_dim=self.encoder.embedding_dim,
+            dim=3,
             out_dim=3,
-            hidden_size=self.decoder_hidden_dim,
+            hidden_size=cfg['decoder_hidden_dim'],
         )
     
-    def predict_displacement(self, pc_noisy, point_idx=None):
+    def get_supervised_loss(self, pc_noisy, pc_mix, pc_clean):
         """
-        pc_noisy: (B, N, 3)
-        point_idx: optional point indices decoded after full-patch encoding
-        return:   (B, N, 3) or (B, M, 3)
+        pcl_noisy: (B, N, 3)
+        pcl_clean: (B, N, 3)
         """
-        B, N, d = pc_noisy.shape
-        feat = self.encoder(pc_noisy)  # (B, N, 256)
-        if point_idx is not None:
-            feat = feat[:, point_idx, :]
-        N_out = feat.shape[1]
+        B, N_noisy, d = pc_mix.shape
+        
+        pnt_idx = get_random_indices(N_noisy, self.num_train_points)
+        
+        # Feature extraction
+        feat = self.encoder(pc_mix)  # (B, N, F)
         F_dim = feat.shape[2]
-        return self.decoder(feat.reshape(-1, F_dim)).reshape(B, N_out, d)
-    
-    def get_supervised_loss(self, pc_noisy, pc_clean):
-        """
-        pc_noisy: (B, N, 3)
-        pc_clean: (B, N, 3)
-        """
-        target = pc_clean - pc_noisy
-        point_idx = get_random_indices(pc_noisy.shape[1], self.num_train_points)
-        if point_idx is not None:
-            target = target[:, point_idx, :]
-        pred_dir = self.predict_displacement(pc_noisy, point_idx=point_idx)
-        loss = (((pred_dir - target) ** 2.0) / self.dsm_sigma).sum(dim=-1).mean()
+        
+        # gather
+        feat = feat[:, pnt_idx, :]
+        pc_noisy = pc_noisy[:, pnt_idx, :]
+        pc_mix = pc_mix[:, pnt_idx, :]
+        pc_clean = pc_clean[:, pnt_idx, :]
+        
+        # target
+        grad_dir_t_target = pc_clean - pc_noisy
+        
+        # decoder
+        pred_dir = self.decoder(
+            c=feat.reshape(-1, F_dim)
+        ).reshape(B, len(pnt_idx), d) # type: ignore
+        
+        loss = (((pred_dir - grad_dir_t_target) ** 2.0) / self.dsm_sigma).sum(dim=-1).mean()
         
         return loss
 
-    def denoise_langevin_dynamics(self, pcl_noisy, num_steps=None):
+    def denoise_langevin_dynamics(self, pcl_noisy, num_steps: int=4):
         """
         pcl_noisy: (B, N, 3)
         """
-        if num_steps is None:
-            num_steps = self.denoise_num_steps
+        B, N, d = pcl_noisy.shape
         with jt.no_grad():
             pcl_next = pcl_noisy.clone()
             for it in range(num_steps):
-                pred_dir = self.predict_displacement(pcl_next)
+                feat = self.encoder(pcl_next)  # (B, N, F)
+                F_dim = feat.shape[2]
+                
+                pred_dir = self.decoder(
+                    c=feat.reshape(-1, F_dim)
+                ).reshape(B, N, d)
+                
                 pcl_next = pcl_next + (1.0 / num_steps) * pred_dir
         return pcl_next, None
     
     def training_step(self, batch: Dict) -> Dict:
         patch_size = batch['pc_noisy'].shape[-2]
         pc_noisy = batch['pc_noisy'].reshape(-1, patch_size, 3)
+        pc_mix = batch['pc_mix'].reshape(-1, patch_size, 3)
         pc_clean = batch['pc_clean'].reshape(-1, patch_size, 3)
         loss = self.get_supervised_loss(
             pc_noisy=pc_noisy,
+            pc_mix=pc_mix,
             pc_clean=pc_clean,
         )
         return {"loss": loss}
@@ -121,16 +110,17 @@ class VelocityModule(ModelSpec):
         pc_noisy_batch = batch['pc_noisy']
         assert pc_noisy_batch.ndim == 3
         
+        num_steps = 1
         res = []
         for i, pc_noisy in enumerate(pc_noisy_batch):
             pc_next = pc_noisy
-            for it in range(self.predict_rounds):
+            for it in range(num_steps):
                 pc_next = patch_based_denoise(
                     model=self,
                     pcl_noisy=pc_next,
-                    patch_size=self.predict_patch_size,
-                    seed_k=self.predict_seed_k,
-                    seed_k_alpha=self.predict_seed_k_alpha,
+                    patch_size=1000,
+                    seed_k=6,
+                    seed_k_alpha=1,
                 )
             pc_denoised = pc_next.detach().numpy()
             res.append({"pc_denoised": pc_denoised})
@@ -141,13 +131,11 @@ class VelocityModule(ModelSpec):
         for b in batch:
             if not self.is_predict():
                 assert b.meta is not None
-                item = {
+                res.append({
                     "pc_noisy": b.meta['pc_noisy'], # (num_patches, patch_size, 3)
                     "pc_clean": b.meta['pc_clean'],
-                }
-                if 'patch_seed' in b.meta:
-                    item["patch_seed"] = b.meta['patch_seed']
-                res.append(item)
+                    "pc_mix": b.meta['pc_mix'],
+                })
             else:
                 d = {
                     "pc_noisy": b.sampled_vertices_noisy, # (N, 3)
@@ -210,13 +198,16 @@ def patch_based_denoise(model: VelocityModule, pcl_noisy, patch_size=1000, seed_
     """
     assert len(pcl_noisy.shape) == 2
     
-    N, _ = pcl_noisy.shape
+    N, d = pcl_noisy.shape
     num_patches = int(seed_k * N / patch_size)
     pcl_noisy = pcl_noisy.unsqueeze(0)  # (1, N, 3)
     
-    seed_pnts, _ = farthest_point_sampling(pcl_noisy, num_patches)
+    seed_pnts, seed_idx = farthest_point_sampling(pcl_noisy, num_patches)
     patch_dists, point_idxs, patches = knn_points(seed_pnts, pcl_noisy, patch_size)
-
+    
+    from ..data.asset import Exporter
+    pts = patches[0].reshape(-1, 3).detach().numpy()
+    
     patches = patches[0]              # (P, M, 3)
     patch_dists = patch_dists[0]      # (P, M)
     point_idxs = point_idxs[0]        # (P, M)

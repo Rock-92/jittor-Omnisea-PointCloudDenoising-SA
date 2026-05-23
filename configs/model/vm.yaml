@@ -14,6 +14,7 @@ decoder_hidden_dim: 64
 
 # Loss
 dsm_sigma: 0.01
+num_train_points: 256
 
 # Patch-based prediction
 predict_rounds: 1

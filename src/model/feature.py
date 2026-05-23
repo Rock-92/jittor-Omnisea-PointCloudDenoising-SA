@@ -94,11 +94,12 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
         self.rel_pos_bias = RelativePositionBias(relative_position_bias_hidden_dim)
         self.out_proj = nn.Linear(dim * len(knn_scales), dim)
 
-    def execute(self, x, xyz, knn_idx):
+    def execute(self, x, xyz, graph_knn_idx):
         """
         x:       (B, N, C), point features.
         xyz:     (B, N, 3), noisy point coordinates for relative position bias.
-        knn_idx: (B, N, max(knn_scales)), neighbor indices sorted by distance.
+        graph_knn_idx: (B, N, max(knn_scales)), neighbor indices used for
+            attention neighbors and relative-position bias.
         """
         x_norm = self.norm(x)
         q = apply_point_linear(self.q_proj, x_norm)
@@ -107,7 +108,7 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
 
         scale_outputs = []
         for scale_k in self.knn_scales:
-            idx = knn_idx[:, :, :scale_k]
+            idx = graph_knn_idx[:, :, :scale_k]
             k_neighbors = gather_neighbors(k, idx)
             v_neighbors = gather_neighbors(v, idx)
             xyz_neighbors = gather_neighbors(xyz, idx)
@@ -181,16 +182,22 @@ class FeatureExtraction(nn.Module):
         x: (B, N, 3)
         return: (B, N, 256)
         """
-        knn_idx = get_knn_idx(x, x, self.max_knn, offset=1)
-
         feat = apply_point_linear(self.input_proj_1, x)
         feat = self.act(feat)
         feat = apply_point_linear(self.input_proj_2, feat)
         feat = self.act(feat)
 
         block_outputs = []
-        for block, weight in zip(self.blocks, self.block_weights):
-            feat = block(feat, x, knn_idx)
+        reuse_knn_idx = None
+        for block_idx, (block, weight) in enumerate(zip(self.blocks, self.block_weights)):
+            if block_idx == 0:
+                graph_knn_idx = get_knn_idx(x, x, self.max_knn, offset=1)
+            elif block_idx == 1:
+                graph_knn_idx = get_knn_idx(feat, feat, self.max_knn, offset=1)
+                reuse_knn_idx = graph_knn_idx
+            else:
+                graph_knn_idx = reuse_knn_idx
+            feat = block(feat, x, graph_knn_idx)
             block_outputs.append(feat * weight)
 
         feat = jt.concat(block_outputs, dim=-1)
