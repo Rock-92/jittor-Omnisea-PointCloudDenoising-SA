@@ -3,7 +3,7 @@ loader: &loader obj
 
 train_dataset:
   shuffle: True
-  batch_size: 16
+  batch_size: 64
   num_workers: 0
   datapath:
     input_dataset_dir: ./dataset_clean
