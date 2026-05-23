@@ -126,10 +126,13 @@ class VelocityModule(ModelSpec):
         for b in batch:
             if not self.is_predict():
                 assert b.meta is not None
-                res.append({
+                item = {
                     "pc_noisy": b.meta['pc_noisy'], # (num_patches, patch_size, 3)
                     "pc_clean": b.meta['pc_clean'],
-                })
+                }
+                if 'patch_seed' in b.meta:
+                    item["patch_seed"] = b.meta['patch_seed']
+                res.append(item)
             else:
                 d = {
                     "pc_noisy": b.sampled_vertices_noisy, # (N, 3)

@@ -3,6 +3,7 @@ from jittor import optim
 from typing import Dict, List, Optional
 from tqdm import tqdm
 
+import json
 import jittor as jt
 import os
 
@@ -65,6 +66,10 @@ class DummySystem():
             self.optimizer = None
         
         self._validation_loss = defaultdict(list)
+        self._validation_scores = defaultdict(list)
+        self.best_epoch = None
+        self.best_validation_loss = float("inf")
+        self.best_validation_score = float("-inf")
     
     def forward(self, batch, validate: bool=False): # return loss sum
         loss_dict = self.model.training_step(batch)
@@ -110,8 +115,12 @@ class DummySystem():
     def on_train_epoch_end(self):
         pass
     
+    def on_train_end(self):
+        pass
+    
     def on_validation_epoch_start(self):
         self._validation_loss = defaultdict(list)
+        self._validation_scores = defaultdict(list)
     
     def on_validation_batch_start(self):
         pass
@@ -120,11 +129,133 @@ class DummySystem():
         assert self.loss_config is not None, "do not have loss_confing"
         return self.forward(batch, validate=True)
     
+    def validation_metric_step(self, batch):
+        return None
+    
+    def record_validation_scores(self, metrics):
+        if metrics is None:
+            return
+        if isinstance(metrics, dict):
+            metrics = [metrics]
+        for metric in metrics:
+            for name, value in metric.items():
+                if value is None:
+                    continue
+                self._validation_scores[name].append(float(_get_item(value)))
+    
     def on_validation_batch_end(self):
         pass
     
     def on_validation_epoch_end(self):
         pass
+    
+    def get_validation_loss_sum(self):
+        loss_values = []
+        for name, values in self._validation_loss.items():
+            if name.endswith("_loss_sum"):
+                loss_values.extend(values)
+        if len(loss_values) == 0:
+            return None
+        return sum(loss_values) / len(loss_values)
+    
+    def get_validation_score_summary(self):
+        if len(self._validation_scores) == 0:
+            return None
+        summary = {
+            name: sum(values) / len(values)
+            for name, values in self._validation_scores.items()
+            if len(values) > 0
+        }
+        if "cd_score" in summary and "p2s_score" in summary:
+            summary["final_score"] = (
+                0.5 * summary["cd_score"] + 0.5 * summary["p2s_score"]
+            )
+        elif "cd_score" in summary:
+            summary["final_score"] = summary["cd_score"]
+        return summary
+    
+    def log_validation_epoch(self, epoch, validation_loss, score_summary):
+        loss_text = (
+            "nan" if validation_loss is None else f"{validation_loss:.8f}"
+        )
+        if score_summary is None or "final_score" not in score_summary:
+            print(f"Epoch {epoch} validation loss={loss_text}")
+            return
+        print(
+            f"Epoch {epoch} validation: "
+            f"loss={loss_text}, "
+            f"CD score={score_summary.get('cd_score', 0.0):.4f}, "
+            f"P2S score={score_summary.get('p2s_score', 0.0):.4f}, "
+            f"Final score={score_summary['final_score']:.4f}, "
+            f"CD pred={score_summary.get('cd_pred', 0.0):.8f}, "
+            f"CD noisy={score_summary.get('cd_noisy', 0.0):.8f}, "
+            f"P2S pred={score_summary.get('p2s_pred', 0.0):.8f}, "
+            f"P2S noisy={score_summary.get('p2s_noisy', 0.0):.8f}"
+        )
+    
+    def save_best_checkpoint(self, epoch, validation_loss, score_summary=None):
+        validation_score = None
+        if score_summary is not None:
+            validation_score = score_summary.get("final_score")
+        if validation_score is not None:
+            if validation_score < self.best_validation_score:
+                return
+            if (
+                validation_score == self.best_validation_score
+                and (
+                    validation_loss is None
+                    or validation_loss >= self.best_validation_loss
+                )
+            ):
+                return
+        elif validation_loss is not None:
+            if validation_loss >= self.best_validation_loss:
+                return
+        else:
+            return
+        
+        self.best_epoch = epoch
+        if validation_loss is not None:
+            self.best_validation_loss = validation_loss
+        if validation_score is not None:
+            self.best_validation_score = validation_score
+        os.makedirs(self.ckpt_save_dir, exist_ok=True)
+        
+        checkpoint_path = os.path.join(
+            self.ckpt_save_dir,
+            f"{self.ckpt_save_name}_best.pkl",
+        )
+        metadata_path = os.path.join(
+            self.ckpt_save_dir,
+            f"{self.ckpt_save_name}_best.json",
+        )
+        self.model.save(checkpoint_path)
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "best_epoch": self.best_epoch,
+                    "validation_loss": self.best_validation_loss,
+                    "validation_score": (
+                        None
+                        if self.best_validation_score == float("-inf")
+                        else self.best_validation_score
+                    ),
+                    "selection_metric": (
+                        "max_final_score"
+                        if validation_score is not None
+                        else "min_validation_loss"
+                    ),
+                    "checkpoint": checkpoint_path,
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+        print(
+            f"Saved best checkpoint: epoch={self.best_epoch}, "
+            f"validation_loss={self.best_validation_loss}, "
+            f"validation_score={validation_score}"
+        )
     
     def on_before_optimizer_step(self, optimizer):
         pass
@@ -174,6 +305,9 @@ class DummySystem():
                         for batch in pbar:
                             self.on_validation_batch_start()
                             loss = self.validation_step(batch)
+                            self.record_validation_scores(
+                                self.validation_metric_step(batch)
+                            )
                             pbar.set_description(f"Epoch {epoch}, Validate {name}, Loss: {_get_item(loss)}")
                             self.on_validation_batch_end()
                 else:
@@ -181,13 +315,21 @@ class DummySystem():
                     for batch in pbar:
                         self.on_validation_batch_start()
                         loss = self.validation_step(batch)
+                        self.record_validation_scores(
+                            self.validation_metric_step(batch)
+                        )
                         pbar.set_description(f"Epoch {epoch}, Validate, Loss: {_get_item(loss)}")
                         self.on_validation_batch_end()
                 self.on_validation_epoch_end()
+                validation_loss = self.get_validation_loss_sum()
+                score_summary = self.get_validation_score_summary()
+                self.log_validation_epoch(epoch, validation_loss, score_summary)
+                self.save_best_checkpoint(epoch, validation_loss, score_summary)
             
             checkpoint_path = os.path.join(self.ckpt_save_dir, f'{self.ckpt_save_name}_{epoch}.pkl')
             os.makedirs(self.ckpt_save_dir, exist_ok=True)
             self.model.save(checkpoint_path)
+        self.on_train_end()
     
     def predict(self):
         # only iterate once
@@ -206,3 +348,5 @@ class DummySystem():
                 if self.writer is not None:
                     self.writer.write(batch, output, dataset_module=self.dataset_module)
                 pbar.set_description(f"Predicting {dataloader_name}, Batch {batch_idx}")
+                self.on_predict_batch_end()
+        self.on_predict_epoch_end()

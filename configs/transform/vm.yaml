@@ -38,4 +38,4 @@ validate_transform: &validate_transform
       patch_size: 1000
       num_patches: 1
 
-predict_transform: *validate_transform
+predict_transform: {}

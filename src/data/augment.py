@@ -61,6 +61,10 @@ class AugmentNormalizePC(Augment):
         center = (p_max + p_min) / 2
         pc = pc - center
         scale = np.sqrt((pc**2).sum(axis=1).max()).max()
+        if asset.meta is None:
+            asset.meta = {}
+        asset.meta['normalize_center'] = center
+        asset.meta['normalize_scale'] = scale
         asset.sampled_vertices = pc / scale
 
 @dataclass(frozen=True)
@@ -159,6 +163,7 @@ class AugmentPatch(Augment):
             asset.meta = {}
         asset.meta['pc_noisy'] = pat_A
         asset.meta['pc_clean'] = pat_B
+        asset.meta['patch_seed'] = seed_points
 
 def get_augments(*args) -> List[Augment]:
     MAP = {

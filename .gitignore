@@ -16,6 +16,10 @@ dataset_train.tar.gz
 dataset_test_noisy.zip
 dataset_clean.tar.gz
 test_noisy.zip
+*.tar
+*.tar.gz
+*.tgz
+*.zip
 
 # Model/data artifacts
 *.log
