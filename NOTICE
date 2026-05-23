@@ -1,0 +1,4 @@
+This repository is a Jittor point cloud denoising competition baseline.
+
+Third-party libraries used by the project are listed in `requirements.txt`.
+Datasets and pretrained checkpoints are not included in this repository.

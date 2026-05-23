@@ -1,0 +1,31 @@
+# Runtime outputs
+outputs/*
+!outputs/.gitkeep
+experiments/
+tmp_predict/
+results/
+result.zip
+
+# Datasets and ground truth
+dataset_train/
+dataset_test_noisy/
+test_gt/
+dataset_train.tar.gz
+dataset_test_noisy.zip
+
+# Model/data artifacts
+*.log
+*.pkl
+*.pt
+*.ckpt
+*.npz
+*.npy
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# OS and IDE files
+.DS_Store
+.idea/
