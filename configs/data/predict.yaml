@@ -3,7 +3,7 @@ predict_dataset:
   batch_size: 1
   num_workers: 8
   datapath:
-    input_dataset_dir: ./dataset_test_noisy
+    input_dataset_dir: ./test_noisy
     use_prob: False
     loader: npy
     data_name: noisy.npy

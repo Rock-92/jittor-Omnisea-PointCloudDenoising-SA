@@ -6,7 +6,7 @@ point clouds.
 Expected training data layout:
 
 ```text
-dataset_train/
+dataset_clean/
   shapenet/
     <synset_id>/
       <model_id>/
@@ -17,7 +17,7 @@ dataset_train/
 Expected test data layout:
 
 ```text
-dataset_test_noisy/
+test_noisy/
   shapenet/
     <synset_id>/
       <model_id>/

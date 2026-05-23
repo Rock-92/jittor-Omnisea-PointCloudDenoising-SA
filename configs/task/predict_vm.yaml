@@ -10,5 +10,5 @@ components:
 
 writer:
   __target__: vm
-  save_dir: outputs/results/dataset_test_noisy
+  save_dir: outputs/results/test_noisy
   save_name: denoised

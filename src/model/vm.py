@@ -15,12 +15,16 @@ class VelocityModule(ModelSpec):
         
         cfg = self.model_config
         # geometry
-        self.frame_knn = cfg['frame_knn']
+        self.attention_knn = cfg.get('attention_knn', cfg.get('frame_knn', 16))
         self.input_dim = cfg.get('input_dim', 3)
         self.input_expand_dim = cfg.get('input_expand_dim', 128)
         self.feat_embedding_dim = cfg['feat_embedding_dim']
         self.attention_blocks = cfg.get('attention_blocks', 4)
         self.attention_weight_init = cfg.get('attention_weight_init', 1.0)
+        self.relative_position_bias_hidden_dim = cfg.get(
+            'relative_position_bias_hidden_dim',
+            32,
+        )
         self.decoder_hidden_dim = cfg['decoder_hidden_dim']
         
         # patch-based prediction
@@ -35,12 +39,13 @@ class VelocityModule(ModelSpec):
         
         # networks
         self.encoder = FeatureExtraction(
-            k=self.frame_knn,
+            knn_scales=self.attention_knn,
             input_dim=self.input_dim,
             input_expand_dim=self.input_expand_dim,
             embedding_dim=self.feat_embedding_dim,
             num_blocks=self.attention_blocks,
             attention_weight_init=self.attention_weight_init,
+            relative_position_bias_hidden_dim=self.relative_position_bias_hidden_dim,
         )
         
         self.decoder = Decoder(

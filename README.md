@@ -20,12 +20,19 @@ python -m pip install -r requirements.txt
 pip install point-cloud-utils
 ```
 
+如果使用 conda，可以直接从 `environment.yml` 创建同名环境：
+
+```bash
+conda env create -f environment.yml
+conda activate jittor
+```
+
 ## 数据准备
 
 训练数据放在项目根目录下，结构如下：
 
 ```text
-dataset_train/
+dataset_clean/
   shapenet/
     <synset_id>/
       <model_id>/
@@ -36,7 +43,7 @@ dataset_train/
 测试数据结构如下：
 
 ```text
-dataset_test_noisy/
+test_noisy/
   shapenet/
     <synset_id>/
       <model_id>/
@@ -106,7 +113,7 @@ python scripts/infer.py --seed 123
 默认输出：
 
 ```text
-outputs/results/dataset_test_noisy/
+outputs/results/test_noisy/
   shapenet/
     <synset_id>/
       <model_id>/
@@ -116,7 +123,7 @@ outputs/results/dataset_test_noisy/
 打包提交：
 
 ```bash
-cd outputs/results/dataset_test_noisy
+cd outputs/results/test_noisy
 zip -r ../../../result.zip shapenet/
 ```
 
@@ -126,10 +133,10 @@ zip -r ../../../result.zip shapenet/
 
 ```bash
 python scripts/evaluate.py \
-  --pred_dir outputs/results/dataset_test_noisy \
+  --pred_dir outputs/results/test_noisy \
   --gt_dir test_gt \
-  --noisy_dir dataset_test_noisy \
-  --mesh_dir dataset_train \
+  --noisy_dir test_noisy \
+  --mesh_dir dataset_clean \
   --workers 8
 ```
 

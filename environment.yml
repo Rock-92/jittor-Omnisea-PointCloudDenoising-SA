@@ -1,0 +1,12 @@
+name: jittor
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - gcc=10
+  - gxx=10
+  - libgomp
+  - pip
+  - pip:
+      - -r requirements.txt

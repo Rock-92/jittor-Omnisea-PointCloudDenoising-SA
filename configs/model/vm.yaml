@@ -1,12 +1,13 @@
 __target__: VelocityModule
 
 # Encoder
-frame_knn: 16
+attention_knn: [8, 16, 32, 64]
 input_dim: 3
 input_expand_dim: 128
 feat_embedding_dim: 256
 attention_blocks: 4
 attention_weight_init: [1.0, 0.6, 0.3, 0.3]
+relative_position_bias_hidden_dim: 32
 
 # Decoder
 decoder_hidden_dim: 64

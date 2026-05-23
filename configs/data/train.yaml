@@ -6,7 +6,7 @@ train_dataset:
   batch_size: 16
   num_workers: 8
   datapath:
-    input_dataset_dir: ./dataset_train
+    input_dataset_dir: ./dataset_clean
     use_prob: True
     num_files: 10000
     loader: *loader
@@ -22,7 +22,7 @@ validate_dataset:
   batch_size: 1
   num_workers: 8
   datapath:
-    input_dataset_dir: ./dataset_train
+    input_dataset_dir: ./dataset_clean
     use_prob: False
     loader: *loader
     data_name: *data_name

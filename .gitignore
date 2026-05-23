@@ -9,9 +9,13 @@ result.zip
 # Datasets and ground truth
 dataset_train/
 dataset_test_noisy/
+dataset_clean/
+test_noisy/
 test_gt/
 dataset_train.tar.gz
 dataset_test_noisy.zip
+dataset_clean.tar.gz
+test_noisy.zip
 
 # Model/data artifacts
 *.log
