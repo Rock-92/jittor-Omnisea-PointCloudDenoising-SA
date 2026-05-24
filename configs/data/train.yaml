@@ -3,7 +3,7 @@ loader: &loader clean_npy
 
 train_dataset:
   shuffle: True
-  batch_size: 64
+  batch_size: 16
   num_workers: 8
   datapath:
     input_dataset_dir: ./cache_clean_points
