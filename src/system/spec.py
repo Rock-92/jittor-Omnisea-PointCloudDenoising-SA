@@ -3,6 +3,7 @@ from jittor import optim
 from typing import Dict, List, Optional
 from tqdm import tqdm
 
+import csv
 import json
 import jittor as jt
 import numpy as np
@@ -70,6 +71,8 @@ class DummySystem():
         self.ckpt_save_dir = ckpt_save_dir
         self.ckpt_save_name = ckpt_save_name
         self.writer = writer
+        self.run_dir = None
+        self._epoch_metric_records = []
         if trainer_config is None:
             trainer_config = {}
         self.epochs = trainer_config.get('epochs', 1)
@@ -79,11 +82,16 @@ class DummySystem():
         else:
             self.optimizer = None
         
+        self._train_loss = defaultdict(list)
         self._validation_loss = defaultdict(list)
         self._validation_scores = defaultdict(list)
+        self._last_train_loss_dict = {}
         self.best_epoch = None
         self.best_validation_loss = float("inf")
         self.best_validation_score = float("-inf")
+
+    def set_run_dir(self, run_dir: str):
+        self.run_dir = run_dir
     
     def forward(self, batch, validate: bool=False): # return loss sum
         batch = _to_jittor(batch)
@@ -107,6 +115,7 @@ class DummySystem():
                 if self.loss_config[name] > 0:
                     loss_sum += self.loss_config[name] * loss_dict[name]
             loss_dict['loss_sum'] = loss_sum
+            self._last_train_loss_dict = loss_dict.copy()
             # TODO: log
             # # add train prefix to loss_dict
             # prefixed_loss_dict = {f"train/{k}": v for k, v in loss_dict.items()}
@@ -116,7 +125,7 @@ class DummySystem():
         return loss_sum
     
     def on_train_epoch_start(self):
-        pass
+        self._train_loss = defaultdict(list)
     
     def on_train_batch_start(self):
         pass
@@ -163,6 +172,18 @@ class DummySystem():
     
     def on_validation_epoch_end(self):
         pass
+
+    def record_train_losses(self, loss_dict):
+        for name, value in loss_dict.items():
+            if value is None:
+                continue
+            self._train_loss[f"train/{name}"].append(float(_get_item(value)))
+
+    def get_train_loss_sum(self):
+        values = self._train_loss.get("train/loss_sum", [])
+        if len(values) == 0:
+            return None
+        return sum(values) / len(values)
     
     def get_validation_loss_sum(self):
         loss_values = []
@@ -207,6 +228,36 @@ class DummySystem():
             f"P2S pred={score_summary.get('p2s_pred', 0.0):.8f}, "
             f"P2S noisy={score_summary.get('p2s_noisy', 0.0):.8f}"
         )
+
+    def log_epoch_metrics(self, epoch, train_loss=None, validation_loss=None, score_summary=None):
+        if self.run_dir is None:
+            return
+        os.makedirs(self.run_dir, exist_ok=True)
+        if score_summary is None:
+            score_summary = {}
+        record = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": validation_loss,
+            "cd_score": score_summary.get("cd_score"),
+            "p2s_score": score_summary.get("p2s_score"),
+            "final_score": score_summary.get("final_score"),
+        }
+
+        self._epoch_metric_records.append(record)
+        fieldnames = [
+            "epoch",
+            "train_loss",
+            "val_loss",
+            "cd_score",
+            "p2s_score",
+            "final_score",
+        ]
+        csv_path = os.path.join(self.run_dir, "epoch_log.csv")
+        with open(csv_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(self._epoch_metric_records)
     
     def save_best_checkpoint(self, epoch, validation_loss, score_summary=None):
         validation_score = None
@@ -309,11 +360,15 @@ class DummySystem():
                 pbar.set_description(f"Epoch {epoch}, Loss: {_get_item(loss)}")
                 self.on_before_optimizer_step(self.optimizer)
                 self.optimizer.step()
+                self.record_train_losses(self._last_train_loss_dict)
                 self.on_train_batch_end()
             self.on_train_epoch_end()
+            train_loss = self.get_train_loss_sum()
             
             self.model.eval()
             validate_dataloader = self.dataset_module.validate_dataloader()
+            validation_loss = None
+            score_summary = None
             if validate_dataloader is not None:
                 self.on_validation_epoch_start()
                 if isinstance(validate_dataloader, dict):
@@ -344,6 +399,7 @@ class DummySystem():
                 score_summary = self.get_validation_score_summary()
                 self.log_validation_epoch(epoch, validation_loss, score_summary)
                 self.save_best_checkpoint(epoch, validation_loss, score_summary)
+            self.log_epoch_metrics(epoch, train_loss, validation_loss, score_summary)
             
             checkpoint_path = os.path.join(self.ckpt_save_dir, f'{self.ckpt_save_name}_{epoch}.pkl')
             os.makedirs(self.ckpt_save_dir, exist_ok=True)

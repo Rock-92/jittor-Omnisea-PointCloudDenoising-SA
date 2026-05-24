@@ -189,6 +189,8 @@ def main(argv: Optional[List[str]] = None):
         system = None
 
     run_dir = save_run_metadata(mode=mode, seed=args.seed)
+    if system is not None:
+        system.set_run_dir(run_dir)
     print(f"\033[92msaved run metadata: {run_dir}\033[0m")
 
     if mode == "debug":
