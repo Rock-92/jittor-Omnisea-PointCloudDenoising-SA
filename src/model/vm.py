@@ -39,6 +39,7 @@ class VelocityModule(ModelSpec):
         self.denoise_num_steps = cfg.get('denoise_num_steps', 1)
         self.predict_patch_size = cfg.get('predict_patch_size', 1000)
         self.predict_seed_k = cfg.get('predict_seed_k', 6)
+        self.predict_seed_interval = cfg.get('predict_seed_interval', 200)
         self.predict_seed_k_alpha = cfg.get('predict_seed_k_alpha', 1)
         
         # score-matching
@@ -130,6 +131,7 @@ class VelocityModule(ModelSpec):
                     pcl_noisy=pc_next,
                     patch_size=self.predict_patch_size,
                     seed_k=self.predict_seed_k,
+                    seed_interval=self.predict_seed_interval,
                     seed_k_alpha=self.predict_seed_k_alpha,
                 )
             pc_denoised = pc_next.detach().numpy()
@@ -204,24 +206,61 @@ def knn_points(x, y, k):
     nn = jt.stack(nn, dim=0)
     return dist_k, idx, nn
 
-def patch_based_denoise(model: VelocityModule, pcl_noisy, patch_size=1000, seed_k=6, seed_k_alpha=1) -> jt.Var:
+def get_interval_seed_indices(n, interval):
+    interval = max(1, int(interval))
+    seed_idx = np.arange(0, n, interval, dtype=np.int32)
+    if seed_idx.size == 0 or seed_idx[-1] != n - 1:
+        seed_idx = np.concatenate([seed_idx, np.array([n - 1], dtype=np.int32)])
+    return seed_idx
+
+def patch_based_denoise(
+    model: VelocityModule,
+    pcl_noisy,
+    patch_size=1000,
+    seed_k=6,
+    seed_interval=200,
+    seed_k_alpha=1,
+) -> jt.Var:
     """
     pcl_noisy: (N, 3)
     """
     assert len(pcl_noisy.shape) == 2
     
     N, _ = pcl_noisy.shape
-    num_patches = int(seed_k * N / patch_size)
+    patch_size = min(int(patch_size), N)
     pcl_noisy = pcl_noisy.unsqueeze(0)  # (1, N, 3)
     
-    seed_pnts, _ = farthest_point_sampling(pcl_noisy, num_patches)
+    seed_idx = jt.array(get_interval_seed_indices(N, seed_interval)).int32()
+    seed_pnts = pcl_noisy[:, seed_idx, :]
     patch_dists, point_idxs, patches = knn_points(seed_pnts, pcl_noisy, patch_size)
+    
+    covered = np.zeros((N,), dtype=np.bool_)
+    covered[point_idxs[0].numpy().reshape(-1)] = True
+    missing_idx = np.flatnonzero(~covered).astype(np.int32)
+    if missing_idx.size > 0:
+        extra_seed_idx = jt.array(missing_idx).int32()
+        extra_seed_pnts = pcl_noisy[:, extra_seed_idx, :]
+        extra_patch_dists, extra_point_idxs, extra_patches = knn_points(
+            extra_seed_pnts,
+            pcl_noisy,
+            patch_size,
+        )
+        seed_pnts = jt.concat([seed_pnts, extra_seed_pnts], dim=1)
+        patch_dists = jt.concat([patch_dists, extra_patch_dists], dim=1)
+        point_idxs = jt.concat([point_idxs, extra_point_idxs], dim=1)
+        patches = jt.concat([patches, extra_patches], dim=1)
+        print(
+            f"Patch coverage: added {missing_idx.size} extra seed patches "
+            "for points missed by interval seeds."
+        )
+    
+    num_patches = seed_pnts.shape[1]
 
     patches = patches[0]              # (P, M, 3)
     patch_dists = patch_dists[0]      # (P, M)
     point_idxs = point_idxs[0]        # (P, M)
     
-    seed_expand = seed_pnts.squeeze().unsqueeze(1).broadcast(patches.shape)
+    seed_expand = seed_pnts[0].unsqueeze(1).broadcast(patches.shape)
     patches = patches - seed_expand
     
     patch_dists = patch_dists / (patch_dists[:, -1:].broadcast(patch_dists.shape) + 1e-8)
@@ -251,9 +290,22 @@ def patch_based_denoise(model: VelocityModule, pcl_noisy, patch_size=1000, seed_
     patches_denoised = jt.concat(patches_denoised, dim=0)
     patches_denoised = patches_denoised + seed_expand
     pcl_out = []
+    pcl_noisy_flat = pcl_noisy[0]
+    missing_count = 0
     for pidx in range(N):
         patch_id = best_weights_idx[pidx].item()
         mask = (point_idxs[patch_id] == pidx)
-        pcl_out.append(patches_denoised[patch_id][mask])
+        selected = patches_denoised[patch_id][mask]
+        if selected.shape[0] == 0:
+            missing_count += 1
+            selected = pcl_noisy_flat[pidx:pidx+1]
+        else:
+            selected = selected[:1]
+        pcl_out.append(selected)
     pcl_out = jt.concat(pcl_out, dim=0)
+    if missing_count > 0:
+        print(
+            f"Patch fusion warning: {missing_count}/{N} points were not covered "
+            "by any denoised patch; kept their noisy coordinates."
+        )
     return pcl_out
