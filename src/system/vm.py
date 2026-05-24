@@ -224,8 +224,12 @@ class VMSystem(DummySystem):
         
         metrics = []
         for i in range(pred_np.shape[0]):
-            cd_pred = chamfer_distance(pred_np[i], clean_np[i], normalize=False)
-            cd_noisy = chamfer_distance(noisy_np[i], clean_np[i], normalize=False)
+            clean_patch = clean_np[i]
+            pred_patch = pred_np[i]
+            noisy_patch = noisy_np[i]
+
+            cd_pred = chamfer_distance(pred_patch, clean_patch, normalize=True)
+            cd_noisy = chamfer_distance(noisy_patch, clean_patch, normalize=True)
             item = {
                 "cd_pred": cd_pred,
                 "cd_noisy": cd_noisy,
@@ -237,16 +241,16 @@ class VMSystem(DummySystem):
                 mesh_v, mesh_f = self._normalized_mesh(assets[asset_idx])
                 if mesh_v is not None and mesh_f is not None:
                     p2s_pred = point_to_surface_distance(
-                        pred_np[i],
+                        pred_patch,
                         mesh_v,
                         mesh_f,
-                        normalize_ref_pc=None,
+                        normalize_ref_pc=clean_patch,
                     )
                     p2s_noisy = point_to_surface_distance(
-                        noisy_np[i],
+                        noisy_patch,
                         mesh_v,
                         mesh_f,
-                        normalize_ref_pc=None,
+                        normalize_ref_pc=clean_patch,
                     )
                     if p2s_pred is not None and p2s_noisy is not None:
                         item["p2s_pred"] = p2s_pred
