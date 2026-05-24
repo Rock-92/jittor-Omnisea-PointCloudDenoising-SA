@@ -2,7 +2,9 @@ from typing import List, Dict, Optional
 
 import numpy as np
 import os
+import trimesh
 import zipfile
+from pathlib import Path
 
 from evaluate import chamfer_distance, metric_to_score, point_to_surface_distance
 
@@ -144,15 +146,39 @@ class VMSystem(DummySystem):
             self.writer.package_result()
     
     def _normalized_mesh(self, asset: Asset):
-        if asset.vertices is None or asset.faces is None or asset.meta is None:
+        if asset.meta is None:
             return None, None
+        vertices = asset.vertices
+        faces = asset.faces
+        if vertices is None or faces is None:
+            mesh_path = self._source_mesh_path_from_cache(asset.path)
+            if mesh_path is None or not mesh_path.exists():
+                return None, None
+            mesh = trimesh.load(mesh_path, process=False)
+            if isinstance(mesh, trimesh.Scene):
+                mesh = trimesh.util.concatenate(tuple(mesh.geometry.values()))
+            vertices = np.asarray(mesh.vertices, dtype=np.float32)
+            faces = np.asarray(mesh.faces, dtype=np.int32)
         center = asset.meta.get("normalize_center")
         scale = asset.meta.get("normalize_scale")
         if center is None or scale is None or float(scale) < 1e-12:
             return None, None
-        vertices = (asset.vertices - center) / float(scale)
-        faces = asset.faces.astype(np.int32)
+        vertices = (vertices - center) / float(scale)
+        faces = faces.astype(np.int32)
         return vertices, faces
+
+    def _source_mesh_path_from_cache(self, path: Optional[str]):
+        if path is None:
+            return None
+        parts = Path(path).resolve().parts
+        if "cache_clean_points" not in parts:
+            return None
+        cache_idx = parts.index("cache_clean_points")
+        base = Path(*parts[:cache_idx]) if cache_idx > 0 else Path(".")
+        rel_parts = parts[cache_idx + 1:-1]
+        if not rel_parts:
+            return None
+        return base / "dataset_clean" / Path(*rel_parts) / "models" / "model_normalized.obj"
     
     def validation_metric_step(self, batch):
         if "pc_noisy" not in batch or "pc_clean" not in batch:

@@ -11,6 +11,7 @@ result.zip
 dataset_train/
 dataset_test_noisy/
 dataset_clean/
+cache_clean_points/
 test_noisy/
 test_gt/
 dataset_train.tar.gz

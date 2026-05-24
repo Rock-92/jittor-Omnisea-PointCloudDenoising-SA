@@ -77,19 +77,60 @@ class VelocityModule(ModelSpec):
         F_dim = feat.shape[2]
         return self.decoder(feat.reshape(-1, F_dim)).reshape(B, N_out, d)
     
-    def get_supervised_loss(self, pc_noisy, pc_clean):
+    def get_normalized_surface_loss(self, pc_pred, pc_clean, pc_anchor):
+        """
+        Penalize point-to-local-plane distance. Each plane is estimated around
+        the paired clean supervision point.
+        """
+        dist = ((pc_anchor.unsqueeze(2) - pc_clean.unsqueeze(1)) ** 2.0).sum(dim=-1)
+        _, idx = jt.topk(dist, k=3, dim=-1, largest=False)
+        neighbors = []
+        for b in range(pc_clean.shape[0]):
+            neighbors.append(pc_clean[b][idx[b]])
+        neighbors = jt.stack(neighbors, dim=0)
+
+        p0 = pc_anchor
+        p1 = neighbors[:, :, 1, :]
+        p2 = neighbors[:, :, 2, :]
+        v1 = p1 - p0
+        v2 = p2 - p0
+        normal = jt.stack(
+            [
+                v1[:, :, 1] * v2[:, :, 2] - v1[:, :, 2] * v2[:, :, 1],
+                v1[:, :, 2] * v2[:, :, 0] - v1[:, :, 0] * v2[:, :, 2],
+                v1[:, :, 0] * v2[:, :, 1] - v1[:, :, 1] * v2[:, :, 0],
+            ],
+            dim=-1,
+        )
+        normal = normal / (((normal ** 2.0).sum(dim=-1) + 1e-8) ** 0.5).unsqueeze(-1)
+        plane_dist = (((pc_pred - p0) * normal).sum(dim=-1) ** 2.0)
+        return (plane_dist / self.dsm_sigma).mean()
+
+    def get_supervised_losses(self, pc_noisy, pc_clean):
         """
         pc_noisy: (B, N, 3)
         pc_clean: (B, N, 3)
         """
         target = pc_clean - pc_noisy
         point_idx = get_random_indices(pc_noisy.shape[1], self.num_train_points)
+        pc_noisy_for_loss = pc_noisy
+        pc_clean_for_loss = pc_clean
         if point_idx is not None:
             target = target[:, point_idx, :]
+            pc_noisy_for_loss = pc_noisy[:, point_idx, :]
+            pc_clean_for_loss = pc_clean[:, point_idx, :]
         pred_dir = self.predict_displacement(pc_noisy, point_idx=point_idx)
-        loss = (((pred_dir - target) ** 2.0) / self.dsm_sigma).sum(dim=-1).mean()
+        displacement_loss = (((pred_dir - target) ** 2.0) / self.dsm_sigma).sum(dim=-1).mean()
+        normalized_surface_loss = self.get_normalized_surface_loss(
+            pc_pred=pc_noisy_for_loss + pred_dir,
+            pc_clean=pc_clean,
+            pc_anchor=pc_clean_for_loss,
+        )
         
-        return loss
+        return {
+            "displacement_loss": displacement_loss,
+            "normalized_surface_loss": normalized_surface_loss,
+        }
 
     def denoise_langevin_dynamics(self, pcl_noisy, num_steps=None):
         """
@@ -108,11 +149,11 @@ class VelocityModule(ModelSpec):
         patch_size = batch['pc_noisy'].shape[-2]
         pc_noisy = batch['pc_noisy'].reshape(-1, patch_size, 3)
         pc_clean = batch['pc_clean'].reshape(-1, patch_size, 3)
-        loss = self.get_supervised_loss(
+        losses = self.get_supervised_losses(
             pc_noisy=pc_noisy,
             pc_clean=pc_clean,
         )
-        return {"loss": loss}
+        return losses
     
     def execute(self, **kwargs) -> Dict: # type: ignore
         return self.training_step(**kwargs)

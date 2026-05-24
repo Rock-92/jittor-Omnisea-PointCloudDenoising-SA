@@ -1,9 +1,10 @@
 loss:
-  loss: 1.0
+  displacement_loss: 0.9
+  normalized_surface_loss: 0.1
 
 optimizer:
   __target__: adam
   lr: 0.00001
 
 trainer:
-  epochs: 50
+  epochs: 100
