@@ -201,6 +201,18 @@ class PCDataset(Dataset):
     
     def _collate_fn_debug(self, batch):
         return batch # just retun a list of Asset
+
+    @staticmethod
+    def _as_numpy(value, key: str):
+        if isinstance(value, ndarray):
+            arr = value
+        elif isinstance(value, jt.Var):
+            arr = value.numpy()
+        else:
+            raise ValueError(f"cannot convert key {key} to array, type: {type(value)}")
+        if np.issubdtype(arr.dtype, np.floating):
+            arr = arr.astype(np.float32, copy=False)
+        return arr
     
     def _collate_fn(self, batch):
         processed_batch = self.process_fn(batch) # type: ignore
@@ -222,13 +234,7 @@ class PCDataset(Dataset):
                     tensors_cat[k1] = []
                     for i in range(len(processed_batch)):
                         v1 = processed_batch[i]['cat'][k1]
-                        if isinstance(v1, ndarray):
-                            v1 = jt.array(v1)
-                        elif isinstance(v1, jt.Var):
-                            v1 = v1
-                        else:
-                            raise ValueError(f"cannot concatenate non-tensor type of key {k1}, type: {type(v1)}")
-                        tensors_cat[k1].append(v1)
+                        tensors_cat[k1].append(self._as_numpy(v1, k1))
             elif k == "non":
                 assert isinstance(v, dict)
                 for k1 in v.keys():
@@ -236,24 +242,16 @@ class PCDataset(Dataset):
                     non_tensors[k1] = []
                     for i in range(len(processed_batch)):
                         v1 = processed_batch[i]['non'][k1]
-                        if isinstance(v1, ndarray):
-                            v1 = jt.array(v1)
                         non_tensors[k1].append(v1)
             else:
                 check(k)
                 tensors_stack[k] = []
                 for i in range(len(processed_batch)):
                     v1 = processed_batch[i][k]
-                    if isinstance(v1, ndarray):
-                        v1 = jt.array(v1)
-                    elif isinstance(v1, jt.Var):
-                        v1 = v1
-                    else:
-                        raise ValueError(f"cannot stack type of key {k}, type: {type(v1)}")
-                    tensors_stack[k].append(v1)
+                    tensors_stack[k].append(self._as_numpy(v1, k))
         
-        collated_stack = {k: jt.stack(v) for k, v in tensors_stack.items()}
-        collated_cat = {k: jt.concat(v, dim=1) for k, v in tensors_cat.items()}
+        collated_stack = {k: np.stack(v, axis=0) for k, v in tensors_stack.items()}
+        collated_cat = {k: np.concatenate(v, axis=1) for k, v in tensors_cat.items()}
         
         collated_batch = {
             **collated_stack,

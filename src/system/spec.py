@@ -5,6 +5,7 @@ from tqdm import tqdm
 
 import json
 import jittor as jt
+import numpy as np
 import os
 
 from ..data.asset import Asset
@@ -15,6 +16,19 @@ def _get_item(x):
     if isinstance(x, jt.Var):
         return x.item()
     return x
+
+def _to_jittor(value):
+    if isinstance(value, np.ndarray):
+        if np.issubdtype(value.dtype, np.floating):
+            value = value.astype(np.float32, copy=False)
+        return jt.array(value)
+    if isinstance(value, dict):
+        return {k: _to_jittor(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_to_jittor(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_to_jittor(v) for v in value)
+    return value
 
 def get_optimizer(optimizer_config, model):
     __target__ = optimizer_config.pop('__target__')
@@ -72,6 +86,7 @@ class DummySystem():
         self.best_validation_score = float("-inf")
     
     def forward(self, batch, validate: bool=False): # return loss sum
+        batch = _to_jittor(batch)
         loss_dict = self.model.training_step(batch)
         assert isinstance(loss_dict, dict), "loss_dict must be a dict containing loss/metrics"
         assert self.loss_config is not None, "do not have loss_confing"
@@ -267,6 +282,7 @@ class DummySystem():
         pass
     
     def predict_step(self, batch, batch_idx, dataloader_idx=None):
+        batch = _to_jittor(batch)
         return self.model.predict_step(batch)
     
     def on_predict_batch_end(self):
@@ -285,6 +301,7 @@ class DummySystem():
             assert train_dataloader is not None, "train_dataloader is None"
             pbar = tqdm(train_dataloader, total=len(train_dataloader)//train_dataloader.batch_size) # type: ignore
             for batch in pbar:
+                batch = _to_jittor(batch)
                 self.on_train_batch_start()
                 loss = self.training_step(batch)
                 self.optimizer.zero_grad()
@@ -303,6 +320,7 @@ class DummySystem():
                     for name, dataloader in validate_dataloader.items():
                         pbar = tqdm(dataloader, total=len(dataloader)//dataloader.batch_size)
                         for batch in pbar:
+                            batch = _to_jittor(batch)
                             self.on_validation_batch_start()
                             loss = self.validation_step(batch)
                             self.record_validation_scores(
@@ -313,6 +331,7 @@ class DummySystem():
                 else:
                     pbar = tqdm(validate_dataloader, total=len(validate_dataloader)//validate_dataloader.batch_size)
                     for batch in pbar:
+                        batch = _to_jittor(batch)
                         self.on_validation_batch_start()
                         loss = self.validation_step(batch)
                         self.record_validation_scores(
@@ -343,6 +362,7 @@ class DummySystem():
         for dataloader_name, dataloader in predict_dataloader.items():
             pbar = tqdm(dataloader, total=len(dataloader)//dataloader.batch_size) # type: ignore
             for batch_idx, batch in enumerate(pbar):
+                batch = _to_jittor(batch)
                 self.on_predict_batch_start()
                 output = self.predict_step(batch, batch_idx)
                 if self.writer is not None:

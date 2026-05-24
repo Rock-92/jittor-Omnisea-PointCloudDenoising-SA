@@ -43,7 +43,7 @@ class AugmentSample(Augment):
             num_samples=self.num_samples,
             num_vertex_samples=self.num_vertex_samples,
         )
-        asset.sampled_vertices = sampled_vertices
+        asset.sampled_vertices = sampled_vertices.astype(np.float32, copy=False)
 
 @dataclass(frozen=True)
 class AugmentNormalizePC(Augment):
@@ -65,7 +65,7 @@ class AugmentNormalizePC(Augment):
             asset.meta = {}
         asset.meta['normalize_center'] = center
         asset.meta['normalize_scale'] = scale
-        asset.sampled_vertices = pc / scale
+        asset.sampled_vertices = (pc / scale).astype(np.float32, copy=False)
 
 @dataclass(frozen=True)
 class AugmentAddNoise(Augment):
@@ -83,8 +83,8 @@ class AugmentAddNoise(Augment):
         pc = asset.sampled_vertices
         assert pc is not None, "sampled_vertices is None, cannot apply AugmentAddNoise"
         noise_std = np.random.uniform(self.noise_std_min, self.noise_std_max)
-        noise = np.random.laplace(0, noise_std, size=pc.shape)
-        asset.sampled_vertices_noisy = pc + noise
+        noise = np.random.laplace(0, noise_std, size=pc.shape).astype(np.float32, copy=False)
+        asset.sampled_vertices_noisy = (pc + noise).astype(np.float32, copy=False)
 
 @dataclass(frozen=True)
 class AugmentLinear(Augment):

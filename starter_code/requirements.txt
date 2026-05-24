@@ -1,5 +1,0 @@
-jittor
-numpy
-trimesh
-scipy
-omegaconf

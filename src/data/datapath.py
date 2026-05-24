@@ -32,8 +32,8 @@ class ObjLazyAsset(LazyAsset):
         asset = Asset(
             path=self.path,
             cls=self.cls,
-            vertices=np.array(mesh.vertices), # type: ignore
-            faces=np.array(mesh.faces), # type: ignore
+            vertices=np.asarray(mesh.vertices, dtype=np.float32), # type: ignore
+            faces=np.asarray(mesh.faces, dtype=np.int32), # type: ignore
         )
         return asset
 
@@ -41,7 +41,7 @@ class ObjLazyAsset(LazyAsset):
 class NpyLazyAsset(LazyAsset):
     # load a .npy point cloud file as an asset (for predict mode)
     def load(self) -> 'Asset':
-        pc = np.load(self.path).astype(np.float64)
+        pc = np.load(self.path).astype(np.float32, copy=False)
         asset = Asset(
             path=self.path,
             cls=self.cls,
