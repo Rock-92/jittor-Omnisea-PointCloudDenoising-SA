@@ -2,6 +2,7 @@
 output/
 outputs/*
 !outputs/.gitkeep
+outputs1/
 experiments/
 tmp_predict/
 results/

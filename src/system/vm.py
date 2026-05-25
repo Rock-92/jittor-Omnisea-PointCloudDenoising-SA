@@ -81,8 +81,14 @@ class VMWriter(DummyWriter):
         if len(result_files) == 0:
             filename = f"{self.save_name}.{self.output_format}"
             for root, _, files in os.walk(self.save_dir):
+                if "outputs1" in Path(root).parts:
+                    continue
                 if filename in files:
                     result_files.append(os.path.join(root, filename))
+        result_files = [
+            path for path in result_files
+            if "outputs1" not in Path(path).parts
+        ]
         result_files.sort()
         
         zip_dir = os.path.dirname(self.result_zip)
