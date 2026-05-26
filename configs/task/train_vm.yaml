@@ -11,6 +11,6 @@ components:
 
 writer:
   __target__: vm
-  save_dir: outputs/results/test_noisy
+  save_dir: outputs/result/test_noisy
   save_name: denoised
   result_zip: result.zip

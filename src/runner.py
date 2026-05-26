@@ -156,6 +156,7 @@ def main(argv: Optional[List[str]] = None):
         )
 
     optimizer_config = task.get("optimizer", train_config.get("optimizer", None))
+    scheduler_config = task.get("scheduler", train_config.get("scheduler", None))
     loss_config = task.get("loss", train_config.get("loss", None))
     trainer_config = task.get("trainer", train_config.get("trainer", None))
 
@@ -180,6 +181,7 @@ def main(argv: Optional[List[str]] = None):
             dataset_module=dataset_module,
             model=model,
             optimizer_config=optimizer_config,
+            scheduler_config=scheduler_config,
             loss_config=loss_config,
             trainer_config=trainer_config,
             writer=get_writer(**writer_config) if writer_config is not None else None,

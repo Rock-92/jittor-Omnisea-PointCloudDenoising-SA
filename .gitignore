@@ -3,9 +3,10 @@ output/
 outputs/*
 !outputs/.gitkeep
 outputs1/
+outputs1.1/
 experiments/
 tmp_predict/
-results/
+result/
 result.zip
 
 # Datasets and ground truth

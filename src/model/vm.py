@@ -32,7 +32,20 @@ class VelocityModule(ModelSpec):
             'relative_position_bias_hidden_dim',
             32,
         )
-        self.decoder_hidden_dim = cfg['decoder_hidden_dim']
+        self.attention_ffn_hidden_dim = cfg.get(
+            'attention_ffn_hidden_dim',
+            self.feat_embedding_dim * 2,
+        )
+        self.global_token_blocks = cfg.get('global_token_blocks', 4)
+        self.global_token_ffn_hidden_dim = cfg.get(
+            'global_token_ffn_hidden_dim',
+            self.feat_embedding_dim * 2,
+        )
+        self.global_attn_bias_init = cfg.get('global_attn_bias_init', 0.0)
+        self.decoder_hidden_dims = cfg.get(
+            'decoder_hidden_dims',
+            [cfg.get('decoder_hidden_dim', 64)],
+        )
         
         # patch-based prediction
         self.predict_rounds = cfg.get('predict_rounds', 1)
@@ -55,12 +68,16 @@ class VelocityModule(ModelSpec):
             num_blocks=self.attention_blocks,
             attention_weight_init=self.attention_weight_init,
             relative_position_bias_hidden_dim=self.relative_position_bias_hidden_dim,
+            ffn_hidden_dim=self.attention_ffn_hidden_dim,
+            global_token_blocks=self.global_token_blocks,
+            global_token_ffn_hidden_dim=self.global_token_ffn_hidden_dim,
+            global_attn_bias_init=self.global_attn_bias_init,
         )
         
         self.decoder = Decoder(
             z_dim=self.encoder.embedding_dim,
             out_dim=3,
-            hidden_size=self.decoder_hidden_dim,
+            hidden_dims=self.decoder_hidden_dims,
         )
     
     def predict_displacement(self, pc_noisy, point_idx=None):
@@ -269,10 +286,10 @@ def patch_based_denoise(
     
     N, _ = pcl_noisy.shape
     patch_size = min(int(patch_size), N)
+    num_patches = min(N, max(1, int(seed_k * N / patch_size)))
     pcl_noisy = pcl_noisy.unsqueeze(0)  # (1, N, 3)
     
-    seed_idx = jt.array(get_interval_seed_indices(N, seed_interval)).int32()
-    seed_pnts = pcl_noisy[:, seed_idx, :]
+    seed_pnts, seed_idx = farthest_point_sampling(pcl_noisy, num_patches)
     patch_dists, point_idxs, patches = knn_points(seed_pnts, pcl_noisy, patch_size)
     
     covered = np.zeros((N,), dtype=np.bool_)
@@ -290,13 +307,12 @@ def patch_based_denoise(
         patch_dists = jt.concat([patch_dists, extra_patch_dists], dim=1)
         point_idxs = jt.concat([point_idxs, extra_point_idxs], dim=1)
         patches = jt.concat([patches, extra_patches], dim=1)
+        num_patches += missing_idx.size
         print(
             f"Patch coverage: added {missing_idx.size} extra seed patches "
-            "for points missed by interval seeds."
+            "for points missed by FPS seeds."
         )
     
-    num_patches = seed_pnts.shape[1]
-
     patches = patches[0]              # (P, M, 3)
     patch_dists = patch_dists[0]      # (P, M)
     point_idxs = point_idxs[0]        # (P, M)

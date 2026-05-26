@@ -32,6 +32,7 @@ def _to_jittor(value):
     return value
 
 def get_optimizer(optimizer_config, model):
+    optimizer_config = dict(optimizer_config)
     __target__ = optimizer_config.pop('__target__')
     MAPPING = {
         'sgd': optim.SGD,
@@ -42,6 +43,108 @@ def get_optimizer(optimizer_config, model):
     OptimizerClass = MAPPING[__target__]
     optimizer = OptimizerClass(model.parameters(), **optimizer_config)
     return optimizer
+
+def get_optimizer_lr(optimizer):
+    if hasattr(optimizer, "lr"):
+        return float(_get_item(getattr(optimizer, "lr")))
+    param_groups = getattr(optimizer, "param_groups", None)
+    if param_groups:
+        return float(param_groups[0]["lr"])
+    defaults = getattr(optimizer, "defaults", None)
+    if isinstance(defaults, dict) and "lr" in defaults:
+        return float(defaults["lr"])
+    return None
+
+def set_optimizer_lr(optimizer, lr: float):
+    updated = False
+    if hasattr(optimizer, "lr"):
+        setattr(optimizer, "lr", lr)
+        updated = True
+    param_groups = getattr(optimizer, "param_groups", None)
+    if param_groups:
+        for group in param_groups:
+            if isinstance(group, dict) and "lr" in group:
+                group["lr"] = lr
+                updated = True
+    defaults = getattr(optimizer, "defaults", None)
+    if isinstance(defaults, dict) and "lr" in defaults:
+        defaults["lr"] = lr
+        updated = True
+    if not updated:
+        raise AttributeError("optimizer does not expose a writable learning rate")
+
+class ReduceOnPlateauScheduler:
+    
+    def __init__(
+        self,
+        optimizer,
+        monitor: str="final_score",
+        mode: str="max",
+        factor: float=0.5,
+        patience: int=10,
+        min_lr: float=0.0,
+        threshold: float=1e-12,
+    ):
+        if mode not in {"min", "max"}:
+            raise ValueError(f"unsupported scheduler mode: {mode}")
+        if not 0.0 < factor < 1.0:
+            raise ValueError("scheduler factor must be between 0 and 1")
+        self.optimizer = optimizer
+        self.monitor = monitor
+        self.mode = mode
+        self.factor = float(factor)
+        self.patience = int(patience)
+        self.min_lr = float(min_lr)
+        self.threshold = float(threshold)
+        self.best = None
+        self.num_bad_epochs = 0
+    
+    def _is_better(self, value: float) -> bool:
+        if self.best is None:
+            return True
+        if self.mode == "max":
+            return value > self.best + self.threshold
+        return value < self.best - self.threshold
+    
+    def step(self, value, epoch: Optional[int]=None):
+        if value is None:
+            return
+        value = float(value)
+        if np.isnan(value):
+            return
+        if self._is_better(value):
+            self.best = value
+            self.num_bad_epochs = 0
+            return
+        
+        self.num_bad_epochs += 1
+        if self.num_bad_epochs < self.patience:
+            return
+        
+        old_lr = get_optimizer_lr(self.optimizer)
+        if old_lr is None:
+            raise AttributeError("cannot read optimizer learning rate")
+        new_lr = max(old_lr * self.factor, self.min_lr)
+        if new_lr < old_lr - 1e-20:
+            set_optimizer_lr(self.optimizer, new_lr)
+            epoch_text = "" if epoch is None else f" at epoch {epoch}"
+            print(
+                f"Scheduler reduce_on_plateau{epoch_text}: "
+                f"{self.monitor}={value:.8f}, lr {old_lr:.8g} -> {new_lr:.8g}"
+            )
+        self.num_bad_epochs = 0
+
+def get_scheduler(scheduler_config, optimizer):
+    if scheduler_config is None:
+        return None
+    scheduler_config = dict(scheduler_config)
+    __target__ = scheduler_config.pop("__target__")
+    MAPPING = {
+        "reduce_on_plateau": ReduceOnPlateauScheduler,
+    }
+    if __target__ not in MAPPING:
+        raise ValueError(f"unsupported scheduler: {__target__}")
+    return MAPPING[__target__](optimizer=optimizer, **scheduler_config)
 
 class DummyWriter():
     
@@ -59,6 +162,7 @@ class DummySystem():
         model: ModelSpec,
         loss_config=None,
         optimizer_config=None,
+        scheduler_config=None,
         trainer_config=None,
         writer: Optional[DummyWriter]=None,
         
@@ -81,6 +185,11 @@ class DummySystem():
             self.optimizer = get_optimizer(optimizer_config, model)
         else:
             self.optimizer = None
+        self.scheduler = (
+            get_scheduler(scheduler_config, self.optimizer)
+            if scheduler_config is not None and self.optimizer is not None
+            else None
+        )
         
         self._train_loss = defaultdict(list)
         self._validation_loss = defaultdict(list)
@@ -237,6 +346,7 @@ class DummySystem():
             score_summary = {}
         record = {
             "epoch": epoch,
+            "lr": get_optimizer_lr(self.optimizer) if self.optimizer is not None else None,
             "train_loss": train_loss,
             "val_loss": validation_loss,
             "cd_score": score_summary.get("cd_score"),
@@ -247,6 +357,7 @@ class DummySystem():
         self._epoch_metric_records.append(record)
         fieldnames = [
             "epoch",
+            "lr",
             "train_loss",
             "val_loss",
             "cd_score",
@@ -326,6 +437,22 @@ class DummySystem():
     def on_before_optimizer_step(self, optimizer):
         pass
     
+    def step_scheduler(self, epoch, train_loss=None, validation_loss=None, score_summary=None):
+        if self.scheduler is None:
+            return
+        metrics = {
+            "train_loss": train_loss,
+            "val_loss": validation_loss,
+            "validation_loss": validation_loss,
+        }
+        if score_summary is not None:
+            metrics.update(score_summary)
+        monitor = self.scheduler.monitor
+        if monitor not in metrics:
+            print(f"Scheduler monitor `{monitor}` is not available; skipping.")
+            return
+        self.scheduler.step(metrics[monitor], epoch=epoch)
+    
     def on_predict_epoch_start(self):
         pass
     
@@ -400,6 +527,7 @@ class DummySystem():
                 self.log_validation_epoch(epoch, validation_loss, score_summary)
                 self.save_best_checkpoint(epoch, validation_loss, score_summary)
             self.log_epoch_metrics(epoch, train_loss, validation_loss, score_summary)
+            self.step_scheduler(epoch, train_loss, validation_loss, score_summary)
             
             checkpoint_path = os.path.join(self.ckpt_save_dir, f'{self.ckpt_save_name}_{epoch}.pkl')
             os.makedirs(self.ckpt_save_dir, exist_ok=True)

@@ -113,7 +113,7 @@ python scripts/infer.py --seed 123
 默认输出：
 
 ```text
-outputs/results/test_noisy/
+outputs/result/test_noisy/
   shapenet/
     <synset_id>/
       <model_id>/
@@ -123,7 +123,7 @@ outputs/results/test_noisy/
 打包提交：
 
 ```bash
-cd outputs/results/test_noisy
+cd outputs/result/test_noisy
 zip -r ../../../result.zip shapenet/
 ```
 
@@ -133,7 +133,7 @@ zip -r ../../../result.zip shapenet/
 
 ```bash
 python scripts/evaluate.py \
-  --pred_dir outputs/results/test_noisy \
+  --pred_dir outputs/result/test_noisy \
   --gt_dir test_gt \
   --noisy_dir test_noisy \
   --mesh_dir dataset_clean \

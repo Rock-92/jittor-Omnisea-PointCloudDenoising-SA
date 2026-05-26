@@ -8,9 +8,13 @@ feat_embedding_dim: 256
 attention_blocks: 4
 attention_weight_init: [1.0, 0.6, 0.3, 0.2]
 relative_position_bias_hidden_dim: 64
+attention_ffn_hidden_dim: 512
+global_token_blocks: 4
+global_token_ffn_hidden_dim: 512
+global_attn_bias_init: 0.0
 
 # Decoder
-decoder_hidden_dim: 64
+decoder_hidden_dims: [128, 64]
 
 # Loss
 dsm_sigma: 0.01
@@ -20,7 +24,7 @@ num_train_points: 256
 predict_rounds: 1
 denoise_num_steps: 1
 predict_patch_size: 1000
-# Kept for compatibility; interval-based inference uses predict_seed_interval.
+# FPS-based inference uses predict_seed_k. predict_seed_interval is kept for compatibility.
 predict_seed_k: 6
 predict_seed_interval: 200
 predict_seed_k_alpha: 1

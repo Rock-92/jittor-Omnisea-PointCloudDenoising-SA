@@ -15,7 +15,7 @@ class VMWriter(DummyWriter):
     
     def __init__(
         self,
-        save_dir: str="outputs/results/dataset_test_noisy",
+        save_dir: str="outputs/result/dataset_test_noisy",
         save_name: str="denoised",
         output_format: str="npy",
         result_zip: str="result.zip",
@@ -108,6 +108,7 @@ class VMSystem(DummySystem):
         model,
         loss_config=None,
         optimizer_config=None,
+        scheduler_config=None,
         trainer_config=None,
         writer: Optional[DummyWriter]=None,
         
@@ -119,6 +120,7 @@ class VMSystem(DummySystem):
             model=model,
             loss_config=loss_config,
             optimizer_config=optimizer_config,
+            scheduler_config=scheduler_config,
             trainer_config=trainer_config,
             writer=writer,
             ckpt_save_dir=ckpt_save_dir,
