@@ -31,9 +31,13 @@ from diagnose_global_token_similarity import (
     write_csv,
 )
 from src.model.feature import (
+    apply_global_modulation,
     apply_point_linear,
+    apply_residual_gate,
     gather_neighbors,
     get_knn_idx,
+    knn_dot,
+    knn_weighted_sum,
 )
 
 
@@ -52,16 +56,50 @@ def numpy_stats(values):
     }
 
 
+def modulation_stats(values, prefix):
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    return {
+        f"{prefix}_mean": float(np.mean(values)),
+        f"{prefix}_abs_mean": float(np.mean(np.abs(values))),
+        f"{prefix}_p90_abs": float(np.quantile(np.abs(values), 0.90)),
+        f"{prefix}_max_abs": float(np.max(np.abs(values))),
+    }
+
+
 def execute_block_with_global_attention_stats(block, feat, xyz, graph_knn_idx, global_token):
     x_norm = block.attn_norm(feat)
-    q = apply_point_linear(block.q_proj, x_norm)
-    k = apply_point_linear(block.k_proj, x_norm)
-    v = apply_point_linear(block.v_proj, x_norm)
+    (
+        gamma_attn,
+        beta_attn,
+        gate_attn,
+        gamma_ffn,
+        beta_ffn,
+        gate_ffn,
+    ) = block.global_conditioner(global_token)
+    x_mod = apply_global_modulation(x_norm, gamma_attn, beta_attn)
+    attn_mod_delta = tensor_norm(x_mod - x_norm) / (tensor_norm(x_norm) + 1e-12)
 
-    B, N, _ = feat.shape
-    global_norm = block.global_norm(global_token)
-    k_global = apply_point_linear(block.global_k_proj, global_norm)
-    v_global = apply_point_linear(block.global_v_proj, global_norm)
+    gamma_attn_np = gamma_attn.detach().numpy()
+    beta_attn_np = beta_attn.detach().numpy()
+    gate_attn_np = gate_attn.detach().numpy()
+    gamma_ffn_np = gamma_ffn.detach().numpy()
+    beta_ffn_np = beta_ffn.detach().numpy()
+    gate_ffn_np = gate_ffn.detach().numpy()
+    attn_mod_delta_np = attn_mod_delta.detach().numpy()
+    common_stats = {
+        **modulation_stats(gamma_attn_np, "gamma_attn"),
+        **modulation_stats(beta_attn_np, "beta_attn"),
+        **modulation_stats(gate_attn_np, "gate_attn"),
+        **modulation_stats(gamma_ffn_np, "gamma_ffn"),
+        **modulation_stats(beta_ffn_np, "beta_ffn"),
+        **modulation_stats(gate_ffn_np, "gate_ffn"),
+        "attn_mod_delta_ratio_mean": float(np.mean(attn_mod_delta_np)),
+        "attn_mod_delta_ratio_p90": float(np.quantile(attn_mod_delta_np, 0.90)),
+    }
+
+    q = apply_point_linear(block.q_proj, x_mod)
+    k = apply_point_linear(block.k_proj, x_mod)
+    v = apply_point_linear(block.v_proj, x_mod)
 
     scale_outputs = []
     stat_rows = []
@@ -72,67 +110,47 @@ def execute_block_with_global_attention_stats(block, feat, xyz, graph_knn_idx, g
         xyz_neighbors = gather_neighbors(xyz, idx)
         rel_pos = xyz_neighbors - xyz.unsqueeze(2)
 
-        local_logits = (q.unsqueeze(2) * k_neighbors).sum(dim=-1) * block.scale
+        local_logits = knn_dot(q, k_neighbors, block.scale)
         local_logits = local_logits + block.rel_pos_bias(rel_pos)
-
-        k_global_scale = k_global.unsqueeze(1).broadcast((B, N, 1, block.dim))
-        v_global_scale = v_global.unsqueeze(1).broadcast((B, N, 1, block.dim))
-        global_logits = (
-            (q.unsqueeze(2) * k_global_scale).sum(dim=-1) * block.scale
-            + block.global_attn_bias.reshape(1, 1, 1).broadcast((B, N, 1))
-        )
-
-        attn_logits = jt.concat([local_logits, global_logits], dim=2)
-        attn = nn.softmax(attn_logits, dim=-1)
-        local_attn = attn[:, :, :scale_k]
-        global_attn = attn[:, :, -1:]
-
-        local_out = (local_attn.unsqueeze(-1) * v_neighbors).sum(dim=2)
-        global_out = (global_attn.unsqueeze(-1) * v_global_scale).sum(dim=2)
-        scale_out = local_out + global_out
+        attn = nn.softmax(local_logits, dim=-1)
+        scale_out = knn_weighted_sum(attn, v_neighbors)
         scale_outputs.append(scale_out)
 
         attn_np = attn.detach().numpy()[0]
-        global_weight = attn_np[:, -1]
-        local_max = attn_np[:, :scale_k].max(axis=1)
-        uniform = 1.0 / float(scale_k + 1)
+        entropy = -(attn_np * np.log(np.maximum(attn_np, 1e-12))).sum(axis=1)
+        uniform_entropy = math.log(float(scale_k))
 
-        global_norm_np = tensor_norm(global_out).detach().numpy()[0]
-        local_norm_np = tensor_norm(local_out).detach().numpy()[0]
+        scale_norm_np = tensor_norm(scale_out).detach().numpy()[0]
+        gated_scale_out = apply_residual_gate(scale_out, gate_attn)
+        gated_norm_np = tensor_norm(gated_scale_out).detach().numpy()[0]
         total_norm_np = tensor_norm(scale_out).detach().numpy()[0]
-        contribution_ratio = global_norm_np / np.maximum(total_norm_np, 1e-12)
-
-        gw_stats = numpy_stats(global_weight)
-        cr_stats = numpy_stats(contribution_ratio)
+        gate_ratio = gated_norm_np / np.maximum(total_norm_np, 1e-12)
+        entropy_stats = numpy_stats(entropy / max(uniform_entropy, 1e-12))
+        gate_ratio_stats = numpy_stats(gate_ratio)
         stat_rows.append({
             "scale_k": int(scale_k),
-            "uniform_weight": uniform,
-            "global_weight_mean": gw_stats["mean"],
-            "global_weight_median": gw_stats["median"],
-            "global_weight_p90": gw_stats["p90"],
-            "global_weight_p99": gw_stats["p99"],
-            "global_weight_max": gw_stats["max"],
-            "global_over_uniform_rate": float(np.mean(global_weight > uniform)),
-            "global_over_2x_uniform_rate": float(np.mean(global_weight > 2.0 * uniform)),
-            "global_top_attention_rate": float(np.mean(global_weight >= local_max)),
-            "global_contrib_ratio_mean": cr_stats["mean"],
-            "global_contrib_ratio_median": cr_stats["median"],
-            "global_contrib_ratio_p90": cr_stats["p90"],
-            "global_contrib_ratio_p99": cr_stats["p99"],
-            "global_contrib_ratio_max": cr_stats["max"],
-            "local_out_norm_mean": float(np.mean(local_norm_np)),
-            "global_out_norm_mean": float(np.mean(global_norm_np)),
+            **common_stats,
+            "local_attention_entropy_ratio_mean": entropy_stats["mean"],
+            "local_attention_entropy_ratio_median": entropy_stats["median"],
+            "local_attention_entropy_ratio_p90": entropy_stats["p90"],
+            "attn_gate_norm_ratio_mean": gate_ratio_stats["mean"],
+            "attn_gate_norm_ratio_median": gate_ratio_stats["median"],
+            "attn_gate_norm_ratio_p90": gate_ratio_stats["p90"],
+            "local_out_norm_mean": float(np.mean(scale_norm_np)),
             "total_out_norm_mean": float(np.mean(total_norm_np)),
         })
 
     out = jt.concat(scale_outputs, dim=-1)
     out = apply_point_linear(block.out_proj, out)
+    out = apply_residual_gate(out, gate_attn)
     feat = feat + out
 
     ffn = block.ffn_norm(feat)
+    ffn = apply_global_modulation(ffn, gamma_ffn, beta_ffn)
     ffn = apply_point_linear(block.ffn_lin_1, ffn)
     ffn = block.act(ffn)
     ffn = apply_point_linear(block.ffn_lin_2, ffn)
+    ffn = apply_residual_gate(ffn, gate_ffn)
     return feat + ffn, stat_rows
 
 
@@ -181,13 +199,15 @@ def extract_attention_usage(model, patch_noisy):
 def grouped_summary(rows, keys):
     grouped = {}
     metrics = [
-        "global_weight_mean",
-        "global_weight_median",
-        "global_over_uniform_rate",
-        "global_over_2x_uniform_rate",
-        "global_top_attention_rate",
-        "global_contrib_ratio_mean",
-        "global_contrib_ratio_median",
+        "gamma_attn_abs_mean",
+        "beta_attn_abs_mean",
+        "gate_attn_abs_mean",
+        "gamma_ffn_abs_mean",
+        "beta_ffn_abs_mean",
+        "gate_ffn_abs_mean",
+        "attn_mod_delta_ratio_mean",
+        "attn_gate_norm_ratio_mean",
+        "local_attention_entropy_ratio_mean",
     ]
     for row in rows:
         key = tuple(row[k] for k in keys)
@@ -227,7 +247,7 @@ def render_usage_plot(summary_rows, out_path):
                     and int(row["block"]) == block
                     and int(row["scale_k"]) == scale
                 ]
-                vals.append(match[0]["global_weight_mean"] if match else math.nan)
+                vals.append(match[0]["attn_mod_delta_ratio_mean"] if match else math.nan)
             ax.bar(
                 x + (offset_idx - (len(groups) - 1) / 2.0) * width,
                 vals,
@@ -235,9 +255,8 @@ def render_usage_plot(summary_rows, out_path):
                 label=group,
                 color=colors.get(group),
             )
-        ax.axhline(1.0 / (scale + 1), color="#333333", linestyle="--", linewidth=1.0)
-        ax.set_title(f"K={scale} global attention weight mean")
-        ax.set_ylabel("weight")
+        ax.set_title(f"K={scale} global modulation delta ratio")
+        ax.set_ylabel("ratio")
         ax.grid(True, axis="y", alpha=0.25)
     axes[-1].set_xticks(x)
     axes[-1].set_xticklabels([f"block {b}" for b in blocks])
@@ -330,9 +349,9 @@ def main():
         "patch_size": args.patch_size,
         "seed": args.seed,
         "notes": {
-            "uniform_weight": "For K local neighbors plus 1 global token, uniform is 1/(K+1).",
-            "global_top_attention_rate": "Fraction of points where global token has at least the largest local-neighbor attention.",
-            "global_contrib_ratio": "Norm(global_attn * V_global) / norm(local_out + global_out), averaged over points.",
+            "attn_mod_delta_ratio": "Norm of the global-conditioned attention input change divided by the original normalized feature norm.",
+            "attn_gate_norm_ratio": "Norm after the global-conditioned attention residual gate divided by the ungated local attention norm.",
+            "local_attention_entropy_ratio": "Local KNN attention entropy divided by log(K); lower means more concentrated local attention.",
         },
         "by_block_scale": block_scale,
         "by_group_block_scale": group_block_scale,

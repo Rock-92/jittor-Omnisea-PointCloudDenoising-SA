@@ -179,6 +179,65 @@ class GlobalTokenGenerator(nn.Module):
         return tokens[:, :1, :]
 
 
+class GlobalConditionModulator(nn.Module):
+    def __init__(
+        self,
+        dim,
+        hidden_dim=None,
+        strength_init=1.0,
+        gate_scale=1.0,
+        zero_init=True,
+    ):
+        super().__init__()
+        self.dim = dim
+        if hidden_dim is None:
+            hidden_dim = dim * 2
+        self.hidden_dim = int(hidden_dim)
+        self.gate_scale = float(gate_scale)
+
+        self.global_norm = PointLayerNorm(dim)
+        self.lin_1 = nn.Linear(dim, self.hidden_dim)
+        self.lin_2 = nn.Linear(self.hidden_dim, dim * 6)
+        self.act = nn.ReLU()
+        self.condition_strength = jt.ones((1,)) * float(strength_init)
+        if zero_init:
+            self.lin_2.weight = jt.zeros(self.lin_2.weight.shape)
+            if self.lin_2.bias is not None:
+                self.lin_2.bias = jt.zeros(self.lin_2.bias.shape)
+
+    def execute(self, global_token):
+        """
+        global_token: (B, 1, C)
+        return six channel-wise modulation tensors, each (B, C).
+        """
+        B, _, C = global_token.shape
+        g = self.global_norm(global_token).reshape(B, C)
+        params = self.lin_1(g)
+        params = self.act(params)
+        params = self.lin_2(params) * self.condition_strength
+
+        gamma_attn = params[:, 0 * C:1 * C]
+        beta_attn = params[:, 1 * C:2 * C]
+        gate_attn = params[:, 2 * C:3 * C] * self.gate_scale
+        gamma_ffn = params[:, 3 * C:4 * C]
+        beta_ffn = params[:, 4 * C:5 * C]
+        gate_ffn = params[:, 5 * C:6 * C] * self.gate_scale
+        return gamma_attn, beta_attn, gate_attn, gamma_ffn, beta_ffn, gate_ffn
+
+
+def apply_global_modulation(x, gamma, beta):
+    B, N, C = x.shape
+    gamma = gamma.reshape(B, 1, C).broadcast((B, N, C))
+    beta = beta.reshape(B, 1, C).broadcast((B, N, C))
+    return x * (1.0 + gamma) + beta
+
+
+def apply_residual_gate(out, gate):
+    B, N, C = out.shape
+    gate = gate.reshape(B, 1, C).broadcast((B, N, C))
+    return out * (1.0 + gate)
+
+
 class MultiScaleLocalSelfAttentionBlock(nn.Module):
     def __init__(
         self,
@@ -187,6 +246,10 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
         relative_position_bias_hidden_dim,
         ffn_hidden_dim=None,
         global_attn_bias_init=0.0,
+        global_condition_hidden_dim=None,
+        global_condition_strength_init=1.0,
+        global_condition_gate_scale=1.0,
+        global_condition_zero_init=True,
     ):
         super().__init__()
         self.dim = dim
@@ -202,10 +265,14 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
         self.v_proj = nn.Linear(dim, dim)
         self.rel_pos_bias = RelativePositionBias(relative_position_bias_hidden_dim)
         self.out_proj = nn.Linear(dim * len(knn_scales), dim)
-        self.global_norm = PointLayerNorm(dim)
-        self.global_k_proj = nn.Linear(dim, dim)
-        self.global_v_proj = nn.Linear(dim, dim)
-        self.global_attn_bias = jt.ones((1,)) * float(global_attn_bias_init)
+        self.global_attn_bias_init = float(global_attn_bias_init)
+        self.global_conditioner = GlobalConditionModulator(
+            dim=dim,
+            hidden_dim=global_condition_hidden_dim,
+            strength_init=global_condition_strength_init,
+            gate_scale=global_condition_gate_scale,
+            zero_init=global_condition_zero_init,
+        )
 
         self.ffn_norm = PointLayerNorm(dim)
         self.ffn_lin_1 = nn.Linear(dim, self.ffn_hidden_dim)
@@ -220,14 +287,25 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
             attention neighbors and relative-position bias.
         """
         x_norm = self.attn_norm(x)
+        if global_token is not None:
+            (
+                gamma_attn,
+                beta_attn,
+                gate_attn,
+                gamma_ffn,
+                beta_ffn,
+                gate_ffn,
+            ) = self.global_conditioner(global_token)
+            x_norm = apply_global_modulation(x_norm, gamma_attn, beta_attn)
+        else:
+            gate_attn = None
+            gamma_ffn = None
+            beta_ffn = None
+            gate_ffn = None
+
         q = apply_point_linear(self.q_proj, x_norm)
         k = apply_point_linear(self.k_proj, x_norm)
         v = apply_point_linear(self.v_proj, x_norm)
-        if global_token is not None:
-            B, N, _ = x.shape
-            global_norm = self.global_norm(global_token)
-            k_global = apply_point_linear(self.global_k_proj, global_norm)
-            v_global = apply_point_linear(self.global_v_proj, global_norm)
 
         scale_outputs = []
         for scale_k in self.knn_scales:
@@ -239,30 +317,23 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
 
             attn_logits = knn_dot(q, k_neighbors, self.scale)
             attn_logits = attn_logits + self.rel_pos_bias(rel_pos)
-            if global_token is not None:
-                global_logits = (
-                    jt.matmul(q, k_global.transpose(0, 2, 1)) * self.scale
-                    + self.global_attn_bias
-                )
-                attn_logits = jt.concat([attn_logits, global_logits], dim=2)
             attn = nn.softmax(attn_logits, dim=-1)
-            if global_token is None:
-                scale_outputs.append(knn_weighted_sum(attn, v_neighbors))
-            else:
-                local_attn = attn[:, :, :scale_k]
-                global_attn = attn[:, :, scale_k:]
-                local_out = knn_weighted_sum(local_attn, v_neighbors)
-                global_out = jt.matmul(global_attn, v_global)
-                scale_outputs.append(local_out + global_out)
+            scale_outputs.append(knn_weighted_sum(attn, v_neighbors))
 
         out = jt.concat(scale_outputs, dim=-1)
         out = apply_point_linear(self.out_proj, out)
+        if gate_attn is not None:
+            out = apply_residual_gate(out, gate_attn)
         x = x + out
 
         ffn = self.ffn_norm(x)
+        if gamma_ffn is not None:
+            ffn = apply_global_modulation(ffn, gamma_ffn, beta_ffn)
         ffn = apply_point_linear(self.ffn_lin_1, ffn)
         ffn = self.act(ffn)
         ffn = apply_point_linear(self.ffn_lin_2, ffn)
+        if gate_ffn is not None:
+            ffn = apply_residual_gate(ffn, gate_ffn)
         return x + ffn
 
 
@@ -281,6 +352,10 @@ class FeatureExtraction(nn.Module):
         global_token_blocks=4,
         global_token_ffn_hidden_dim=None,
         global_attn_bias_init=0.0,
+        global_condition_hidden_dim=None,
+        global_condition_strength_init=1.0,
+        global_condition_gate_scale=1.0,
+        global_condition_zero_init=True,
     ):
         super().__init__()
 
@@ -302,6 +377,10 @@ class FeatureExtraction(nn.Module):
         self.global_token_blocks = int(global_token_blocks)
         self.global_token_ffn_hidden_dim = int(global_token_ffn_hidden_dim)
         self.global_attn_bias_init = float(global_attn_bias_init)
+        self.global_condition_hidden_dim = global_condition_hidden_dim
+        self.global_condition_strength_init = float(global_condition_strength_init)
+        self.global_condition_gate_scale = float(global_condition_gate_scale)
+        self.global_condition_zero_init = bool(global_condition_zero_init)
 
         self.input_proj_1 = nn.Linear(input_dim, input_expand_dim)
         self.input_proj_2 = nn.Linear(input_expand_dim, embedding_dim)
@@ -329,6 +408,10 @@ class FeatureExtraction(nn.Module):
                 relative_position_bias_hidden_dim=relative_position_bias_hidden_dim,
                 ffn_hidden_dim=self.ffn_hidden_dim,
                 global_attn_bias_init=self.global_attn_bias_init,
+                global_condition_hidden_dim=self.global_condition_hidden_dim,
+                global_condition_strength_init=self.global_condition_strength_init,
+                global_condition_gate_scale=self.global_condition_gate_scale,
+                global_condition_zero_init=self.global_condition_zero_init,
             )
             weight = jt.ones((1,)) * float(block_weight_values[i])
             setattr(self, f"block_{i}", block)

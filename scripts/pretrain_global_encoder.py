@@ -94,6 +94,88 @@ def smooth_l1_loss(pred, target, beta=0.1):
     return jt.where(diff < beta, 0.5 * diff * diff / beta, diff - 0.5 * beta).mean()
 
 
+def scheduled_loss_weights(epoch, schedule_cfg, fallback_geometry_weight):
+    if not schedule_cfg or not bool(schedule_cfg.get("enabled", False)):
+        return 1.0, float(fallback_geometry_weight)
+
+    hold_epochs = int(schedule_cfg.get("hold_epochs", 5))
+    transition_end_epoch = int(schedule_cfg.get("transition_end_epoch", 15))
+    start_dino_weight = float(schedule_cfg.get("start_dino_weight", 0.10))
+    start_geometry_weight = float(schedule_cfg.get("start_geometry_weight", 0.90))
+    end_dino_weight = float(schedule_cfg.get("end_dino_weight", 0.95))
+    end_geometry_weight = float(schedule_cfg.get("end_geometry_weight", 0.05))
+
+    if epoch < hold_epochs:
+        t = 0.0
+    elif epoch >= transition_end_epoch:
+        t = 1.0
+    else:
+        denom = max(1, transition_end_epoch - hold_epochs)
+        t = float(epoch - hold_epochs) / float(denom)
+
+    dino_weight = start_dino_weight + t * (end_dino_weight - start_dino_weight)
+    geometry_weight = start_geometry_weight + t * (
+        end_geometry_weight - start_geometry_weight
+    )
+    return dino_weight, geometry_weight
+
+
+class EMALossNormalizer:
+    def __init__(self, schedule_cfg):
+        schedule_cfg = schedule_cfg or {}
+        self.enabled = bool(schedule_cfg.get("enabled", False)) and bool(
+            schedule_cfg.get("normalize_losses", False)
+        )
+        self.momentum = float(schedule_cfg.get("normalizer_momentum", 0.9))
+        self.clamp_min = float(schedule_cfg.get("normalizer_clamp_min", 0.05))
+        self.clamp_max = float(schedule_cfg.get("normalizer_clamp_max", 50.0))
+        self.eps = float(schedule_cfg.get("normalizer_eps", 1e-8))
+        self.dino_ema = None
+        self.geometry_ema = None
+
+    def _update(self, attr_name, value):
+        value = max(float(value), self.eps)
+        prev = getattr(self, attr_name)
+        if prev is None:
+            ema = value
+        else:
+            ema = self.momentum * prev + (1.0 - self.momentum) * value
+        setattr(self, attr_name, ema)
+        return ema
+
+    def _scale(self, ema):
+        scale = 1.0 / max(float(ema), self.eps)
+        return min(max(scale, self.clamp_min), self.clamp_max)
+
+    def normalize(self, dino_loss, geometry_loss):
+        dino_ema = self._update("dino_ema", dino_loss.item())
+        geometry_ema = self._update("geometry_ema", geometry_loss.item())
+        if not self.enabled:
+            return (
+                dino_loss,
+                geometry_loss,
+                {
+                    "dino_loss_ema": dino_ema,
+                    "geometry_loss_ema": geometry_ema,
+                    "dino_loss_scale": 1.0,
+                    "geometry_loss_scale": 1.0,
+                },
+            )
+
+        dino_scale = self._scale(dino_ema)
+        geometry_scale = self._scale(geometry_ema)
+        return (
+            dino_loss * dino_scale,
+            geometry_loss * geometry_scale,
+            {
+                "dino_loss_ema": dino_ema,
+                "geometry_loss_ema": geometry_ema,
+                "dino_loss_scale": dino_scale,
+                "geometry_loss_scale": geometry_scale,
+            },
+        )
+
+
 def orientation_variation(normals):
     if normals.shape[0] == 0:
         return 0.0
@@ -585,7 +667,9 @@ def main():
     center_momentum = float(dino_cfg.get("center_momentum", 0.9))
     ema_base = float(dino_cfg.get("ema_momentum_base", 0.996))
     ema_final = float(dino_cfg.get("ema_momentum_final", 0.999))
-    geometry_weight = float(geometry_cfg.get("weight", 0.05))
+    base_geometry_weight = float(geometry_cfg.get("weight", 0.05))
+    loss_schedule_cfg = cfg.get("loss_schedule", {}) or {}
+    loss_normalizer = EMALossNormalizer(loss_schedule_cfg)
     weak_view_cfg = cfg.get("weak_view", {})
     strong_view_cfg = cfg.get("strong_view", {})
     center = jt.zeros((1, int(head_cfg.get("out_dim", 1024)))).stop_grad()
@@ -610,9 +694,22 @@ def main():
         teacher_head.eval()
 
         pbar = tqdm(dataset_module.train_dataloader(), total=steps_per_epoch)
+        dino_weight, geometry_weight = scheduled_loss_weights(
+            epoch,
+            loss_schedule_cfg,
+            fallback_geometry_weight=base_geometry_weight,
+        )
         epoch_losses = []
         epoch_dino_losses = []
         epoch_geo_losses = []
+        epoch_balanced_dino_losses = []
+        epoch_balanced_geo_losses = []
+        last_norm_stats = {
+            "dino_loss_ema": float("nan"),
+            "geometry_loss_ema": float("nan"),
+            "dino_loss_scale": 1.0,
+            "geometry_loss_scale": 1.0,
+        }
         for step_idx, batch in enumerate(pbar):
             if args.max_steps_per_epoch is not None and step_idx >= args.max_steps_per_epoch:
                 break
@@ -642,7 +739,10 @@ def main():
             dino_loss = soft_cross_entropy(teacher_probs, student_logits, student_temp)
             geo_pred = geo_head(student_token)
             geo_loss = smooth_l1_loss(geo_pred, geo_target)
-            loss = dino_loss + geometry_weight * geo_loss
+            balanced_dino_loss, balanced_geo_loss, last_norm_stats = (
+                loss_normalizer.normalize(dino_loss, geo_loss)
+            )
+            loss = dino_weight * balanced_dino_loss + geometry_weight * balanced_geo_loss
 
             optimizer.zero_grad()
             optimizer.backward(loss)
@@ -662,18 +762,33 @@ def main():
             loss_val = float(loss.item())
             dino_val = float(dino_loss.item())
             geo_val = float(geo_loss.item())
+            balanced_dino_val = float(balanced_dino_loss.item())
+            balanced_geo_val = float(balanced_geo_loss.item())
             epoch_losses.append(loss_val)
             epoch_dino_losses.append(dino_val)
             epoch_geo_losses.append(geo_val)
+            epoch_balanced_dino_losses.append(balanced_dino_val)
+            epoch_balanced_geo_losses.append(balanced_geo_val)
             pbar.set_description(
                 f"Epoch {epoch}, loss={loss_val:.5f}, "
-                f"dino={dino_val:.5f}, geo={geo_val:.5f}"
+                f"dino={dino_val:.5f}, geo={geo_val:.5f}, "
+                f"w=({dino_weight:.2f},{geometry_weight:.2f})"
             )
             global_step += 1
 
         mean_loss = float(np.mean(epoch_losses)) if epoch_losses else float("nan")
         mean_dino_loss = float(np.mean(epoch_dino_losses)) if epoch_dino_losses else float("nan")
         mean_geo_loss = float(np.mean(epoch_geo_losses)) if epoch_geo_losses else float("nan")
+        mean_balanced_dino_loss = (
+            float(np.mean(epoch_balanced_dino_losses))
+            if epoch_balanced_dino_losses
+            else float("nan")
+        )
+        mean_balanced_geo_loss = (
+            float(np.mean(epoch_balanced_geo_losses))
+            if epoch_balanced_geo_losses
+            else float("nan")
+        )
         lr_value = float(optimizer.lr)
         improved = np.isfinite(mean_loss) and mean_loss <= best_loss
         curr_global_state = global_encoder_state(student_model)
@@ -687,6 +802,11 @@ def main():
             "loss": mean_loss,
             "dino_loss": mean_dino_loss,
             "geo_loss": mean_geo_loss,
+            "balanced_dino_loss": mean_balanced_dino_loss,
+            "balanced_geo_loss": mean_balanced_geo_loss,
+            "dino_weight": dino_weight,
+            "geometry_weight": geometry_weight,
+            **last_norm_stats,
             "lr": lr_value,
             **delta_stats,
         }
@@ -699,6 +819,14 @@ def main():
                     "loss",
                     "dino_loss",
                     "geo_loss",
+                    "balanced_dino_loss",
+                    "balanced_geo_loss",
+                    "dino_weight",
+                    "geometry_weight",
+                    "dino_loss_ema",
+                    "geometry_loss_ema",
+                    "dino_loss_scale",
+                    "geometry_loss_scale",
                     "lr",
                     "global_param_delta_l2",
                     "global_param_delta_max",
@@ -745,6 +873,9 @@ def main():
             f"loss={mean_loss:.6f}, "
             f"dino_loss={mean_dino_loss:.6f}, "
             f"geo_loss={mean_geo_loss:.6f}, "
+            f"balanced_dino={mean_balanced_dino_loss:.6f}, "
+            f"balanced_geo={mean_balanced_geo_loss:.6f}, "
+            f"weights=({dino_weight:.3f},{geometry_weight:.3f}), "
             f"lr={lr_value:.8g}, "
             f"global_delta_l2={delta_stats['global_param_delta_l2']:.6g}, "
             f"global_changed={delta_stats['global_param_changed_keys']}, "

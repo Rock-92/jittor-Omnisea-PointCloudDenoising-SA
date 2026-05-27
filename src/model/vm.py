@@ -42,6 +42,22 @@ class VelocityModule(ModelSpec):
             self.feat_embedding_dim * 2,
         )
         self.global_attn_bias_init = cfg.get('global_attn_bias_init', 0.0)
+        self.global_condition_hidden_dim = cfg.get(
+            'global_condition_hidden_dim',
+            self.feat_embedding_dim * 2,
+        )
+        self.global_condition_strength_init = cfg.get(
+            'global_condition_strength_init',
+            1.0,
+        )
+        self.global_condition_gate_scale = cfg.get(
+            'global_condition_gate_scale',
+            1.0,
+        )
+        self.global_condition_zero_init = cfg.get(
+            'global_condition_zero_init',
+            True,
+        )
         self.global_encoder_pretrain_ckpt = cfg.get(
             'global_encoder_pretrain_ckpt',
             None,
@@ -76,6 +92,10 @@ class VelocityModule(ModelSpec):
             global_token_blocks=self.global_token_blocks,
             global_token_ffn_hidden_dim=self.global_token_ffn_hidden_dim,
             global_attn_bias_init=self.global_attn_bias_init,
+            global_condition_hidden_dim=self.global_condition_hidden_dim,
+            global_condition_strength_init=self.global_condition_strength_init,
+            global_condition_gate_scale=self.global_condition_gate_scale,
+            global_condition_zero_init=self.global_condition_zero_init,
         )
         
         self.decoder = Decoder(

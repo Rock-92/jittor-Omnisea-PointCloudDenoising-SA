@@ -27,6 +27,20 @@ geometry:
   weight: 0.05
   hidden_dim: 256
 
+loss_schedule:
+  enabled: true
+  hold_epochs: 5
+  transition_end_epoch: 15
+  start_dino_weight: 0.10
+  start_geometry_weight: 0.90
+  end_dino_weight: 0.95
+  end_geometry_weight: 0.05
+  normalize_losses: true
+  normalizer_momentum: 0.9
+  normalizer_clamp_min: 0.05
+  normalizer_clamp_max: 50.0
+  normalizer_eps: 0.00000001
+
 weak_view:
   min_keep_ratio: 1.0
   noise_std_min: 0.002
