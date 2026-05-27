@@ -1,7 +1,0 @@
-{
-  "epoch": 29,
-  "loss": 0.6092117853914968,
-  "seed": 123,
-  "config": "/root/myproject/jittor-Omnisea-PointCloudDenoising-SA/configs/pretrain/global_dino.yaml",
-  "selection_metric": "min_pretrain_loss"
-}
