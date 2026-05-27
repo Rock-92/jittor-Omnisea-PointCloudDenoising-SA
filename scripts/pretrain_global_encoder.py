@@ -217,7 +217,8 @@ def surface_neighbor_jitter(points, reference_points, cfg, rng):
 
 
 def normalize_barycentric(barycentric):
-    barycentric = np.maximum(barycentric.astype(np.float32, copy=False), 0.0)
+    barycentric = to_numpy_float32(barycentric)
+    barycentric = np.maximum(barycentric, 0.0)
     denom = barycentric.sum(axis=-1, keepdims=True)
     denom = np.maximum(denom, 1e-8)
     return barycentric / denom
@@ -249,11 +250,17 @@ def surface_mesh_jitter(surface_info, sample_idx, cfg, rng):
     if any(surface_info.get(key) is None for key in required):
         return None
 
-    vertices = surface_info["mesh_vertices"]
+    vertices = to_numpy_float32(surface_info["mesh_vertices"])
     faces = surface_info["mesh_faces"]
-    face_index = surface_info["surface_face_index"][sample_idx].astype(np.int64)
+    if isinstance(faces, jt.Var):
+        faces = faces.numpy()
+    faces = np.asarray(faces, dtype=np.int64)
+    source_face_index = surface_info["surface_face_index"]
+    if isinstance(source_face_index, jt.Var):
+        source_face_index = source_face_index.numpy()
+    face_index = np.asarray(source_face_index, dtype=np.int64)[sample_idx]
     barycentric = surface_info["surface_barycentric"][sample_idx]
-    patch_seed = surface_info["patch_seed"].reshape(1, 3)
+    patch_seed = to_numpy_float32(surface_info["patch_seed"]).reshape(1, 3)
     if face_index.size == 0 or vertices.size == 0 or faces.size == 0:
         return None
 
