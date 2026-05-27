@@ -1,0 +1,30 @@
+[
+  {
+    "model": "pretrained",
+    "n_patches": 20,
+    "same_strong_mean": 0.9689546823501587,
+    "clean_weak_mean": 0.998914361000061,
+    "diff_strong_mean": 0.12791773676872253,
+    "diff_clean_mean": 0.10092324763536453,
+    "same_minus_diff_gap": 0.8410369157791138,
+    "token_geom_spearman": 0.09839870181562108,
+    "nearest_geom_dist_mean": 2.230736666917801,
+    "random_geom_dist_mean": 2.714189052581787,
+    "nearest_vs_random_ratio": 0.8218796199166313,
+    "token_dim_std_mean": 0.05371568351984024
+  },
+  {
+    "model": "random_init",
+    "n_patches": 20,
+    "same_strong_mean": 0.9999938011169434,
+    "clean_weak_mean": 0.9999996423721313,
+    "diff_strong_mean": 0.9979148507118225,
+    "diff_clean_mean": 0.997897207736969,
+    "same_minus_diff_gap": 0.0020789504051208496,
+    "token_geom_spearman": -0.11015934250985229,
+    "nearest_geom_dist_mean": 2.703435254096985,
+    "random_geom_dist_mean": 2.714189052581787,
+    "nearest_vs_random_ratio": 0.9960379331444975,
+    "token_dim_std_mean": 0.0025714223738759756
+  }
+]

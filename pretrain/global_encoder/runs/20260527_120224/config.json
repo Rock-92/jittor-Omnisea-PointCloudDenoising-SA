@@ -1,0 +1,187 @@
+{
+  "seed": 123,
+  "config": {
+    "components": {
+      "data": "train",
+      "transform": "vm",
+      "model": "vm"
+    },
+    "pretrain": {
+      "epochs": 30,
+      "output_dir": "outputs/pretrain/global_encoder"
+    },
+    "optimizer": {
+      "__target__": "adam",
+      "lr": 0.0001
+    },
+    "dino": {
+      "teacher_temp": 0.04,
+      "student_temp": 0.1,
+      "center_momentum": 0.9,
+      "ema_momentum_base": 0.996,
+      "ema_momentum_final": 0.999
+    },
+    "head": {
+      "hidden_dim": 1024,
+      "bottleneck_dim": 256,
+      "out_dim": 1024
+    },
+    "geometry": {
+      "weight": 0.05,
+      "hidden_dim": 256
+    },
+    "weak_view": {
+      "min_keep_ratio": 1.0,
+      "noise_std_min": 0.002,
+      "noise_std_max": 0.008,
+      "rotate_degrees": 2.0
+    },
+    "strong_view": {
+      "min_keep_ratio": 1.0,
+      "noise_std_min": 0.01,
+      "noise_std_max": 0.03,
+      "rotate_degrees": 5.0,
+      "surface_jitter": true,
+      "surface_jitter_knn": 12,
+      "surface_jitter_alpha_min": 0.05,
+      "surface_jitter_alpha_max": 0.25
+    }
+  },
+  "data_config": {
+    "data_name": "clean.npy",
+    "loader": "clean_npy",
+    "train_dataset": {
+      "shuffle": true,
+      "batch_size": 16,
+      "num_workers": 8,
+      "datapath": {
+        "input_dataset_dir": "./cache_clean_points",
+        "use_prob": true,
+        "num_files": 5000,
+        "loader": "clean_npy",
+        "data_name": "clean.npy",
+        "ignore_check": true,
+        "data_path": {
+          "shapenet": [
+            [
+              "./datalist/train.txt",
+              1.0
+            ]
+          ]
+        }
+      }
+    },
+    "validate_dataset": {
+      "shuffle": false,
+      "batch_size": 1,
+      "num_workers": 8,
+      "datapath": {
+        "input_dataset_dir": "./cache_clean_points",
+        "use_prob": false,
+        "loader": "clean_npy",
+        "data_name": "clean.npy",
+        "ignore_check": true,
+        "data_path": {
+          "shapenet": [
+            [
+              "./datalist/validate.txt",
+              1.0
+            ]
+          ]
+        }
+      }
+    },
+    "predict_dataset": {
+      "shuffle": false,
+      "batch_size": 1,
+      "num_workers": 8,
+      "datapath": {
+        "input_dataset_dir": "./test_noisy",
+        "use_prob": false,
+        "loader": "npy",
+        "data_name": "noisy.npy",
+        "ignore_check": true,
+        "data_path": {
+          "shapenet": [
+            [
+              "./datalist/test.txt",
+              1.0
+            ]
+          ]
+        }
+      }
+    }
+  },
+  "transform_config": {
+    "train_transform": {
+      "augments": [
+        {
+          "__target__": "normalize_pc"
+        },
+        {
+          "__target__": "add_noise",
+          "noise_std_min": 0.005,
+          "noise_std_max": 0.02
+        },
+        {
+          "__target__": "patch",
+          "patch_size": 1000,
+          "num_patches": 1
+        }
+      ]
+    },
+    "validate_transform": {
+      "augments": [
+        {
+          "__target__": "normalize_pc"
+        },
+        {
+          "__target__": "add_noise",
+          "noise_std_min": 0.005,
+          "noise_std_max": 0.02
+        },
+        {
+          "__target__": "patch",
+          "patch_size": 1000,
+          "num_patches": 1
+        }
+      ]
+    },
+    "predict_transform": {}
+  },
+  "model_config": {
+    "attention_knn": [
+      8,
+      16,
+      32
+    ],
+    "input_dim": 3,
+    "input_expand_dim": 128,
+    "feat_embedding_dim": 256,
+    "attention_blocks": 4,
+    "attention_weight_init": [
+      1.0,
+      0.6,
+      0.3,
+      0.2
+    ],
+    "relative_position_bias_hidden_dim": 64,
+    "attention_ffn_hidden_dim": 512,
+    "global_token_blocks": 4,
+    "global_token_ffn_hidden_dim": 512,
+    "global_attn_bias_init": 0.0,
+    "global_encoder_pretrain_ckpt": null,
+    "decoder_hidden_dims": [
+      128,
+      64
+    ],
+    "dsm_sigma": 0.01,
+    "num_train_points": 256,
+    "predict_rounds": 1,
+    "denoise_num_steps": 1,
+    "predict_patch_size": 1000,
+    "predict_seed_k": 6,
+    "predict_seed_interval": 200,
+    "predict_seed_k_alpha": 1
+  }
+}
