@@ -44,6 +44,33 @@ def apply_edge_linear(linear, x):
     return out.reshape(B, N, K, -1)
 
 
+def knn_dot(q, k_neighbors, scale):
+    """
+    q:           (B, N, C)
+    k_neighbors: (B, N, K, C)
+    return:      (B, N, K)
+
+    Use batched matmul instead of 4D broadcast multiply + reduce. The latter
+    can hit a ROCm codegen bug in Jittor during backward compilation.
+    """
+    B, N, K, C = k_neighbors.shape
+    q_flat = q.reshape(B * N, 1, C)
+    k_flat = k_neighbors.reshape(B * N, K, C)
+    return jt.matmul(q_flat, k_flat.transpose(0, 2, 1)).reshape(B, N, K) * scale
+
+
+def knn_weighted_sum(attn, values):
+    """
+    attn:   (B, N, K)
+    values: (B, N, K, C)
+    return: (B, N, C)
+    """
+    B, N, K, C = values.shape
+    attn_flat = attn.reshape(B * N, 1, K)
+    values_flat = values.reshape(B * N, K, C)
+    return jt.matmul(attn_flat, values_flat).reshape(B, N, C)
+
+
 class PointLayerNorm(nn.Module):
     def __init__(self, dim, eps=1e-5):
         super().__init__()
@@ -107,9 +134,9 @@ class TokenSelfAttentionBlock(nn.Module):
         q = apply_point_linear(self.q_proj, x)
         k = apply_point_linear(self.k_proj, x)
         v = apply_point_linear(self.v_proj, x)
-        attn_logits = (q.unsqueeze(2) * k.unsqueeze(1)).sum(dim=-1) * self.scale
+        attn_logits = jt.matmul(q, k.transpose(0, 2, 1)) * self.scale
         attn = nn.softmax(attn_logits, dim=-1)
-        out = (attn.unsqueeze(-1) * v.unsqueeze(1)).sum(dim=2)
+        out = jt.matmul(attn, v)
         out = apply_point_linear(self.out_proj, out)
         x = self.attn_norm(x + out)
 
@@ -209,20 +236,23 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
             xyz_neighbors = gather_neighbors(xyz, idx)
             rel_pos = xyz_neighbors - xyz.unsqueeze(2)
 
-            attn_logits = (q.unsqueeze(2) * k_neighbors).sum(dim=-1) * self.scale
+            attn_logits = knn_dot(q, k_neighbors, self.scale)
             attn_logits = attn_logits + self.rel_pos_bias(rel_pos)
-            v_all = v_neighbors
             if global_token is not None:
-                k_global_scale = k_global.unsqueeze(1).broadcast((B, N, 1, self.dim))
-                v_global_scale = v_global.unsqueeze(1).broadcast((B, N, 1, self.dim))
                 global_logits = (
-                    (q.unsqueeze(2) * k_global_scale).sum(dim=-1) * self.scale
-                    + self.global_attn_bias.reshape(1, 1, 1).broadcast((B, N, 1))
+                    jt.matmul(q, k_global.transpose(0, 2, 1)) * self.scale
+                    + self.global_attn_bias
                 )
                 attn_logits = jt.concat([attn_logits, global_logits], dim=2)
-                v_all = jt.concat([v_neighbors, v_global_scale], dim=2)
             attn = nn.softmax(attn_logits, dim=-1)
-            scale_outputs.append((attn.unsqueeze(-1) * v_all).sum(dim=2))
+            if global_token is None:
+                scale_outputs.append(knn_weighted_sum(attn, v_neighbors))
+            else:
+                local_attn = attn[:, :, :scale_k]
+                global_attn = attn[:, :, scale_k:]
+                local_out = knn_weighted_sum(local_attn, v_neighbors)
+                global_out = jt.matmul(global_attn, v_global)
+                scale_outputs.append(local_out + global_out)
 
         out = jt.concat(scale_outputs, dim=-1)
         out = apply_point_linear(self.out_proj, out)
