@@ -69,29 +69,37 @@ outputs/      日志、权重、结果，默认不提交
 
 ## 训练
 
-默认训练命令：
+当前训练流程分为三步：先从干净网格生成 clean 点云缓存，再预训练 global encoder，最后加载预训练权重进行主训练。
+
+1. 生成 clean 点云缓存：
 
 ```bash
-python scripts/train.py --seed 123
+python scripts/cache_clean_points.py --input_dataset_dir dataset_clean --output_dir cache_clean_points --datalist datalist/train.txt datalist/validate.txt --num_samples 32768 --num_vertex_samples 1024 --workers 8
 ```
 
-等价兼容命令：
+如果需要覆盖已有缓存，在命令末尾追加 `--overwrite`。
+
+2. 预训练 global encoder：
 
 ```bash
-python run.py --task configs/task/train_vm.yaml --seed 123
+python scripts/pretrain_global_encoder.py --config configs/pretrain/global_dino.yaml --seed 123
 ```
 
-训练超参数在 `configs/train/vm.yaml`：
+预训练完成后会生成：
 
-```yaml
-optimizer:
-  lr: 0.00001
-
-trainer:
-  epochs: 100
+```text
+outputs/pretrain/global_encoder/global_encoder_best.pkl
 ```
 
-模型结构参数在 `configs/model/vm.yaml`。默认权重保存到：
+3. 加载预训练权重进行主训练：
+
+```bash
+python run.py --task configs/task/train_vm_dino.yaml --seed 123
+```
+
+主训练会通过 `configs/model/vm_dino_pretrained.yaml` 自动加载 `global_encoder_best.pkl`。训练超参数在 `configs/train/vm_dino_pretrained.yaml`，模型结构参数在 `configs/model/vm_dino_pretrained.yaml`。
+
+默认权重保存到：
 
 ```text
 outputs/checkpoints/vm/

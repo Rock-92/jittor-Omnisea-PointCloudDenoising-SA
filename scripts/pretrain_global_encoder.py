@@ -29,6 +29,12 @@ def load_yaml(path):
     return OmegaConf.to_container(OmegaConf.load(path), resolve=True)
 
 
+def to_numpy_float32(value):
+    if isinstance(value, jt.Var):
+        value = value.numpy()
+    return value.astype(np.float32, copy=False)
+
+
 def parse_dataset_config(data_config):
     train_dataset_config = None
     if data_config.get("train_dataset", None) is not None:
@@ -365,7 +371,7 @@ def main():
         for step_idx, batch in enumerate(pbar):
             if args.max_steps_per_epoch is not None and step_idx >= args.max_steps_per_epoch:
                 break
-            pc_clean = batch["pc_clean"].astype(np.float32, copy=False)
+            pc_clean = to_numpy_float32(batch["pc_clean"])
             patch_size = pc_clean.shape[-2]
             pc_clean = pc_clean.reshape(-1, patch_size, 3)
             teacher_view = jt.array(make_view(pc_clean, weak_view_cfg, rng))
