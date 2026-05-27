@@ -50,13 +50,14 @@ def knn_dot(q, k_neighbors, scale):
     k_neighbors: (B, N, K, C)
     return:      (B, N, K)
 
-    Use batched matmul instead of 4D broadcast multiply + reduce. The latter
-    can hit a ROCm codegen bug in Jittor during backward compilation.
+    Flatten (B, N) before the multiply so Jittor sees a 3D reduce instead of
+    the 4D broadcast-reduce pattern that can fail to compile on ROCm. This is
+    also faster than launching many tiny batched GEMMs for local KNN attention.
     """
     B, N, K, C = k_neighbors.shape
-    q_flat = q.reshape(B * N, 1, C)
+    q_flat = q.reshape(B * N, C)
     k_flat = k_neighbors.reshape(B * N, K, C)
-    return jt.matmul(q_flat, k_flat.transpose(0, 2, 1)).reshape(B, N, K) * scale
+    return (q_flat.unsqueeze(1) * k_flat).sum(dim=-1).reshape(B, N, K) * scale
 
 
 def knn_weighted_sum(attn, values):
@@ -66,9 +67,9 @@ def knn_weighted_sum(attn, values):
     return: (B, N, C)
     """
     B, N, K, C = values.shape
-    attn_flat = attn.reshape(B * N, 1, K)
+    attn_flat = attn.reshape(B * N, K)
     values_flat = values.reshape(B * N, K, C)
-    return jt.matmul(attn_flat, values_flat).reshape(B, N, C)
+    return (attn_flat.unsqueeze(-1) * values_flat).sum(dim=1).reshape(B, N, C)
 
 
 class PointLayerNorm(nn.Module):
