@@ -186,7 +186,95 @@ def random_rotation(max_degrees, rng):
     ], dtype=np.float32)
 
 
-def make_view(pc_clean, cfg, rng):
+def surface_neighbor_jitter(points, reference_points, cfg, rng):
+    """
+    Move each point within the local sampled surface neighborhood.
+
+    The pretrain batch contains cached clean surface samples, not mesh faces, so
+    this approximates a small on-surface slide by interpolating toward a nearby
+    clean surface sample. The object-level surface stays the same while the
+    concrete sampled point locations change.
+    """
+    if points.shape[0] <= 1:
+        return points
+    knn = int(cfg.get("surface_jitter_knn", 12))
+    knn = max(1, min(knn, reference_points.shape[0] - 1))
+    alpha_min = float(cfg.get("surface_jitter_alpha_min", 0.05))
+    alpha_max = float(cfg.get("surface_jitter_alpha_max", 0.25))
+    if alpha_max <= 0.0:
+        return points
+    alpha_min = max(0.0, min(alpha_min, alpha_max))
+
+    tree = cKDTree(reference_points)
+    _, idx = tree.query(points, k=knn + 1)
+    if idx.ndim == 1:
+        idx = idx[:, None]
+    candidates = idx[:, 1:] if idx.shape[1] > 1 else idx
+    choice = rng.integers(0, candidates.shape[1], size=points.shape[0])
+    target = reference_points[candidates[np.arange(points.shape[0]), choice]]
+    alpha = rng.uniform(alpha_min, alpha_max, size=(points.shape[0], 1)).astype(np.float32)
+    return (points + alpha * (target - points)).astype(np.float32, copy=False)
+
+
+def normalize_barycentric(barycentric):
+    barycentric = np.maximum(barycentric.astype(np.float32, copy=False), 0.0)
+    denom = barycentric.sum(axis=-1, keepdims=True)
+    denom = np.maximum(denom, 1e-8)
+    return barycentric / denom
+
+
+def random_barycentric(num_points, rng):
+    weights = rng.random((num_points, 3), dtype=np.float32)
+    return normalize_barycentric(weights)
+
+
+def surface_mesh_jitter(surface_info, sample_idx, cfg, rng):
+    """
+    Move points exactly on cached mesh triangles when cache metadata is present.
+
+    Each cached clean point has a source triangle and barycentric coordinate.
+    The jitter mixes that coordinate with a random point on the same triangle,
+    keeping the student view on the object surface while changing the concrete
+    sampled locations.
+    """
+    if surface_info is None:
+        return None
+    required = [
+        "mesh_vertices",
+        "mesh_faces",
+        "surface_face_index",
+        "surface_barycentric",
+        "patch_seed",
+    ]
+    if any(surface_info.get(key) is None for key in required):
+        return None
+
+    vertices = surface_info["mesh_vertices"]
+    faces = surface_info["mesh_faces"]
+    face_index = surface_info["surface_face_index"][sample_idx].astype(np.int64)
+    barycentric = surface_info["surface_barycentric"][sample_idx]
+    patch_seed = surface_info["patch_seed"].reshape(1, 3)
+    if face_index.size == 0 or vertices.size == 0 or faces.size == 0:
+        return None
+
+    alpha_min = float(cfg.get("surface_jitter_alpha_min", 0.05))
+    alpha_max = float(cfg.get("surface_jitter_alpha_max", 0.25))
+    if alpha_max <= 0.0:
+        return None
+    alpha_min = max(0.0, min(alpha_min, alpha_max))
+    alpha = rng.uniform(alpha_min, alpha_max, size=(sample_idx.shape[0], 1)).astype(np.float32)
+
+    barycentric = normalize_barycentric(barycentric)
+    target_barycentric = random_barycentric(sample_idx.shape[0], rng)
+    moved_barycentric = normalize_barycentric(
+        barycentric + alpha * (target_barycentric - barycentric)
+    )
+    triangles = vertices[faces[face_index]]
+    points_abs = (triangles * moved_barycentric[:, :, None]).sum(axis=1)
+    return (points_abs - patch_seed).astype(np.float32, copy=False)
+
+
+def make_view(pc_clean, cfg, rng, surface_infos=None):
     B, N, _ = pc_clean.shape
     view = np.empty_like(pc_clean, dtype=np.float32)
     min_keep = int(round(N * float(cfg.get("min_keep_ratio", 1.0))))
@@ -194,12 +282,24 @@ def make_view(pc_clean, cfg, rng):
     noise_min = float(cfg.get("noise_std_min", 0.0))
     noise_max = float(cfg.get("noise_std_max", noise_min))
     rotate_degrees = float(cfg.get("rotate_degrees", 0.0))
+    use_surface_jitter = bool(cfg.get("surface_jitter", False))
     for b in range(B):
         patch = pc_clean[b]
         keep_count = int(rng.integers(min_keep, N + 1))
         keep_idx = rng.choice(N, size=keep_count, replace=False)
         sample_idx = rng.choice(keep_idx, size=N, replace=keep_count < N)
         points = patch[sample_idx].copy()
+        if use_surface_jitter:
+            surface_info = (
+                surface_infos[b]
+                if surface_infos is not None and b < len(surface_infos)
+                else None
+            )
+            surface_points = surface_mesh_jitter(surface_info, sample_idx, cfg, rng)
+            if surface_points is None:
+                points = surface_neighbor_jitter(points, patch, cfg, rng)
+            else:
+                points = surface_points
         rng.shuffle(points)
         rot = random_rotation(rotate_degrees, rng)
         points = points @ rot.T
@@ -217,6 +317,15 @@ def copy_params(dst, src):
 def stop_params(module):
     for param in module.parameters():
         param.stop_grad()
+
+
+def start_params(module_or_params):
+    if hasattr(module_or_params, "parameters"):
+        params = module_or_params.parameters()
+    else:
+        params = module_or_params
+    for param in params:
+        param.start_grad()
 
 
 def ema_update(dst_params, src_params, momentum):
@@ -240,12 +349,135 @@ def global_encoder_state(model):
     }
 
 
+def state_delta_stats(curr_state, prev_state):
+    total_sq = 0.0
+    max_abs = 0.0
+    changed = 0
+    for key, curr in curr_state.items():
+        if key not in prev_state:
+            continue
+        diff = curr - prev_state[key]
+        total_sq += float((diff * diff).sum())
+        key_max = float(np.max(np.abs(diff))) if diff.size else 0.0
+        max_abs = max(max_abs, key_max)
+        if key_max > 0.0:
+            changed += 1
+    return {
+        "global_param_delta_l2": float(math.sqrt(total_sq)),
+        "global_param_delta_max": max_abs,
+        "global_param_changed_keys": changed,
+    }
+
+
 def save_global_checkpoint(model, path, metadata):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     jt.save(global_encoder_state(model), path)
     meta_path = os.path.splitext(path)[0] + ".json"
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+
+def load_surface_sidecars(asset_path, cache):
+    if asset_path is None:
+        return None
+    cache_dir = str(Path(asset_path).parent)
+    if cache_dir in cache:
+        return cache[cache_dir]
+
+    mesh_path = Path(cache_dir) / "mesh.npz"
+    surface_path = Path(cache_dir) / "surface_sample.npz"
+    if not mesh_path.exists() or not surface_path.exists():
+        cache[cache_dir] = None
+        return None
+
+    with np.load(mesh_path) as mesh_npz:
+        mesh_vertices = mesh_npz["vertices"].astype(np.float32, copy=False)
+        mesh_faces = mesh_npz["faces"].astype(np.int32, copy=False)
+    with np.load(surface_path) as surface_npz:
+        surface_face_index = surface_npz["face_index"].astype(np.int32, copy=False)
+        surface_barycentric = surface_npz["barycentric"].astype(np.float32, copy=False)
+
+    cache[cache_dir] = {
+        "mesh_vertices": mesh_vertices,
+        "mesh_faces": mesh_faces,
+        "surface_face_index": surface_face_index,
+        "surface_barycentric": surface_barycentric,
+    }
+    return cache[cache_dir]
+
+
+def build_patch_surface_info(asset, cache):
+    if asset.meta is None:
+        return None
+    patch_index = asset.meta.get("patch_index")
+    patch_seed = asset.meta.get("patch_seed")
+    center = asset.meta.get("normalize_center")
+    scale = asset.meta.get("normalize_scale")
+    if patch_index is None or patch_seed is None or center is None or scale is None:
+        return None
+    scale = float(scale)
+    if scale < 1e-12:
+        return None
+
+    sidecars = load_surface_sidecars(asset.path, cache)
+    if sidecars is None:
+        return None
+
+    patch_index = patch_index.astype(np.int64, copy=False)
+    max_index = int(patch_index.max()) if patch_index.size > 0 else -1
+    if max_index >= sidecars["surface_face_index"].shape[0]:
+        return None
+
+    center = center.reshape(1, 3).astype(np.float32, copy=False)
+    mesh_vertices = ((sidecars["mesh_vertices"] - center) / scale).astype(
+        np.float32,
+        copy=False,
+    )
+    return {
+        "mesh_vertices": mesh_vertices,
+        "mesh_faces": sidecars["mesh_faces"],
+        "surface_face_index": sidecars["surface_face_index"][patch_index],
+        "surface_barycentric": sidecars["surface_barycentric"][patch_index],
+        "patch_seed": patch_seed.astype(np.float32, copy=False),
+    }
+
+
+class PretrainProcessFn:
+    def __init__(self, model):
+        self.model = model
+        self.surface_cache = {}
+
+    def __call__(self, batch):
+        processed = self.model.process_fn(batch)
+        for item, asset in zip(processed, batch):
+            item["non"] = {
+                "surface": build_patch_surface_info(asset, self.surface_cache),
+            }
+        return processed
+
+
+def flatten_surface_infos(surface_batch, patch_count):
+    if surface_batch is None:
+        return None
+    flat = []
+    for surface_info in surface_batch:
+        if surface_info is None:
+            flat.extend([None] * patch_count)
+            continue
+        info_patch_count = int(surface_info["surface_face_index"].shape[0])
+        for patch_idx in range(info_patch_count):
+            flat.append(
+                {
+                    "mesh_vertices": surface_info["mesh_vertices"],
+                    "mesh_faces": surface_info["mesh_faces"],
+                    "surface_face_index": surface_info["surface_face_index"][patch_idx],
+                    "surface_barycentric": surface_info["surface_barycentric"][patch_idx],
+                    "patch_seed": surface_info["patch_seed"][patch_idx],
+                }
+            )
+        if info_patch_count < patch_count:
+            flat.extend([None] * (patch_count - info_patch_count))
+    return flat
 
 
 def main():
@@ -294,10 +526,15 @@ def main():
     )
     stop_params(teacher_model)
     stop_params(teacher_head)
+    # In Jittor, stop_grad after load_parameters can also silence the copied
+    # student tensors. Re-enable student gradients explicitly.
+    start_params(student_model.global_encoder_parameters())
+    start_params(student_head)
+    start_params(geo_head)
 
     train_dataset_config = parse_dataset_config(data_config)
     dataset_module = PCDatasetModule(
-        process_fn=student_model._process_fn,
+        process_fn=PretrainProcessFn(student_model),
         train_dataset_config=train_dataset_config,
         train_transform=student_model.get_train_transform(),
         debug=False,
@@ -356,6 +593,7 @@ def main():
     best_loss = float("inf")
     log_rows = []
     log_path = run_dir / "pretrain_log.csv"
+    prev_global_state = global_encoder_state(student_model)
 
     for epoch in range(epochs):
         student_model.train()
@@ -371,11 +609,20 @@ def main():
         for step_idx, batch in enumerate(pbar):
             if args.max_steps_per_epoch is not None and step_idx >= args.max_steps_per_epoch:
                 break
-            pc_clean = to_numpy_float32(batch["pc_clean"])
-            patch_size = pc_clean.shape[-2]
-            pc_clean = pc_clean.reshape(-1, patch_size, 3)
+            pc_clean_raw = to_numpy_float32(batch["pc_clean"])
+            patch_count = pc_clean_raw.shape[1] if pc_clean_raw.ndim == 4 else 1
+            patch_size = pc_clean_raw.shape[-2]
+            pc_clean = pc_clean_raw.reshape(-1, patch_size, 3)
+            surface_infos = flatten_surface_infos(batch.get("surface"), patch_count)
             teacher_view = jt.array(make_view(pc_clean, weak_view_cfg, rng))
-            student_view = jt.array(make_view(pc_clean, strong_view_cfg, rng))
+            student_view = jt.array(
+                make_view(
+                    pc_clean,
+                    strong_view_cfg,
+                    rng,
+                    surface_infos=surface_infos,
+                )
+            )
             geo_target = jt.array(geometry_targets(pc_clean, rng))
 
             with jt.no_grad():
@@ -420,18 +667,36 @@ def main():
         mean_loss = float(np.mean(epoch_losses)) if epoch_losses else float("nan")
         mean_dino_loss = float(np.mean(epoch_dino_losses)) if epoch_dino_losses else float("nan")
         mean_geo_loss = float(np.mean(epoch_geo_losses)) if epoch_geo_losses else float("nan")
+        lr_value = float(optimizer.lr)
+        improved = np.isfinite(mean_loss) and mean_loss <= best_loss
+        curr_global_state = global_encoder_state(student_model)
+        delta_stats = state_delta_stats(curr_global_state, prev_global_state)
+        prev_global_state = {
+            key: value.copy()
+            for key, value in curr_global_state.items()
+        }
         row = {
             "epoch": epoch,
             "loss": mean_loss,
             "dino_loss": mean_dino_loss,
             "geo_loss": mean_geo_loss,
-            "lr": float(optimizer.lr),
+            "lr": lr_value,
+            **delta_stats,
         }
         log_rows.append(row)
         with log_path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(
                 f,
-                fieldnames=["epoch", "loss", "dino_loss", "geo_loss", "lr"],
+                fieldnames=[
+                    "epoch",
+                    "loss",
+                    "dino_loss",
+                    "geo_loss",
+                    "lr",
+                    "global_param_delta_l2",
+                    "global_param_delta_max",
+                    "global_param_changed_keys",
+                ],
             )
             writer.writeheader()
             writer.writerows(log_rows)
@@ -448,7 +713,7 @@ def main():
                 "selection_metric": "last",
             },
         )
-        if np.isfinite(mean_loss) and mean_loss <= best_loss:
+        if improved:
             best_loss = mean_loss
             best_path = output_dir / "global_encoder_best.pkl"
             save_global_checkpoint(
@@ -463,6 +728,22 @@ def main():
                 },
             )
             print(f"Saved best global encoder checkpoint: {best_path} loss={mean_loss:.6f}")
+        best_text = (
+            f"{best_loss:.6f}" if best_loss < float("inf") else "nan"
+        )
+        status = "new best" if improved else f"best={best_text}"
+        print(
+            f"Epoch {epoch} summary: "
+            f"steps={len(epoch_losses)}, "
+            f"loss={mean_loss:.6f}, "
+            f"dino_loss={mean_dino_loss:.6f}, "
+            f"geo_loss={mean_geo_loss:.6f}, "
+            f"lr={lr_value:.8g}, "
+            f"global_delta_l2={delta_stats['global_param_delta_l2']:.6g}, "
+            f"global_changed={delta_stats['global_param_changed_keys']}, "
+            f"{status}",
+            flush=True,
+        )
 
     if best_loss < float("inf"):
         print(f"Pretraining complete. Best loss={best_loss:.6f}")

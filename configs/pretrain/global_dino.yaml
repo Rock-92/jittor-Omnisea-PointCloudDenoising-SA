@@ -34,7 +34,11 @@ weak_view:
   rotate_degrees: 2.0
 
 strong_view:
-  min_keep_ratio: 0.75
-  noise_std_min: 0.005
-  noise_std_max: 0.020
+  min_keep_ratio: 1.0
+  noise_std_min: 0.010
+  noise_std_max: 0.030
   rotate_degrees: 5.0
+  surface_jitter: true
+  surface_jitter_knn: 12
+  surface_jitter_alpha_min: 0.05
+  surface_jitter_alpha_max: 0.25
