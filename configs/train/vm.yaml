@@ -1,6 +1,6 @@
 loss:
-  displacement_loss: 0.9
-  normalized_surface_loss: 0.1
+  displacement_loss: 0.8
+  normalized_surface_loss: 0.2
 
 optimizer:
   __target__: adam
