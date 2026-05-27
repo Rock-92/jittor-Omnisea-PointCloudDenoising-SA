@@ -12,7 +12,7 @@ attention_ffn_hidden_dim: 512
 global_token_blocks: 4
 global_token_ffn_hidden_dim: 512
 global_attn_bias_init: 0.0
-global_encoder_pretrain_ckpt: null
+global_encoder_pretrain_ckpt: outputs/pretrain/global_encoder/global_encoder_best.pkl
 
 # Decoder
 decoder_hidden_dims: [128, 64]

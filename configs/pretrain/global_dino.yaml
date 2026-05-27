@@ -1,0 +1,40 @@
+components:
+  data: train
+  transform: vm
+  model: vm
+
+pretrain:
+  epochs: 30
+  output_dir: outputs/pretrain/global_encoder
+
+optimizer:
+  __target__: adam
+  lr: 0.0001
+
+dino:
+  teacher_temp: 0.04
+  student_temp: 0.1
+  center_momentum: 0.9
+  ema_momentum_base: 0.996
+  ema_momentum_final: 0.999
+
+head:
+  hidden_dim: 1024
+  bottleneck_dim: 256
+  out_dim: 1024
+
+geometry:
+  weight: 0.05
+  hidden_dim: 256
+
+weak_view:
+  min_keep_ratio: 1.0
+  noise_std_min: 0.002
+  noise_std_max: 0.008
+  rotate_degrees: 2.0
+
+strong_view:
+  min_keep_ratio: 0.75
+  noise_std_min: 0.005
+  noise_std_max: 0.020
+  rotate_degrees: 5.0

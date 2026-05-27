@@ -34,6 +34,7 @@ def _to_jittor(value):
 def get_optimizer(optimizer_config, model):
     optimizer_config = dict(optimizer_config)
     __target__ = optimizer_config.pop('__target__')
+    global_encoder_lr_scale = optimizer_config.pop("global_encoder_lr_scale", None)
     MAPPING = {
         'sgd': optim.SGD,
         'adam': optim.Adam,
@@ -41,7 +42,18 @@ def get_optimizer(optimizer_config, model):
     if __target__ not in MAPPING:
         raise ValueError(f"unsupported optimizer: {__target__}")
     OptimizerClass = MAPPING[__target__]
-    optimizer = OptimizerClass(model.parameters(), **optimizer_config)
+    params = model.parameters()
+    base_lr = optimizer_config.get("lr")
+    if (
+        global_encoder_lr_scale is not None
+        and base_lr is not None
+        and hasattr(model, "optimizer_param_groups")
+    ):
+        params = model.optimizer_param_groups(
+            base_lr=base_lr,
+            global_encoder_lr_scale=global_encoder_lr_scale,
+        )
+    optimizer = OptimizerClass(params, **optimizer_config)
     return optimizer
 
 def get_optimizer_lr(optimizer):
@@ -64,7 +76,7 @@ def set_optimizer_lr(optimizer, lr: float):
     if param_groups:
         for group in param_groups:
             if isinstance(group, dict) and "lr" in group:
-                group["lr"] = lr
+                group["lr"] = lr * float(group.get("lr_scale", 1.0))
                 updated = True
     defaults = getattr(optimizer, "defaults", None)
     if isinstance(defaults, dict) and "lr" in defaults:
@@ -180,6 +192,7 @@ class DummySystem():
         if trainer_config is None:
             trainer_config = {}
         self.epochs = trainer_config.get('epochs', 1)
+        self.current_epoch = 0
         
         if optimizer_config is not None and model is not None:
             self.optimizer = get_optimizer(optimizer_config, model)
@@ -473,6 +486,7 @@ class DummySystem():
         assert self.optimizer is not None, "optimizer is None, cannot train"
         self.model.set_predict(False)
         for epoch in range(self.epochs):
+            self.current_epoch = epoch
             self.model.train()
             self.on_train_epoch_start()
             train_dataloader = self.dataset_module.train_dataloader()

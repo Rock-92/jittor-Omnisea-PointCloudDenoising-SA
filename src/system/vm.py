@@ -126,6 +126,26 @@ class VMSystem(DummySystem):
             ckpt_save_dir=ckpt_save_dir,
             ckpt_save_name=ckpt_save_name,
         )
+        if trainer_config is None:
+            trainer_config = {}
+        self.global_encoder_freeze_epochs = int(
+            trainer_config.get("global_encoder_freeze_epochs", 0)
+        )
+        self._global_encoder_trainable_state = None
+
+    def on_train_epoch_start(self):
+        super().on_train_epoch_start()
+        if not hasattr(self.model, "set_global_encoder_trainable"):
+            return
+        trainable = self.current_epoch >= self.global_encoder_freeze_epochs
+        if trainable != self._global_encoder_trainable_state:
+            self.model.set_global_encoder_trainable(trainable)
+            state = "trainable" if trainable else "frozen"
+            print(
+                f"Global encoder is {state} at epoch {self.current_epoch} "
+                f"(freeze_epochs={self.global_encoder_freeze_epochs})"
+            )
+            self._global_encoder_trainable_state = trainable
     
     def on_train_end(self):
         if self.writer is None or self.dataset_module.predict_dataset_config is None:

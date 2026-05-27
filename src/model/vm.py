@@ -42,6 +42,10 @@ class VelocityModule(ModelSpec):
             self.feat_embedding_dim * 2,
         )
         self.global_attn_bias_init = cfg.get('global_attn_bias_init', 0.0)
+        self.global_encoder_pretrain_ckpt = cfg.get(
+            'global_encoder_pretrain_ckpt',
+            None,
+        )
         self.decoder_hidden_dims = cfg.get(
             'decoder_hidden_dims',
             [cfg.get('decoder_hidden_dim', 64)],
@@ -78,6 +82,82 @@ class VelocityModule(ModelSpec):
             z_dim=self.encoder.embedding_dim,
             out_dim=3,
             hidden_dims=self.decoder_hidden_dims,
+        )
+
+        if self.global_encoder_pretrain_ckpt is not None:
+            self.load_global_encoder_pretrain(self.global_encoder_pretrain_ckpt)
+
+    @staticmethod
+    def is_global_encoder_param_name(name: str) -> bool:
+        return (
+            name.startswith("encoder.input_proj_1.")
+            or name.startswith("encoder.input_proj_2.")
+            or name.startswith("encoder.global_token_generator.")
+        )
+
+    def global_encoder_parameters(self):
+        return [
+            param
+            for name, param in self.named_parameters()
+            if self.is_global_encoder_param_name(name)
+        ]
+
+    def non_global_encoder_parameters(self):
+        return [
+            param
+            for name, param in self.named_parameters()
+            if not self.is_global_encoder_param_name(name)
+        ]
+
+    def optimizer_param_groups(self, base_lr: float, global_encoder_lr_scale=None):
+        if global_encoder_lr_scale is None:
+            return self.parameters()
+        global_params = self.global_encoder_parameters()
+        other_params = self.non_global_encoder_parameters()
+        if len(global_params) == 0 or len(other_params) == 0:
+            return self.parameters()
+        scale = float(global_encoder_lr_scale)
+        return [
+            {
+                "params": other_params,
+                "lr": float(base_lr),
+                "lr_scale": 1.0,
+            },
+            {
+                "params": global_params,
+                "lr": float(base_lr) * scale,
+                "lr_scale": scale,
+            },
+        ]
+
+    def set_global_encoder_trainable(self, trainable: bool):
+        for param in self.global_encoder_parameters():
+            if trainable:
+                param.start_grad()
+            else:
+                param.stop_grad()
+
+    def load_global_encoder_pretrain(self, checkpoint_path: str):
+        import os
+
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"global encoder pretrain checkpoint not found: {checkpoint_path}")
+        state = jt.load(checkpoint_path)
+        if isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
+        filtered = {
+            key: value
+            for key, value in state.items()
+            if self.is_global_encoder_param_name(key)
+        }
+        if len(filtered) == 0:
+            raise ValueError(
+                f"no global encoder parameters found in checkpoint: {checkpoint_path}"
+            )
+        self.load_parameters(filtered)
+        print(
+            f"Loaded {len(filtered)} global encoder parameters from "
+            f"{checkpoint_path}"
         )
     
     def predict_displacement(self, pc_noisy, point_idx=None):
