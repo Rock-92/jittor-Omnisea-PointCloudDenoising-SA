@@ -71,6 +71,20 @@ outputs/      日志、权重、结果，默认不提交
 
 当前训练流程分为三步：先从干净网格生成 clean 点云缓存，再预训练 global encoder，最后加载预训练权重进行主训练。
 
+如果 clean 点云缓存已经准备好，可以用一行命令串起预训练和主训练：
+
+```bash
+python scripts/train_pipeline.py --seed 123 --force-pretrain
+```
+
+如果 `outputs/pretrain/global_encoder/global_encoder_best.pkl` 已经存在且希望复用，去掉 `--force-pretrain` 即可：
+
+```bash
+python scripts/train_pipeline.py --seed 123
+```
+
+该脚本会在预训练结束后自动启动 `configs/task/train_vm_dino.yaml` 主训练。
+
 1. 生成 clean 点云缓存：
 
 ```bash
