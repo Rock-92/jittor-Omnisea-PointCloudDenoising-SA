@@ -27,13 +27,12 @@ conda env create -f environment.yml
 conda activate jittor
 ```
 
-## ROCm/HIP/DCU backend note
+## ROCm/HIP/DCU 后端注意事项
 
-This project is primarily tested on NVIDIA CUDA GPUs. Training on ROCm/HIP/DCU
-machines may fail during Jittor just-in-time compilation of backward fused
-operators.
+本项目主要在 NVIDIA CUDA GPU 环境下测试。使用 ROCm/HIP/DCU 机器训练时，
+Jittor 可能会在反向传播阶段即时编译 fused operator 失败。
 
-Typical symptoms include errors like:
+典型报错包含：
 
 ```text
 /opt/dtk/bin/hipcc
@@ -44,9 +43,8 @@ jt.sync(params_has_grad)
 broadcast_to ... binary_multiply ... reduce_add
 ```
 
-If this happens, it is usually a Jittor backend compilation compatibility issue,
-not a dataset, checkpoint, or loss-value problem. First verify the actual GPU
-backend:
+如果出现这类错误，通常是 Jittor 后端编译兼容性问题，不是数据集、checkpoint
+或 loss 数值本身的问题。可以先确认当前实际 GPU 后端：
 
 ```bash
 nvidia-smi
@@ -54,16 +52,16 @@ which nvcc
 which hipcc
 ```
 
-For reliable training, use an NVIDIA CUDA environment such as A800, 4090, or
-3090. Clearing the Jittor cache may be worth trying once:
+为了稳定训练，建议使用 A800、4090、3090 等 NVIDIA CUDA 环境。可以先尝试清理
+一次 Jittor 编译缓存：
 
 ```bash
 rm -rf ~/.cache/jittor
 ```
 
-If the same `hipcc` fused-operator error still appears after clearing the cache,
-switch to a CUDA machine or rewrite the affected attention operations to avoid
-the ROCm/HIP fused broadcast-reduce kernel.
+如果清理缓存后仍然出现同样的 `hipcc` fused-operator 错误，建议切换到 CUDA
+机器训练，或者改写相关 attention 操作，绕开 ROCm/HIP 后端的 fused
+broadcast-reduce kernel。
 
 ## 数据准备
 
@@ -87,6 +85,30 @@ test_noisy/
       <model_id>/
         noisy.npy
 ```
+
+训练前需要先从 `dataset_clean` 生成 clean 点云缓存。默认会根据
+`datalist/train.txt` 和 `datalist/validate.txt` 中的模型路径，读取
+`model_normalized.obj` 并采样输出 `clean.npy`：
+
+```bash
+python scripts/cache_clean_points.py \
+  --input_dataset_dir dataset_clean \
+  --output_dir cache_clean_points \
+  --datalist datalist/train.txt datalist/validate.txt \
+  --workers 8
+```
+
+生成后的缓存结构如下：
+
+```text
+cache_clean_points/
+  shapenet/
+    <synset_id>/
+      <model_id>/
+        clean.npy
+```
+
+如果缓存已存在，默认会跳过；需要重新生成时添加 `--overwrite`。
 
 数据列表在 `datalist/` 下。数据根目录配置在：
 
