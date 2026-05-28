@@ -1,9 +1,8 @@
 # Runtime outputs
 output/
-outputs/*
-!outputs/.gitkeep
-outputs1/
-outputs1.1/
+outputs*
+analysis/
+analysis_outputs/
 experiments/
 tmp_predict/
 result/
