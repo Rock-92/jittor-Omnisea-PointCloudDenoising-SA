@@ -1,0 +1,15 @@
+{
+  "checkpoint": "E:\\Code\\outputs\\pretrain\\global_encoder\\global_encoder_best.pkl",
+  "n_patches": 120,
+  "n_meshes": 30,
+  "token_dim_std_mean": 0.0533621609210968,
+  "token_pair_cos_mean": 0.2079927049772729,
+  "token_pair_cos_std": 0.3253107583660362,
+  "token_geom_spearman": 0.21273441865579745,
+  "nearest_geom_dist_mean": 1.8248374540358783,
+  "random_geom_dist_mean": 2.6468803882598877,
+  "nearest_vs_random_ratio": 0.6894295118622882,
+  "same_mesh_nearest_rate": 0.20833333333333334,
+  "same_mesh_pair_cos_mean": 0.3881606003786955,
+  "diff_mesh_pair_cos_mean": 0.20333319044102924
+}

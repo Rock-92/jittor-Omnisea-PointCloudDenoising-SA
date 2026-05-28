@@ -41,6 +41,7 @@ class VelocityModule(ModelSpec):
             'global_token_ffn_hidden_dim',
             self.feat_embedding_dim * 2,
         )
+        self.use_global_token = cfg.get('use_global_token', True)
         self.global_attn_bias_init = cfg.get('global_attn_bias_init', 0.0)
         self.global_condition_hidden_dim = cfg.get(
             'global_condition_hidden_dim',
@@ -91,6 +92,7 @@ class VelocityModule(ModelSpec):
             ffn_hidden_dim=self.attention_ffn_hidden_dim,
             global_token_blocks=self.global_token_blocks,
             global_token_ffn_hidden_dim=self.global_token_ffn_hidden_dim,
+            use_global_token=self.use_global_token,
             global_attn_bias_init=self.global_attn_bias_init,
             global_condition_hidden_dim=self.global_condition_hidden_dim,
             global_condition_strength_init=self.global_condition_strength_init,

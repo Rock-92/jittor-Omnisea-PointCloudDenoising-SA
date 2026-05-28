@@ -351,6 +351,7 @@ class FeatureExtraction(nn.Module):
         ffn_hidden_dim=None,
         global_token_blocks=4,
         global_token_ffn_hidden_dim=None,
+        use_global_token=True,
         global_attn_bias_init=0.0,
         global_condition_hidden_dim=None,
         global_condition_strength_init=1.0,
@@ -374,6 +375,7 @@ class FeatureExtraction(nn.Module):
         self.ffn_hidden_dim = int(ffn_hidden_dim)
         if global_token_ffn_hidden_dim is None:
             global_token_ffn_hidden_dim = embedding_dim * 2
+        self.use_global_token = bool(use_global_token)
         self.global_token_blocks = int(global_token_blocks)
         self.global_token_ffn_hidden_dim = int(global_token_ffn_hidden_dim)
         self.global_attn_bias_init = float(global_attn_bias_init)
@@ -433,7 +435,7 @@ class FeatureExtraction(nn.Module):
         feat = self.act(feat)
         feat = apply_point_linear(self.input_proj_2, feat)
         feat = self.act(feat)
-        global_token = self.global_token_generator(feat)
+        global_token = self.global_token_generator(feat) if self.use_global_token else None
 
         block_outputs = []
         for block_idx, (block, weight) in enumerate(zip(self.blocks, self.block_weights)):

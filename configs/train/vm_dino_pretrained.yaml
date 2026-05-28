@@ -5,7 +5,6 @@ loss:
 optimizer:
   __target__: adam
   lr: 0.000003
-  global_encoder_lr_scale: 1.0
 
 scheduler:
   __target__: reduce_on_plateau
@@ -17,4 +16,4 @@ scheduler:
 
 trainer:
   epochs: 100
-  global_encoder_freeze_epochs: 10
+  global_encoder_freeze_epochs: 0
