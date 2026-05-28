@@ -27,6 +27,44 @@ conda env create -f environment.yml
 conda activate jittor
 ```
 
+## ROCm/HIP/DCU backend note
+
+This project is primarily tested on NVIDIA CUDA GPUs. Training on ROCm/HIP/DCU
+machines may fail during Jittor just-in-time compilation of backward fused
+operators.
+
+Typical symptoms include errors like:
+
+```text
+/opt/dtk/bin/hipcc
+gfx906 / gfx926 / gfx928
+Compile fused operator failed
+optimizer.backward(loss)
+jt.sync(params_has_grad)
+broadcast_to ... binary_multiply ... reduce_add
+```
+
+If this happens, it is usually a Jittor backend compilation compatibility issue,
+not a dataset, checkpoint, or loss-value problem. First verify the actual GPU
+backend:
+
+```bash
+nvidia-smi
+which nvcc
+which hipcc
+```
+
+For reliable training, use an NVIDIA CUDA environment such as A800, 4090, or
+3090. Clearing the Jittor cache may be worth trying once:
+
+```bash
+rm -rf ~/.cache/jittor
+```
+
+If the same `hipcc` fused-operator error still appears after clearing the cache,
+switch to a CUDA machine or rewrite the affected attention operations to avoid
+the ROCm/HIP fused broadcast-reduce kernel.
+
 ## 数据准备
 
 训练数据放在项目根目录下，结构如下：
