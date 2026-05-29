@@ -421,6 +421,8 @@ class VMSSLSystem(VMSystem):
                 score_summary = self.get_validation_score_summary()
                 self.log_validation_epoch(epoch, validation_loss, score_summary)
                 self.save_best_checkpoint(epoch, validation_loss, score_summary)
+            else:
+                self.save_best_train_checkpoint(epoch, train_loss)
             self.log_epoch_metrics(epoch, train_loss, validation_loss, score_summary)
             self.step_scheduler(epoch, train_loss, validation_loss, score_summary)
 

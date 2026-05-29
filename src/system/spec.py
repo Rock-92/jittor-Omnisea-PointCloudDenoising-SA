@@ -433,6 +433,44 @@ class DummySystem():
             f"validation_loss={self.best_validation_loss}, "
             f"validation_score={validation_score}"
         )
+
+    def save_best_train_checkpoint(self, epoch, train_loss):
+        if train_loss is None:
+            return
+        if train_loss >= self.best_validation_loss:
+            return
+
+        self.best_epoch = epoch
+        self.best_validation_loss = train_loss
+        os.makedirs(self.ckpt_save_dir, exist_ok=True)
+
+        checkpoint_path = os.path.join(
+            self.ckpt_save_dir,
+            f"{self.ckpt_save_name}_best.pkl",
+        )
+        metadata_path = os.path.join(
+            self.ckpt_save_dir,
+            f"{self.ckpt_save_name}_best.json",
+        )
+        self.model.save(checkpoint_path)
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "best_epoch": self.best_epoch,
+                    "train_loss": self.best_validation_loss,
+                    "validation_loss": None,
+                    "validation_score": None,
+                    "selection_metric": "min_train_loss",
+                    "checkpoint": checkpoint_path,
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+        print(
+            f"Saved train-best checkpoint: epoch={self.best_epoch}, "
+            f"train_loss={self.best_validation_loss}"
+        )
     
     def on_before_optimizer_step(self, optimizer):
         pass
@@ -526,6 +564,8 @@ class DummySystem():
                 score_summary = self.get_validation_score_summary()
                 self.log_validation_epoch(epoch, validation_loss, score_summary)
                 self.save_best_checkpoint(epoch, validation_loss, score_summary)
+            else:
+                self.save_best_train_checkpoint(epoch, train_loss)
             self.log_epoch_metrics(epoch, train_loss, validation_loss, score_summary)
             self.step_scheduler(epoch, train_loss, validation_loss, score_summary)
             
