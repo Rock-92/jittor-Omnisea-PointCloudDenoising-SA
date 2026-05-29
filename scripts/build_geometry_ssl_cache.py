@@ -141,7 +141,7 @@ def main():
     parser.add_argument("--datalist", nargs="+", default=["datalist/train.txt"])
     parser.add_argument("--output_dir", default="geometry_ssl_cache")
     parser.add_argument("--num_shapes", type=int, default=5000)
-    parser.add_argument("--patches_per_shape", type=int, default=4)
+    parser.add_argument("--patches_per_shape", type=int, default=1)
     parser.add_argument("--patch_size", type=int, default=1000)
     parser.add_argument("--num_samples", type=int, default=32768)
     parser.add_argument("--num_vertex_samples", type=int, default=1024)

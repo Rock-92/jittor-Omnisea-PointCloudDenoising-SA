@@ -118,7 +118,7 @@ python scripts/build_geometry_ssl_cache.py \
   --datalist datalist/train.txt \
   --output_dir geometry_ssl_cache \
   --num_shapes 5000 \
-  --patches_per_shape 4 \
+  --patches_per_shape 1 \
   --num_geom_classes 12 \
   --seed 123 \
   --overwrite
@@ -132,7 +132,7 @@ C:\Users\Lenovo\anaconda3\envs\jittor\python.exe scripts\build_geometry_ssl_cach
   --datalist datalist\train.txt `
   --output_dir geometry_ssl_cache `
   --num_shapes 5000 `
-  --patches_per_shape 4 `
+  --patches_per_shape 1 `
   --num_geom_classes 12 `
   --seed 123 `
   --overwrite
@@ -185,7 +185,7 @@ epochs = 30
 num_geom_classes = 12
 num_prototypes = 24
 swav_weight = 0.2
-batch_size = 64
+batch_size = 16
 lr = 1e-4
 ```
 
@@ -329,7 +329,7 @@ python scripts/build_geometry_ssl_cache.py \
   --datalist datalist/train.txt \
   --output_dir geometry_ssl_cache \
   --num_shapes 5000 \
-  --patches_per_shape 4 \
+  --patches_per_shape 1 \
   --num_geom_classes 12 \
   --seed 123 \
   --overwrite
