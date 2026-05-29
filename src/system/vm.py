@@ -355,9 +355,9 @@ class VMSSLSystem(VMSystem):
         if abs(self.global_lr_scale - 1.0) < 1e-12:
             return
         for p in self._global_params:
-            grad = getattr(p, "grad", None)
+            grad = p.opt_grad(optimizer)
             if grad is not None:
-                p.grad = grad * self.global_lr_scale
+                grad.update(grad * self.global_lr_scale)
 
     def train(self):
         assert self.optimizer is not None, "optimizer is None, cannot train"
