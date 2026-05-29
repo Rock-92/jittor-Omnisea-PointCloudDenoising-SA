@@ -1,0 +1,30 @@
+__target__: GlobalTokenSSLModule
+
+attention_knn: [8, 16, 32]
+input_dim: 3
+input_expand_dim: 128
+feat_embedding_dim: 256
+attention_blocks: 4
+attention_weight_init: [1.0, 0.6, 0.3, 0.2]
+relative_position_bias_hidden_dim: 64
+attention_ffn_hidden_dim: 512
+global_token_blocks: 4
+global_token_ffn_hidden_dim: 512
+global_attn_bias_init: 0.0
+
+patch_size: 1000
+num_geom_classes: 3
+num_prototypes: 6
+projection_dim: 128
+ssl_hidden_dim: 256
+
+noise_std_min: 0.005
+noise_std_max: 0.020
+dropout_min: 0.0
+dropout_max: 0.08
+jitter_std: 0.001
+jitter_clip: 0.003
+
+swav_temperature: 0.1
+sinkhorn_epsilon: 0.05
+sinkhorn_iters: 3

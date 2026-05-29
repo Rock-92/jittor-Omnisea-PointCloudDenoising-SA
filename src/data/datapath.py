@@ -62,6 +62,20 @@ class CleanNpyLazyAsset(LazyAsset):
         return asset
 
 @dataclass
+class GeometrySSLLazyAsset(LazyAsset):
+    def load(self) -> 'Asset':
+        data = np.load(self.path, allow_pickle=False)
+        patch = data["patch"].astype(np.float32, copy=False)
+        label = np.asarray(data["label"], dtype=np.int64)
+        asset = Asset(
+            path=self.path,
+            cls=self.cls,
+            sampled_vertices=patch,
+            meta={"geom_label": label},
+        )
+        return asset
+
+@dataclass
 class Datapath(ConfigSpec):
     """handle input data paths"""
     
@@ -105,6 +119,7 @@ class Datapath(ConfigSpec):
             'obj': ObjLazyAsset,
             'npy': NpyLazyAsset,
             'clean_npy': CleanNpyLazyAsset,
+            'geometry_ssl': GeometrySSLLazyAsset,
         }
         input_dataset_dir = kwargs.get('input_dataset_dir', '')
         num_files = kwargs.get('num_files', None)

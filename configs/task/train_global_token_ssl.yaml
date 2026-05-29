@@ -1,0 +1,10 @@
+mode: train
+load_ckpt: null
+debug: false
+
+components:
+  data: global_token_ssl
+  model: global_token_ssl
+  transform: global_token_ssl
+  train: global_token_ssl
+  system: global_token_ssl
