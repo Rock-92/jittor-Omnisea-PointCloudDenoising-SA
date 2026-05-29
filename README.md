@@ -209,12 +209,6 @@ outputs/checkpoints/global_token_ssl/checkpoint_best.pkl
 outputs/checkpoints/global_token_ssl/checkpoint_<epoch>.pkl
 ```
 
-如果只是快速检查链路，可以先运行 smoke 版本：
-
-```bash
-python run.py --task configs/task/train_global_token_ssl_smoke.yaml --seed 123
-```
-
 ## Step 4: 使用 SSL 权重开始主去噪训练
 
 SSL 预训练完成后，使用下面入口开始主训练：
