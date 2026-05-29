@@ -4,7 +4,7 @@ import jittor as jt
 import numpy as np
 from jittor import nn
 
-from .feature import FeatureExtraction, apply_point_linear
+from .feature import GlobalTokenGenerator, apply_point_linear
 from .spec import ModelSpec
 from ..data.asset import Asset
 
@@ -31,6 +31,34 @@ class MLPHead(nn.Module):
         return self.lin_2(x)
 
 
+class GlobalTokenEncoder(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        input_expand_dim,
+        embedding_dim,
+        global_token_blocks,
+        global_token_ffn_hidden_dim,
+    ):
+        super().__init__()
+        self.embedding_dim = int(embedding_dim)
+        self.input_proj_1 = nn.Linear(input_dim, input_expand_dim)
+        self.input_proj_2 = nn.Linear(input_expand_dim, embedding_dim)
+        self.act = nn.ReLU()
+        self.global_token_generator = GlobalTokenGenerator(
+            dim=embedding_dim,
+            num_blocks=global_token_blocks,
+            ffn_hidden_dim=global_token_ffn_hidden_dim,
+        )
+
+    def execute(self, pc):
+        feat = apply_point_linear(self.input_proj_1, pc)
+        feat = self.act(feat)
+        feat = apply_point_linear(self.input_proj_2, feat)
+        feat = self.act(feat)
+        return self.global_token_generator(feat)
+
+
 class GlobalTokenSSLModule(ModelSpec):
     def __init__(self, model_config, transform_config):
         super().__init__(model_config, transform_config)
@@ -49,18 +77,12 @@ class GlobalTokenSSLModule(ModelSpec):
         self.sinkhorn_epsilon = float(cfg.get("sinkhorn_epsilon", 0.05))
         self.sinkhorn_iters = int(cfg.get("sinkhorn_iters", 3))
 
-        self.encoder = FeatureExtraction(
-            knn_scales=cfg.get("attention_knn", [8, 16, 32]),
+        self.encoder = GlobalTokenEncoder(
             input_dim=cfg.get("input_dim", 3),
             input_expand_dim=cfg.get("input_expand_dim", 128),
             embedding_dim=cfg["feat_embedding_dim"],
-            num_blocks=cfg.get("attention_blocks", 4),
-            attention_weight_init=cfg.get("attention_weight_init", [1.0, 0.6, 0.3, 0.2]),
-            relative_position_bias_hidden_dim=cfg.get("relative_position_bias_hidden_dim", 64),
-            ffn_hidden_dim=cfg.get("attention_ffn_hidden_dim", 512),
             global_token_blocks=cfg.get("global_token_blocks", 4),
             global_token_ffn_hidden_dim=cfg.get("global_token_ffn_hidden_dim", 512),
-            global_attn_bias_init=cfg.get("global_attn_bias_init", 0.0),
         )
         dim = self.encoder.embedding_dim
         self.geom_head = MLPHead(dim, cfg.get("ssl_hidden_dim", 256), self.num_geom_classes)
@@ -68,11 +90,7 @@ class GlobalTokenSSLModule(ModelSpec):
         self.prototype_head = nn.Linear(self.projection_dim, self.num_prototypes, bias=False)
 
     def encode_global(self, pc):
-        feat = apply_point_linear(self.encoder.input_proj_1, pc)
-        feat = self.encoder.act(feat)
-        feat = apply_point_linear(self.encoder.input_proj_2, feat)
-        feat = self.encoder.act(feat)
-        token = self.encoder.global_token_generator(feat)
+        token = self.encoder(pc)
         return token[:, 0, :]
 
     def make_view(self, clean_patch):
