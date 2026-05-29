@@ -4,7 +4,7 @@ loader: &loader geometry_ssl
 train_dataset:
   shuffle: True
   batch_size: 64
-  num_workers: 0
+  num_workers: 8
   datapath:
     input_dataset_dir: ./geometry_ssl_cache
     use_prob: False
