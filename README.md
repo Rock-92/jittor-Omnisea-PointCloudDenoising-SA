@@ -77,7 +77,9 @@ python scripts/cache_clean_points.py \
   --input_dataset_dir dataset_clean \
   --output_dir cache_clean_points \
   --datalist datalist/train.txt datalist/validate.txt \
-  --workers 8
+  --workers 8 \
+  --seed 123 \
+  --overwrite
 ```
 
 Windows 示例：
@@ -87,7 +89,9 @@ C:\Users\Lenovo\anaconda3\envs\jittor\python.exe scripts\cache_clean_points.py `
   --input_dataset_dir E:\Code\competition2_EdgeConv\dataset_clean `
   --output_dir cache_clean_points `
   --datalist datalist\train.txt datalist\validate.txt `
-  --workers 8
+  --workers 8 `
+  --seed 123 `
+  --overwrite
 ```
 
 输出结构：
@@ -100,11 +104,7 @@ cache_clean_points/
         clean.npy
 ```
 
-已有缓存默认跳过。需要重建时加：
-
-```bash
---overwrite
-```
+命令中默认加入了 `--overwrite`，会重建已有缓存；如果想复用已有缓存，可以去掉 `--overwrite`。
 
 ## Step 2: 生成 SSL 几何缓存
 
@@ -325,7 +325,9 @@ python scripts/cache_clean_points.py \
   --input_dataset_dir dataset_clean \
   --output_dir cache_clean_points \
   --datalist datalist/train.txt datalist/validate.txt \
-  --workers 8
+  --workers 8 \
+  --seed 123 \
+  --overwrite
 
 # 2. 生成 SSL 几何缓存
 python scripts/build_geometry_ssl_cache.py \

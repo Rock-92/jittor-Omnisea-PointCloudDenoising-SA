@@ -31,7 +31,7 @@ def read_datalists(paths: Iterable[Path]) -> List[str]:
     return rel_paths
 
 
-def cache_one(args: Tuple[str, str, str, str, str, int, int, bool]):
+def cache_one(args: Tuple[str, str, str, str, str, int, int, bool, int]):
     (
         rel_path,
         input_dataset_dir,
@@ -41,7 +41,9 @@ def cache_one(args: Tuple[str, str, str, str, str, int, int, bool]):
         num_samples,
         num_vertex_samples,
         overwrite,
+        seed,
     ) = args
+    np.random.seed(seed)
     mesh_path = Path(input_dataset_dir) / rel_path / mesh_name
     output_path = Path(output_dir) / rel_path / output_name
 
@@ -96,12 +98,14 @@ def parse_args():
     parser.add_argument("--num_samples", type=int, default=32768)
     parser.add_argument("--num_vertex_samples", type=int, default=1024)
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    np.random.seed(args.seed)
     datalist_paths = [Path(p) for p in args.datalist]
     rel_paths = read_datalists(datalist_paths)
     tasks = [
@@ -114,8 +118,9 @@ def main():
             args.num_samples,
             args.num_vertex_samples,
             args.overwrite,
+            args.seed + i,
         )
-        for rel_path in rel_paths
+        for i, rel_path in enumerate(rel_paths)
     ]
 
     counts = {"ok": 0, "skip": 0, "missing": 0, "error": 0}
