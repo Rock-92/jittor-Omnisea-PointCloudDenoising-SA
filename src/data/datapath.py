@@ -66,12 +66,16 @@ class GeometrySSLLazyAsset(LazyAsset):
     def load(self) -> 'Asset':
         data = np.load(self.path, allow_pickle=False)
         patch = data["patch"].astype(np.float32, copy=False)
-        label = np.asarray(data["label"], dtype=np.int64)
+        meta = {}
+        if "label" in data:
+            meta["geom_label"] = np.asarray(data["label"], dtype=np.int64)
+        if "geom_feature" in data:
+            meta["geom_feature"] = data["geom_feature"].astype(np.float32, copy=False)
         asset = Asset(
             path=self.path,
             cls=self.cls,
             sampled_vertices=patch,
-            meta={"geom_label": label},
+            meta=meta,
         )
         return asset
 

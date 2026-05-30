@@ -9,26 +9,28 @@ from .spec import ModelSpec
 from ..data.asset import Asset
 
 
-def l2_normalize(x, eps=1e-12):
-    return x / jt.sqrt((x * x).sum(dim=-1, keepdims=True) + eps)
-
-
-def soft_cross_entropy(logits, target_prob):
-    log_prob = nn.log_softmax(logits, dim=-1)
-    return -(target_prob * log_prob).sum(dim=-1).mean()
-
-
-class MLPHead(nn.Module):
-    def __init__(self, in_dim, hidden_dim, out_dim):
+class MAEDecoder(nn.Module):
+    def __init__(self, in_dim, hidden_dim, num_points):
         super().__init__()
+        self.num_points = int(num_points)
         self.lin_1 = nn.Linear(in_dim, hidden_dim)
-        self.lin_2 = nn.Linear(hidden_dim, out_dim)
+        self.lin_2 = nn.Linear(hidden_dim, hidden_dim)
+        self.lin_3 = nn.Linear(hidden_dim, self.num_points * 3)
         self.act = nn.ReLU()
 
     def execute(self, x):
         x = self.lin_1(x)
         x = self.act(x)
-        return self.lin_2(x)
+        x = self.lin_2(x)
+        x = self.act(x)
+        return self.lin_3(x).reshape(x.shape[0], self.num_points, 3)
+
+
+def chamfer_l2(pred, target):
+    dist = ((pred.unsqueeze(2) - target.unsqueeze(1)) ** 2).sum(dim=-1)
+    min_pred, _ = jt.min(dist, dim=2)
+    min_target, _ = jt.min(dist, dim=1)
+    return min_pred.mean() + min_target.mean()
 
 
 class GlobalTokenEncoder(nn.Module):
@@ -64,18 +66,22 @@ class GlobalTokenSSLModule(ModelSpec):
         super().__init__(model_config, transform_config)
         cfg = self.model_config
         self.patch_size = int(cfg.get("patch_size", 1000))
-        self.noise_std_min = float(cfg.get("noise_std_min", 0.005))
-        self.noise_std_max = float(cfg.get("noise_std_max", 0.020))
-        self.dropout_min = float(cfg.get("dropout_min", 0.0))
-        self.dropout_max = float(cfg.get("dropout_max", 0.08))
-        self.jitter_std = float(cfg.get("jitter_std", 0.001))
-        self.jitter_clip = float(cfg.get("jitter_clip", 0.003))
-        self.num_geom_classes = int(cfg.get("num_geom_classes", 12))
-        self.num_prototypes = int(cfg.get("num_prototypes", 24))
-        self.projection_dim = int(cfg.get("projection_dim", 128))
-        self.swav_temperature = float(cfg.get("swav_temperature", 0.1))
-        self.sinkhorn_epsilon = float(cfg.get("sinkhorn_epsilon", 0.05))
-        self.sinkhorn_iters = int(cfg.get("sinkhorn_iters", 3))
+        self.mask_ratio = float(cfg.get("mask_ratio", 0.6))
+        self.mae_visible_points = int(
+            cfg.get(
+                "mae_visible_points",
+                max(1, round(self.patch_size * (1.0 - self.mask_ratio))),
+            )
+        )
+        self.mae_mask_points = int(
+            cfg.get(
+                "mae_mask_points",
+                max(1, self.patch_size - self.mae_visible_points),
+            )
+        )
+        self.mae_noise_std = float(cfg.get("mae_noise_std", 0.0))
+        self.mae_jitter_std = float(cfg.get("mae_jitter_std", 0.0))
+        self.mae_jitter_clip = float(cfg.get("mae_jitter_clip", 0.0))
 
         self.encoder = GlobalTokenEncoder(
             input_dim=cfg.get("input_dim", 3),
@@ -85,107 +91,78 @@ class GlobalTokenSSLModule(ModelSpec):
             global_token_ffn_hidden_dim=cfg.get("global_token_ffn_hidden_dim", 512),
         )
         dim = self.encoder.embedding_dim
-        self.geom_head = MLPHead(dim, cfg.get("ssl_hidden_dim", 256), self.num_geom_classes)
-        self.projector = MLPHead(dim, cfg.get("ssl_hidden_dim", 256), self.projection_dim)
-        self.prototype_head = nn.Linear(self.projection_dim, self.num_prototypes, bias=False)
+        self.mae_decoder = MAEDecoder(
+            in_dim=dim,
+            hidden_dim=cfg.get("mae_decoder_hidden_dim", 512),
+            num_points=self.mae_mask_points,
+        )
 
     def encode_global(self, pc):
         token = self.encoder(pc)
         return token[:, 0, :]
 
-    def make_view(self, clean_patch):
-        noise_std = jt.rand((clean_patch.shape[0], 1, 1)) * (
-            self.noise_std_max - self.noise_std_min
-        ) + self.noise_std_min
-        # Jittor has no laplace helper here; inverse-CDF from uniform.
-        u = jt.rand(clean_patch.shape) - 0.5
-        laplace = -noise_std * jt.sign(u) * jt.log(1.0 - 2.0 * jt.abs(u) + 1e-12)
-        jitter = jt.clamp(jt.randn(clean_patch.shape) * self.jitter_std, -self.jitter_clip, self.jitter_clip)
-        return clean_patch + laplace + jitter
-
-    def make_view_np(self, clean_patch):
-        pc = clean_patch.astype(np.float32, copy=True)
-        n = pc.shape[0]
-        drop = np.random.uniform(self.dropout_min, self.dropout_max)
-        keep = max(1, int(round(n * (1.0 - drop))))
-        keep_idx = np.random.choice(n, keep, replace=False)
-        pc = pc[keep_idx]
-        if pc.shape[0] < n:
-            add_idx = np.random.choice(pc.shape[0], n - pc.shape[0], replace=True)
-            pc = np.concatenate([pc, pc[add_idx]], axis=0)
-        pc = pc[np.random.permutation(n)]
-        noise_std = np.random.uniform(self.noise_std_min, self.noise_std_max)
-        pc = pc + np.random.laplace(0.0, noise_std, size=pc.shape).astype(np.float32)
-        jitter = np.clip(
-            np.random.normal(0.0, self.jitter_std, size=pc.shape),
-            -self.jitter_clip,
-            self.jitter_clip,
-        ).astype(np.float32)
-        return (pc + jitter).astype(np.float32, copy=False)
-
-    def sinkhorn(self, scores):
-        q = jt.exp(scores / self.sinkhorn_epsilon).transpose(0, 1)
-        q = q / (q.sum() + 1e-12)
-        k = q.shape[0]
-        b = q.shape[1]
-        for _ in range(self.sinkhorn_iters):
-            q = q / (q.sum(dim=1, keepdims=True) + 1e-12)
-            q = q / k
-            q = q / (q.sum(dim=0, keepdims=True) + 1e-12)
-            q = q / b
-        q = q * b
-        return q.transpose(0, 1)
-
-    def forward_heads(self, pc):
-        z = self.encode_global(pc)
-        geom_logits = self.geom_head(z)
-        proj = l2_normalize(self.projector(z))
-        proto_logits = self.prototype_head(proj)
-        return geom_logits, proto_logits
-
     def training_step(self, batch: Dict) -> Dict:
-        clean_patch = batch["pc_clean"].reshape(-1, self.patch_size, 3)
-        labels = batch["geom_label"].reshape(-1).int32()
-        view_a = batch.get("view_a", None)
-        view_b = batch.get("view_b", None)
-        if view_a is None or view_b is None:
-            view_a = self.make_view(clean_patch)
-            view_b = self.make_view(clean_patch)
+        visible = batch.get("pc_visible", None)
+        masked = batch.get("pc_masked", None)
+        if visible is None or masked is None:
+            clean_patch = batch["pc_clean"].reshape(-1, self.patch_size, 3)
+            visible, masked = self.make_mae_batch_np(clean_patch.numpy())
+            visible = jt.array(visible)
+            masked = jt.array(masked)
         else:
-            view_a = view_a.reshape(-1, self.patch_size, 3)
-            view_b = view_b.reshape(-1, self.patch_size, 3)
+            visible = visible.reshape(-1, self.mae_visible_points, 3)
+            masked = masked.reshape(-1, self.mae_mask_points, 3)
 
-        geom_a, proto_a = self.forward_heads(view_a)
-        geom_b, proto_b = self.forward_heads(view_b)
-        loss_geom = (nn.cross_entropy_loss(geom_a, labels) + nn.cross_entropy_loss(geom_b, labels)) * 0.5
-
-        scores_a = proto_a / self.swav_temperature
-        scores_b = proto_b / self.swav_temperature
-        with jt.no_grad():
-            q_a = self.sinkhorn(proto_a)
-            q_b = self.sinkhorn(proto_b)
-        loss_swav = 0.5 * (
-            soft_cross_entropy(scores_a, q_b) + soft_cross_entropy(scores_b, q_a)
-        )
-        pred = geom_a.argmax(dim=-1)[0]
-        acc = (pred == labels).float().mean()
+        z = self.encode_global(visible)
+        recon = self.mae_decoder(z)
+        loss_mae = chamfer_l2(recon, masked)
         return {
-            "geom_loss": loss_geom,
-            "swav_loss": loss_swav,
-            "geom_acc": acc,
+            "mae_loss": loss_mae,
         }
+
+    def make_mae_batch_np(self, clean_patch):
+        visible = []
+        masked = []
+        for pc in clean_patch:
+            v, m = self.make_mae_sample_np(pc)
+            visible.append(v)
+            masked.append(m)
+        return (
+            np.stack(visible, axis=0).astype(np.float32, copy=False),
+            np.stack(masked, axis=0).astype(np.float32, copy=False),
+        )
+
+    def make_mae_sample_np(self, clean_patch):
+        pc = clean_patch.astype(np.float32, copy=False)
+        n = pc.shape[0]
+        if self.mae_visible_points + self.mae_mask_points <= n:
+            idx = np.random.permutation(n)
+            visible_idx = idx[: self.mae_visible_points]
+            masked_idx = idx[self.mae_visible_points : self.mae_visible_points + self.mae_mask_points]
+        else:
+            visible_idx = np.random.choice(n, self.mae_visible_points, replace=True)
+            masked_idx = np.random.choice(n, self.mae_mask_points, replace=True)
+        visible = pc[visible_idx].copy()
+        masked = pc[masked_idx].copy()
+        if self.mae_noise_std > 0.0:
+            visible += np.random.laplace(0.0, self.mae_noise_std, size=visible.shape).astype(np.float32)
+        if self.mae_jitter_std > 0.0:
+            jitter = np.random.normal(0.0, self.mae_jitter_std, size=visible.shape).astype(np.float32)
+            if self.mae_jitter_clip > 0.0:
+                jitter = np.clip(jitter, -self.mae_jitter_clip, self.mae_jitter_clip)
+            visible += jitter
+        return visible.astype(np.float32, copy=False), masked.astype(np.float32, copy=False)
 
     def process_fn(self, batch: List[Asset]) -> List[Dict]:
         out = []
         for b in batch:
             assert b.sampled_vertices is not None
-            assert b.meta is not None and "geom_label" in b.meta
+            visible, masked = self.make_mae_sample_np(b.sampled_vertices)
             out.append(
                 {
                     "pc_clean": b.sampled_vertices,
-                    "view_a": self.make_view_np(b.sampled_vertices),
-                    "view_b": self.make_view_np(b.sampled_vertices),
-                    "geom_label": b.meta["geom_label"],
+                    "pc_visible": visible,
+                    "pc_masked": masked,
                 }
             )
         return out

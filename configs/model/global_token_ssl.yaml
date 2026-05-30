@@ -13,18 +13,14 @@ global_token_ffn_hidden_dim: 512
 global_attn_bias_init: 0.0
 
 patch_size: 1000
-num_geom_classes: 12
-num_prototypes: 24
-projection_dim: 128
-ssl_hidden_dim: 256
 
-noise_std_min: 0.005
-noise_std_max: 0.020
-dropout_min: 0.0
-dropout_max: 0.08
-jitter_std: 0.001
-jitter_clip: 0.003
-
-swav_temperature: 0.1
-sinkhorn_epsilon: 0.05
-sinkhorn_iters: 3
+# Lightweight Point-MAE style pretraining.
+# A random subset of clean patch points is hidden, the global token encoder sees
+# only visible points, and mae_decoder reconstructs the masked point set.
+mask_ratio: 0.6
+mae_visible_points: 400
+mae_mask_points: 600
+mae_decoder_hidden_dim: 512
+mae_noise_std: 0.005
+mae_jitter_std: 0.001
+mae_jitter_clip: 0.003

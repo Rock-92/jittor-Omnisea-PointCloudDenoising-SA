@@ -1,6 +1,6 @@
 # Jittor Point Cloud Denoising
 
-这是一个基于 Jittor 的点云去噪项目。模型输入 noisy patch，预测每个点的去噪位移：
+这是一个基于 Jittor 的点云去噪项目。主模型输入 noisy patch，不直接预测 clean point，而是预测每个点的去噪位移：
 
 ```text
 target = pc_clean - pc_noisy
@@ -15,9 +15,9 @@ pc_pred = pc_noisy + displacement
 + MLP displacement decoder
 ```
 
-其中 global token encoder 可以先用“几何伪标签 + SwAV prototype consistency”做自监督预训练，再接入主去噪训练。
+其中 global token encoder 可以先用轻量 Point-MAE 风格任务做自监督预训练，再接入主去噪训练。
 
-## 环境
+## Environment
 
 推荐使用 NVIDIA CUDA 环境：
 
@@ -35,9 +35,13 @@ conda activate jittor
 python -m pip install -r requirements.txt
 ```
 
-ROCm/HIP/DCU 后端可能触发 Jittor fused operator 编译失败。训练建议使用 A800、4090、3090 等 NVIDIA CUDA 机器。
+本地 Windows 常用 Python：
 
-## 数据目录
+```text
+C:\Users\Lenovo\anaconda3\envs\jittor\python.exe
+```
+
+## Data Layout
 
 clean mesh 目录：
 
@@ -60,17 +64,18 @@ test_noisy/
         noisy.npy
 ```
 
-如果原始数据放在隔壁项目，例如：
+如果原始数据在隔壁项目，例如：
 
 ```text
 E:\Code\competition2_EdgeConv\dataset_clean
+E:\Code\competition2_EdgeConv\test_noisy
 ```
 
-下面命令里的 `--input_dataset_dir` 改成对应路径即可。
+把下面命令里的 `--input_dataset_dir` 或配置里的 `input_dataset_dir` 改成对应路径即可。
 
-## Step 1: 生成主训练 clean 缓存
+## Step 1: Build Clean Cache
 
-主去噪训练读取的是 clean 点云缓存，不直接从 mesh 训练。先从 OBJ 采样生成 `clean.npy`：
+主去噪训练读取 clean 点云缓存，不直接从 mesh 训练。先从 OBJ 采样生成 `clean.npy`：
 
 ```bash
 python scripts/cache_clean_points.py \
@@ -104,13 +109,9 @@ cache_clean_points/
         clean.npy
 ```
 
-命令中默认加入了 `--overwrite`，会重建已有缓存；如果想复用已有缓存，可以去掉 `--overwrite`。
+## Step 2: Build SSL Patch Cache
 
-## Step 2: 生成 SSL 几何缓存
-
-global token 自监督预训练使用单独的几何缓存 `geometry_ssl_cache`。它会从真实 OBJ 采样 clean patch，计算 PCA、局部曲率、normal variation 等几何特征，再用 k-means 生成几何伪标签。
-
-推荐第一版配置：
+global token 自监督预训练使用单独缓存 `geometry_ssl_cache`。当前 MAE 预训练只需要 `samples/*.npz` 里的 clean patch；脚本仍会额外保存几何特征、k-means 标签和统计文件，方便后续诊断或对比实验。
 
 ```bash
 python scripts/build_geometry_ssl_cache.py \
@@ -154,52 +155,44 @@ geometry_ssl_cache/
   sources.json
 ```
 
-其中：
+## Step 3: Pretrain Global Token Encoder
 
-- `samples/*.npz`：单个 clean patch 和几何伪标签，供 dataloader 训练使用。
-- `labels.npy`：k-means 伪标签。
-- `geom_features.npy`：几何描述符。
-- `kmeans.json`：聚类中心、特征名、每类数量。
+当前 SSL 预训练是轻量 Point-MAE 风格：
 
-## Step 3: 预训练 global token encoder
+```text
+clean patch: 1000 points
+-> 随机 visible 400 点，加入轻微 noise/jitter
+-> masked 600 点作为重建目标
+-> visible points 输入 global token encoder
+-> 输出 global token: (B, 256)
+-> mae_decoder 重建 masked point set
+-> Chamfer L2 loss
+```
 
-生成 `geometry_ssl_cache` 后，启动 global token SSL 预训练：
+启动预训练：
 
 ```bash
 python run.py --task configs/task/train_global_token_ssl.yaml --seed 123
 ```
 
-训练配置：
-
-```text
-configs/model/global_token_ssl.yaml
-configs/data/global_token_ssl.yaml
-configs/train/global_token_ssl.yaml
-configs/task/train_global_token_ssl.yaml
-```
-
-默认设置：
+默认关键配置：
 
 ```text
 epochs = 30
-num_geom_classes = 12
-num_prototypes = 24
-swav_weight = 0.2
 batch_size = 16
 lr = 1e-4
+patch_size = 1000
+mae_visible_points = 400
+mae_mask_points = 600
+mae_decoder_hidden_dim = 512
+mae_noise_std = 0.005
+mae_jitter_std = 0.001
 ```
 
-每个 clean patch 会生成两个增强 view：
+loss：
 
 ```text
-view_a = dropout/resample + Laplace noise + small jitter
-view_b = another dropout/resample + Laplace noise + small jitter
-```
-
-预训练 loss：
-
-```text
-loss = geom_loss + 0.2 * swav_loss
+loss = mae_loss
 ```
 
 输出 checkpoint：
@@ -209,9 +202,11 @@ outputs/checkpoints/global_token_ssl/checkpoint_best.pkl
 outputs/checkpoints/global_token_ssl/checkpoint_<epoch>.pkl
 ```
 
-## Step 4: 使用 SSL 权重开始主去噪训练
+注意：`checkpoint_best.pkl` 按最低 train loss 保存，因为 SSL 当前没有验证集。
 
-SSL 预训练完成后，使用下面入口开始主训练：
+## Step 4: Train VM With SSL Weights
+
+SSL 预训练完成后，使用下面入口开始主去噪训练：
 
 ```bash
 python run.py --task configs/task/train_vm_ssl.yaml --seed 123
@@ -222,9 +217,9 @@ python run.py --task configs/task/train_vm_ssl.yaml --seed 123
 ```text
 1. 创建正常 VelocityModule 去噪模型
 2. 从 outputs/checkpoints/global_token_ssl/checkpoint_best.pkl 加载：
-   - input_proj_1
-   - input_proj_2
-   - global_token_generator
+   - encoder.input_proj_1
+   - encoder.input_proj_2
+   - encoder.global_token_generator
 3. 前 8 个 epoch 冻结 global token encoder
 4. 第 9 个 epoch 起解冻，并使用 0.2x global gradient scale
 5. 按原 displacement + surface loss 训练主去噪模型
@@ -260,27 +255,21 @@ data_name: clean.npy
 outputs/checkpoints/vm_ssl/checkpoint_best.pkl
 ```
 
-## 不使用 SSL 的原始主训练
+## Train Without SSL
 
-如果不想使用 global token 预训练，仍然可以走原来的训练入口：
+如果不使用 global token 预训练，使用原始主训练入口：
 
 ```bash
 python run.py --task configs/task/train_vm.yaml --seed 123
 ```
 
-或者：
-
-```bash
-python scripts/train.py --seed 123
-```
-
-默认 checkpoint 输出：
+默认 checkpoint：
 
 ```text
 outputs/checkpoints/vm/checkpoint_best.pkl
 ```
 
-## 推理
+## Inference
 
 确认 `configs/task/predict_vm.yaml` 中的 `load_ckpt` 指向要使用的 checkpoint，例如：
 
@@ -294,24 +283,14 @@ load_ckpt: outputs/checkpoints/vm_ssl/checkpoint_best.pkl
 python scripts/infer.py --seed 123
 ```
 
-推理输出：
+如果测试数据在隔壁项目，修改：
 
-```text
-outputs/result/test_noisy/
-  shapenet/
-    <synset_id>/
-      <model_id>/
-        denoised.npy
+```yaml
+# configs/data/predict.yaml
+input_dataset_dir: ../competition2_EdgeConv/test_noisy
 ```
 
-打包提交：
-
-```bash
-cd outputs/result/test_noisy
-zip -r ../../../result.zip shapenet/
-```
-
-## 推荐完整流程
+## Recommended Flow
 
 ```bash
 # 1. 生成主训练 clean 缓存
@@ -323,7 +302,7 @@ python scripts/cache_clean_points.py \
   --seed 123 \
   --overwrite
 
-# 2. 生成 SSL 几何缓存
+# 2. 生成 SSL patch 缓存
 python scripts/build_geometry_ssl_cache.py \
   --input_dataset_dir dataset_clean \
   --datalist datalist/train.txt \
@@ -344,7 +323,7 @@ python run.py --task configs/task/train_vm_ssl.yaml --seed 123
 python scripts/infer.py --seed 123
 ```
 
-## 诊断 global token
+## Diagnose Global Token
 
 可以使用：
 
@@ -366,7 +345,7 @@ python tools/analyze_global_token.py \
 - denoising encoder 是否关注 global token。
 - local attention 中 global token 权重是否高于 uniform baseline。
 
-## 项目结构
+## Project Layout
 
 ```text
 configs/       配置文件
@@ -377,6 +356,6 @@ tools/         诊断工具
 outputs/       checkpoint、日志、推理结果
 ```
 
-## 说明
+## Notes
 
 仓库不包含数据集、训练权重和大缓存文件。`cache_clean_points/`、`geometry_ssl_cache/`、`outputs/` 都是运行时产物。

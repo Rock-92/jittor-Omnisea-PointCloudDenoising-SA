@@ -1,7 +1,5 @@
 loss:
-  geom_loss: 1.0
-  swav_loss: 0.2
-  geom_acc: 0.0
+  mae_loss: 1.0
 
 optimizer:
   __target__: adam
