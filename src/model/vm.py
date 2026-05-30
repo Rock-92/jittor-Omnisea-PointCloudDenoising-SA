@@ -41,7 +41,6 @@ class VelocityModule(ModelSpec):
             'global_token_ffn_hidden_dim',
             self.feat_embedding_dim * 2,
         )
-        self.global_attn_bias_init = cfg.get('global_attn_bias_init', 0.0)
         self.decoder_hidden_dims = cfg.get(
             'decoder_hidden_dims',
             [cfg.get('decoder_hidden_dim', 64)],
@@ -71,7 +70,6 @@ class VelocityModule(ModelSpec):
             ffn_hidden_dim=self.attention_ffn_hidden_dim,
             global_token_blocks=self.global_token_blocks,
             global_token_ffn_hidden_dim=self.global_token_ffn_hidden_dim,
-            global_attn_bias_init=self.global_attn_bias_init,
         )
         
         self.decoder = Decoder(

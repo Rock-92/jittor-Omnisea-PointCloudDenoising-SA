@@ -158,7 +158,6 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
         knn_scales,
         relative_position_bias_hidden_dim,
         ffn_hidden_dim=None,
-        global_attn_bias_init=0.0,
     ):
         super().__init__()
         self.dim = dim
@@ -175,14 +174,22 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
         self.rel_pos_bias = RelativePositionBias(relative_position_bias_hidden_dim)
         self.out_proj = nn.Linear(dim * len(knn_scales), dim)
         self.global_norm = PointLayerNorm(dim)
-        self.global_k_proj = nn.Linear(dim, dim)
-        self.global_v_proj = nn.Linear(dim, dim)
-        self.global_attn_bias = jt.ones((1,)) * float(global_attn_bias_init)
+        self.scale_gate_proj = nn.Linear(dim, len(self.knn_scales))
+        self.temperature_proj = nn.Linear(dim, len(self.knn_scales))
+        self.rel_gate_proj = nn.Linear(dim, len(self.knn_scales))
+        self._zero_linear(self.scale_gate_proj)
+        self._zero_linear(self.temperature_proj)
+        self._zero_linear(self.rel_gate_proj)
 
         self.ffn_norm = PointLayerNorm(dim)
         self.ffn_lin_1 = nn.Linear(dim, self.ffn_hidden_dim)
         self.ffn_lin_2 = nn.Linear(self.ffn_hidden_dim, dim)
         self.act = nn.ReLU()
+
+    def _zero_linear(self, linear):
+        linear.weight.update(jt.zeros(linear.weight.shape))
+        if linear.bias is not None:
+            linear.bias.update(jt.zeros(linear.bias.shape))
 
     def execute(self, x, xyz, graph_knn_idx, global_token=None):
         """
@@ -195,34 +202,33 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
         q = apply_point_linear(self.q_proj, x_norm)
         k = apply_point_linear(self.k_proj, x_norm)
         v = apply_point_linear(self.v_proj, x_norm)
+        B, N, _ = x.shape
         if global_token is not None:
-            B, N, _ = x.shape
             global_norm = self.global_norm(global_token)
-            k_global = apply_point_linear(self.global_k_proj, global_norm)
-            v_global = apply_point_linear(self.global_v_proj, global_norm)
+            global_cond = global_norm[:, 0, :]
+            scale_gate = nn.softmax(self.scale_gate_proj(global_cond), dim=-1) * len(self.knn_scales)
+            temperature = jt.exp(0.25 * jt.tanh(self.temperature_proj(global_cond)))
+            rel_gate = 1.0 + 0.5 * jt.tanh(self.rel_gate_proj(global_cond))
 
         scale_outputs = []
-        for scale_k in self.knn_scales:
+        for scale_idx, scale_k in enumerate(self.knn_scales):
             idx = graph_knn_idx[:, :, :scale_k]
             k_neighbors = gather_neighbors(k, idx)
             v_neighbors = gather_neighbors(v, idx)
             xyz_neighbors = gather_neighbors(xyz, idx)
             rel_pos = xyz_neighbors - xyz.unsqueeze(2)
 
-            attn_logits = (q.unsqueeze(2) * k_neighbors).sum(dim=-1) * self.scale
-            attn_logits = attn_logits + self.rel_pos_bias(rel_pos)
-            v_all = v_neighbors
+            dot_logits = (q.unsqueeze(2) * k_neighbors).sum(dim=-1) * self.scale
+            rel_bias = self.rel_pos_bias(rel_pos)
             if global_token is not None:
-                k_global_scale = k_global.unsqueeze(1).broadcast((B, N, 1, self.dim))
-                v_global_scale = v_global.unsqueeze(1).broadcast((B, N, 1, self.dim))
-                global_logits = (
-                    (q.unsqueeze(2) * k_global_scale).sum(dim=-1) * self.scale
-                    + self.global_attn_bias.reshape(1, 1, 1).broadcast((B, N, 1))
-                )
-                attn_logits = jt.concat([attn_logits, global_logits], dim=2)
-                v_all = jt.concat([v_neighbors, v_global_scale], dim=2)
+                dot_logits = dot_logits / temperature[:, scale_idx].reshape(B, 1, 1)
+                rel_bias = rel_bias * rel_gate[:, scale_idx].reshape(B, 1, 1)
+            attn_logits = dot_logits + rel_bias
             attn = nn.softmax(attn_logits, dim=-1)
-            scale_outputs.append((attn.unsqueeze(-1) * v_all).sum(dim=2))
+            scale_out = (attn.unsqueeze(-1) * v_neighbors).sum(dim=2)
+            if global_token is not None:
+                scale_out = scale_out * scale_gate[:, scale_idx].reshape(B, 1, 1)
+            scale_outputs.append(scale_out)
 
         out = jt.concat(scale_outputs, dim=-1)
         out = apply_point_linear(self.out_proj, out)
@@ -249,7 +255,6 @@ class FeatureExtraction(nn.Module):
         ffn_hidden_dim=None,
         global_token_blocks=4,
         global_token_ffn_hidden_dim=None,
-        global_attn_bias_init=0.0,
     ):
         super().__init__()
 
@@ -270,7 +275,6 @@ class FeatureExtraction(nn.Module):
             global_token_ffn_hidden_dim = embedding_dim * 2
         self.global_token_blocks = int(global_token_blocks)
         self.global_token_ffn_hidden_dim = int(global_token_ffn_hidden_dim)
-        self.global_attn_bias_init = float(global_attn_bias_init)
 
         self.input_proj_1 = nn.Linear(input_dim, input_expand_dim)
         self.input_proj_2 = nn.Linear(input_expand_dim, embedding_dim)
@@ -297,7 +301,6 @@ class FeatureExtraction(nn.Module):
                 knn_scales=self.knn_scales,
                 relative_position_bias_hidden_dim=relative_position_bias_hidden_dim,
                 ffn_hidden_dim=self.ffn_hidden_dim,
-                global_attn_bias_init=self.global_attn_bias_init,
             )
             weight = jt.ones((1,)) * float(block_weight_values[i])
             setattr(self, f"block_{i}", block)
