@@ -41,6 +41,8 @@ class VelocityModule(ModelSpec):
             'global_token_ffn_hidden_dim',
             self.feat_embedding_dim * 2,
         )
+        self.local_token_count = cfg.get('local_token_count', 16)
+        self.local_token_knn = cfg.get('local_token_knn', 128)
         self.decoder_hidden_dims = cfg.get(
             'decoder_hidden_dims',
             [cfg.get('decoder_hidden_dim', 64)],
@@ -70,6 +72,8 @@ class VelocityModule(ModelSpec):
             ffn_hidden_dim=self.attention_ffn_hidden_dim,
             global_token_blocks=self.global_token_blocks,
             global_token_ffn_hidden_dim=self.global_token_ffn_hidden_dim,
+            local_token_count=self.local_token_count,
+            local_token_knn=self.local_token_knn,
         )
         
         self.decoder = Decoder(
