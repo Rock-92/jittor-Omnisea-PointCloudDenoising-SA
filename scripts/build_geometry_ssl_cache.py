@@ -115,6 +115,33 @@ def geometry_feature(points):
     return np.asarray([d[name] for name in names], dtype=np.float32), names
 
 
+def farthest_point_indices(points, count):
+    n = points.shape[0]
+    count = min(max(1, int(count)), n)
+    selected = []
+    dist = np.full((n,), np.inf, dtype=np.float64)
+    farthest = 0
+    for _ in range(count):
+        selected.append(farthest)
+        d = ((points - points[farthest]) ** 2).sum(axis=1)
+        dist = np.minimum(dist, d)
+        farthest = int(dist.argmax())
+    return np.asarray(selected, dtype=np.int64)
+
+
+def local_token_patches(points, num_tokens, token_patch_size):
+    num_tokens = min(max(1, int(num_tokens)), points.shape[0])
+    token_patch_size = min(max(1, int(token_patch_size)), points.shape[0])
+    center_idx = farthest_point_indices(points, num_tokens)
+    centers = points[center_idx]
+    tree = cKDTree(points)
+    _, nn_idx = tree.query(centers, k=token_patch_size)
+    patches = []
+    for i, inds in enumerate(nn_idx):
+        patches.append((points[inds] - centers[i][None, :]).astype(np.float32, copy=False))
+    return np.stack(patches, axis=0).astype(np.float32, copy=False)
+
+
 def kmeans(x, k, seed, iters=100):
     rng = np.random.default_rng(seed)
     n = x.shape[0]
@@ -143,6 +170,8 @@ def main():
     parser.add_argument("--num_shapes", type=int, default=5000)
     parser.add_argument("--patches_per_shape", type=int, default=1)
     parser.add_argument("--patch_size", type=int, default=1000)
+    parser.add_argument("--local_token_count", type=int, default=16)
+    parser.add_argument("--local_token_patch_size", type=int, default=128)
     parser.add_argument("--num_samples", type=int, default=32768)
     parser.add_argument("--num_vertex_samples", type=int, default=1024)
     parser.add_argument("--num_geom_classes", type=int, default=12)
@@ -152,9 +181,16 @@ def main():
 
     out_dir = Path(args.output_dir)
     patches_path = out_dir / "patches_clean.npy"
-    labels_path = out_dir / "labels.npy"
-    features_path = out_dir / "geom_features.npy"
-    if patches_path.exists() and labels_path.exists() and features_path.exists() and not args.overwrite:
+    local_patches_path = out_dir / "local_patches_clean.npy"
+    local_labels_path = out_dir / "local_labels.npy"
+    local_features_path = out_dir / "local_geom_features.npy"
+    if (
+        patches_path.exists()
+        and local_patches_path.exists()
+        and local_labels_path.exists()
+        and local_features_path.exists()
+        and not args.overwrite
+    ):
         print(f"cache exists: {out_dir}")
         return
 
@@ -168,7 +204,8 @@ def main():
         rels = rels[: args.num_shapes]
 
     patches = []
-    features = []
+    local_patches_all = []
+    local_features = []
     sources = []
     feature_names = None
     for shape_idx, rel in enumerate(rels):
@@ -187,11 +224,22 @@ def main():
         for local_i, inds in enumerate(nn_idx):
             seed = pc[seed_idx[local_i]][None, :]
             patch = (pc[inds] - seed).astype(np.float32, copy=False)
-            feat, names = geometry_feature(patch)
+            local_patches = local_token_patches(
+                patch,
+                args.local_token_count,
+                args.local_token_patch_size,
+            )
+            local_feat_rows = []
+            for local_patch in local_patches:
+                local_feat, local_names = geometry_feature(local_patch)
+                local_feat_rows.append(local_feat)
+                if feature_names is None:
+                    feature_names = local_names
             if feature_names is None:
-                feature_names = names
+                feature_names = local_names
             patches.append(patch)
-            features.append(feat)
+            local_patches_all.append(local_patches)
+            local_features.extend(local_feat_rows)
             sources.append(
                 {
                     "source": rel,
@@ -202,26 +250,35 @@ def main():
         if (shape_idx + 1) % 50 == 0:
             print(f"processed {shape_idx + 1}/{len(rels)} shapes, patches={len(patches)}")
 
-    if len(patches) < args.num_geom_classes:
-        raise RuntimeError("not enough patches to cluster")
+    if len(local_features) < args.num_geom_classes:
+        raise RuntimeError("not enough local patches to cluster")
 
     patches_arr = np.stack(patches, axis=0).astype(np.float32, copy=False)
-    features_arr = np.stack(features, axis=0).astype(np.float32, copy=False)
-    mean = features_arr.mean(axis=0, keepdims=True)
-    std = features_arr.std(axis=0, keepdims=True) + 1e-12
-    features_z = (features_arr - mean) / std
-    labels, centers = kmeans(features_z, args.num_geom_classes, args.seed)
+    local_patches_arr = np.stack(local_patches_all, axis=0).astype(np.float32, copy=False)
+    local_features_arr = np.stack(local_features, axis=0).astype(np.float32, copy=False)
+    mean = local_features_arr.mean(axis=0, keepdims=True)
+    std = local_features_arr.std(axis=0, keepdims=True) + 1e-12
+    local_features_z = (local_features_arr - mean) / std
+    local_labels_flat, centers = kmeans(local_features_z, args.num_geom_classes, args.seed)
+    actual_local_token_count = local_patches_arr.shape[1]
+    local_labels = local_labels_flat.reshape(patches_arr.shape[0], actual_local_token_count)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     np.save(patches_path, patches_arr)
-    np.save(labels_path, labels)
-    np.save(features_path, features_arr)
+    np.save(local_patches_path, local_patches_arr)
+    np.save(local_labels_path, local_labels)
+    np.save(local_features_path, local_features_arr)
     sample_dir = out_dir / "samples"
     sample_dir.mkdir(parents=True, exist_ok=True)
     datalist_rows = []
     for i in range(patches_arr.shape[0]):
         name = f"{i:08d}.npz"
-        np.savez_compressed(sample_dir / name, patch=patches_arr[i], label=np.asarray(labels[i], dtype=np.int64))
+        np.savez_compressed(
+            sample_dir / name,
+            patch=patches_arr[i],
+            local_patches=local_patches_arr[i],
+            local_labels=local_labels[i].astype(np.int64, copy=False),
+        )
         datalist_rows.append(f"samples/{name}\n")
     with open(out_dir / "train.txt", "w", encoding="utf-8") as f:
         f.writelines(datalist_rows)
@@ -235,7 +292,7 @@ def main():
                 "feature_mean": mean.reshape(-1).tolist(),
                 "feature_std": std.reshape(-1).tolist(),
                 "centers": centers.tolist(),
-                "counts": np.bincount(labels, minlength=args.num_geom_classes).tolist(),
+                "counts": np.bincount(local_labels_flat, minlength=args.num_geom_classes).tolist(),
                 "args": vars(args),
             },
             f,
@@ -243,7 +300,7 @@ def main():
             indent=2,
         )
     print(f"saved {len(patches)} patches to {out_dir}")
-    print("cluster counts:", np.bincount(labels, minlength=args.num_geom_classes).tolist())
+    print("local cluster counts:", np.bincount(local_labels_flat, minlength=args.num_geom_classes).tolist())
 
 
 if __name__ == "__main__":

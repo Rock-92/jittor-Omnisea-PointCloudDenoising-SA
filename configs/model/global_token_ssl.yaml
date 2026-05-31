@@ -12,6 +12,8 @@ global_token_blocks: 4
 global_token_ffn_hidden_dim: 512
 
 patch_size: 1000
+local_token_count: 16
+local_token_patch_size: 128
 num_geom_classes: 12
 num_prototypes: 24
 projection_dim: 128

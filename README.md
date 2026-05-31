@@ -10,12 +10,12 @@ pc_pred = pc_noisy + displacement
 当前主线模型包含：
 
 ```text
-4-layer global token encoder
+shared local geometry token encoder
 + 4-layer local denoising encoder
 + MLP displacement decoder
 ```
 
-其中 global token encoder 可以先用“几何伪标签 + SwAV prototype consistency”做自监督预训练，再接入主去噪训练。
+其中 local geometry token encoder 可以先用“局部几何伪标签 + SwAV prototype consistency”做自监督预训练，再接入主去噪训练。主去噪训练会把一个 patch 划成 16 个局部子 patch，共享同一套 token encoder 得到 16 个局部 token，每个点使用最近局部 token 调制 local attention。
 
 ## 环境
 
@@ -106,9 +106,9 @@ cache_clean_points/
 
 命令中默认加入了 `--overwrite`，会重建已有缓存；如果想复用已有缓存，可以去掉 `--overwrite`。
 
-## Step 2: 生成 SSL 几何缓存
+## Step 2: 生成 SSL 局部几何缓存
 
-global token 自监督预训练使用单独的几何缓存 `geometry_ssl_cache`。它会从真实 OBJ 采样 clean patch，计算 PCA、局部曲率、normal variation 等几何特征，再用 k-means 生成几何伪标签。
+local token 自监督预训练使用单独的几何缓存 `geometry_ssl_cache`。它会从真实 OBJ 采样 clean patch，再把每个 clean patch 划成 16 个局部子 patch；对每个局部子 patch 计算 PCA、局部曲率、normal variation 等几何特征，再用 k-means 生成局部几何伪标签。
 
 推荐第一版配置：
 
@@ -119,6 +119,8 @@ python scripts/build_geometry_ssl_cache.py \
   --output_dir geometry_ssl_cache \
   --num_shapes 5000 \
   --patches_per_shape 1 \
+  --local_token_count 16 \
+  --local_token_patch_size 128 \
   --num_geom_classes 12 \
   --seed 123 \
   --overwrite
@@ -133,6 +135,8 @@ C:\Users\Lenovo\anaconda3\envs\jittor\python.exe scripts\build_geometry_ssl_cach
   --output_dir geometry_ssl_cache `
   --num_shapes 5000 `
   --patches_per_shape 1 `
+  --local_token_count 16 `
+  --local_token_patch_size 128 `
   --num_geom_classes 12 `
   --seed 123 `
   --overwrite
@@ -148,22 +152,24 @@ geometry_ssl_cache/
     ...
   train.txt
   patches_clean.npy
-  labels.npy
-  geom_features.npy
+  local_patches_clean.npy
+  local_labels.npy
+  local_geom_features.npy
   kmeans.json
   sources.json
 ```
 
 其中：
 
-- `samples/*.npz`：单个 clean patch 和几何伪标签，供 dataloader 训练使用。
-- `labels.npy`：k-means 伪标签。
-- `geom_features.npy`：几何描述符。
+- `samples/*.npz`：单个 clean patch、16 个局部子 patch、16 个局部几何伪标签。
+- `local_patches_clean.npy`：所有局部子 patch。
+- `local_labels.npy`：局部 k-means 伪标签。
+- `local_geom_features.npy`：局部几何描述符。
 - `kmeans.json`：聚类中心、特征名、每类数量。
 
-## Step 3: 预训练 global token encoder
+## Step 3: 预训练 local token encoder
 
-生成 `geometry_ssl_cache` 后，启动 global token SSL 预训练：
+生成 `geometry_ssl_cache` 后，启动 local token SSL 预训练：
 
 ```bash
 python run.py --task configs/task/train_global_token_ssl.yaml --seed 123
@@ -187,13 +193,15 @@ num_prototypes = 24
 swav_weight = 0.2
 batch_size = 16
 lr = 1e-4
+local_token_count = 16
+local_token_patch_size = 128
 ```
 
-每个 clean patch 会生成两个增强 view：
+每个局部子 patch 会生成两个增强 view：
 
 ```text
-view_a = dropout/resample + Laplace noise + small jitter
-view_b = another dropout/resample + Laplace noise + small jitter
+local_view_a = Laplace noise + small jitter
+local_view_b = another Laplace noise + small jitter
 ```
 
 预训练 loss：
@@ -201,6 +209,8 @@ view_b = another dropout/resample + Laplace noise + small jitter
 ```text
 loss = geom_loss + 0.2 * swav_loss
 ```
+
+loss 会在 16 个局部 token 上分别计算；16 个局部 token 共享同一套 `input_proj_1/input_proj_2/global_token_generator/geom_head/projector/prototype_head` 参数。
 
 输出 checkpoint：
 
@@ -225,9 +235,11 @@ python run.py --task configs/task/train_vm_ssl.yaml --seed 123
    - input_proj_1
    - input_proj_2
    - global_token_generator
-3. 前 8 个 epoch 冻结 global token encoder
-4. 第 9 个 epoch 起解冻，并使用 0.2x global gradient scale
-5. 按原 displacement + surface loss 训练主去噪模型
+3. 主模型用这套共享 token encoder 为每个 patch 提取 16 个局部 token
+4. 每个点使用最近局部 token 调制 local attention
+5. 前 8 个 epoch 冻结 token encoder
+6. 第 9 个 epoch 起解冻，并使用 0.2x token encoder gradient scale
+7. 按原 displacement + surface loss 训练主去噪模型
 ```
 
 对应配置：

@@ -1,7 +1,6 @@
 from typing import Dict, List
 
 import jittor as jt
-import numpy as np
 from jittor import nn
 
 from .feature import GlobalTokenGenerator, apply_point_linear
@@ -63,7 +62,8 @@ class GlobalTokenSSLModule(ModelSpec):
     def __init__(self, model_config, transform_config):
         super().__init__(model_config, transform_config)
         cfg = self.model_config
-        self.patch_size = int(cfg.get("patch_size", 1000))
+        self.local_token_count = int(cfg.get("local_token_count", 16))
+        self.local_token_patch_size = int(cfg.get("local_token_patch_size", 128))
         self.noise_std_min = float(cfg.get("noise_std_min", 0.005))
         self.noise_std_max = float(cfg.get("noise_std_max", 0.020))
         self.dropout_min = float(cfg.get("dropout_min", 0.0))
@@ -89,9 +89,14 @@ class GlobalTokenSSLModule(ModelSpec):
         self.projector = MLPHead(dim, cfg.get("ssl_hidden_dim", 256), self.projection_dim)
         self.prototype_head = nn.Linear(self.projection_dim, self.num_prototypes, bias=False)
 
-    def encode_global(self, pc):
-        token = self.encoder(pc)
-        return token[:, 0, :]
+    def encode_local_tokens(self, local_patches):
+        """
+        local_patches: (B, M, K, 3)
+        return:        (B, M, C)
+        """
+        B, M, K, _ = local_patches.shape
+        tokens = self.encoder(local_patches.reshape(B * M, K, 3))[:, 0, :]
+        return tokens.reshape(B, M, -1)
 
     def make_view(self, clean_patch):
         noise_std = jt.rand((clean_patch.shape[0], 1, 1)) * (
@@ -99,29 +104,10 @@ class GlobalTokenSSLModule(ModelSpec):
         ) + self.noise_std_min
         # Jittor has no laplace helper here; inverse-CDF from uniform.
         u = jt.rand(clean_patch.shape) - 0.5
-        laplace = -noise_std * jt.sign(u) * jt.log(1.0 - 2.0 * jt.abs(u) + 1e-12)
+        sign = (u > 0).float() * 2.0 - 1.0
+        laplace = -noise_std * sign * jt.log(1.0 - 2.0 * jt.abs(u) + 1e-12)
         jitter = jt.clamp(jt.randn(clean_patch.shape) * self.jitter_std, -self.jitter_clip, self.jitter_clip)
         return clean_patch + laplace + jitter
-
-    def make_view_np(self, clean_patch):
-        pc = clean_patch.astype(np.float32, copy=True)
-        n = pc.shape[0]
-        drop = np.random.uniform(self.dropout_min, self.dropout_max)
-        keep = max(1, int(round(n * (1.0 - drop))))
-        keep_idx = np.random.choice(n, keep, replace=False)
-        pc = pc[keep_idx]
-        if pc.shape[0] < n:
-            add_idx = np.random.choice(pc.shape[0], n - pc.shape[0], replace=True)
-            pc = np.concatenate([pc, pc[add_idx]], axis=0)
-        pc = pc[np.random.permutation(n)]
-        noise_std = np.random.uniform(self.noise_std_min, self.noise_std_max)
-        pc = pc + np.random.laplace(0.0, noise_std, size=pc.shape).astype(np.float32)
-        jitter = np.clip(
-            np.random.normal(0.0, self.jitter_std, size=pc.shape),
-            -self.jitter_clip,
-            self.jitter_clip,
-        ).astype(np.float32)
-        return (pc + jitter).astype(np.float32, copy=False)
 
     def sinkhorn(self, scores):
         q = jt.exp(scores / self.sinkhorn_epsilon).transpose(0, 1)
@@ -136,39 +122,61 @@ class GlobalTokenSSLModule(ModelSpec):
         q = q * b
         return q.transpose(0, 1)
 
-    def forward_heads(self, pc):
-        z = self.encode_global(pc)
-        geom_logits = self.geom_head(z)
-        proj = l2_normalize(self.projector(z))
-        proto_logits = self.prototype_head(proj)
+    def forward_local_heads(self, local_patches):
+        z = self.encode_local_tokens(local_patches)
+        B, M, C = z.shape
+        z_flat = z.reshape(B * M, C)
+        geom_logits = self.geom_head(z_flat).reshape(B, M, self.num_geom_classes)
+        proj = l2_normalize(self.projector(z_flat))
+        proto_logits = self.prototype_head(proj).reshape(B, M, self.num_prototypes)
         return geom_logits, proto_logits
 
     def training_step(self, batch: Dict) -> Dict:
-        clean_patch = batch["pc_clean"].reshape(-1, self.patch_size, 3)
-        labels = batch["geom_label"].reshape(-1).int32()
-        view_a = batch.get("view_a", None)
-        view_b = batch.get("view_b", None)
-        if view_a is None or view_b is None:
-            view_a = self.make_view(clean_patch)
-            view_b = self.make_view(clean_patch)
-        else:
-            view_a = view_a.reshape(-1, self.patch_size, 3)
-            view_b = view_b.reshape(-1, self.patch_size, 3)
+        local_patches = batch["local_patches"].reshape(
+            -1,
+            self.local_token_count,
+            self.local_token_patch_size,
+            3,
+        )
+        local_labels = batch["local_geom_label"].reshape(-1, self.local_token_count).int32()
+        local_view_a = self.make_view(
+            local_patches.reshape(-1, self.local_token_patch_size, 3)
+        ).reshape(
+            -1,
+            self.local_token_count,
+            self.local_token_patch_size,
+            3,
+        )
+        local_view_b = self.make_view(
+            local_patches.reshape(-1, self.local_token_patch_size, 3)
+        ).reshape(
+            -1,
+            self.local_token_count,
+            self.local_token_patch_size,
+            3,
+        )
+        geom_a, proto_a = self.forward_local_heads(local_view_a)
+        geom_b, proto_b = self.forward_local_heads(local_view_b)
+        labels_flat = local_labels.reshape(-1)
+        geom_a_flat = geom_a.reshape(-1, self.num_geom_classes)
+        geom_b_flat = geom_b.reshape(-1, self.num_geom_classes)
+        loss_geom = (
+            nn.cross_entropy_loss(geom_a_flat, labels_flat)
+            + nn.cross_entropy_loss(geom_b_flat, labels_flat)
+        ) * 0.5
 
-        geom_a, proto_a = self.forward_heads(view_a)
-        geom_b, proto_b = self.forward_heads(view_b)
-        loss_geom = (nn.cross_entropy_loss(geom_a, labels) + nn.cross_entropy_loss(geom_b, labels)) * 0.5
-
-        scores_a = proto_a / self.swav_temperature
-        scores_b = proto_b / self.swav_temperature
+        proto_a_flat = proto_a.reshape(-1, self.num_prototypes)
+        proto_b_flat = proto_b.reshape(-1, self.num_prototypes)
+        scores_a = proto_a_flat / self.swav_temperature
+        scores_b = proto_b_flat / self.swav_temperature
         with jt.no_grad():
-            q_a = self.sinkhorn(proto_a)
-            q_b = self.sinkhorn(proto_b)
+            q_a = self.sinkhorn(proto_a_flat)
+            q_b = self.sinkhorn(proto_b_flat)
         loss_swav = 0.5 * (
             soft_cross_entropy(scores_a, q_b) + soft_cross_entropy(scores_b, q_a)
         )
-        pred = geom_a.argmax(dim=-1)[0]
-        acc = (pred == labels).float().mean()
+        pred = geom_a_flat.argmax(dim=-1)[0]
+        acc = (pred == labels_flat).float().mean()
         return {
             "geom_loss": loss_geom,
             "swav_loss": loss_swav,
@@ -178,14 +186,12 @@ class GlobalTokenSSLModule(ModelSpec):
     def process_fn(self, batch: List[Asset]) -> List[Dict]:
         out = []
         for b in batch:
-            assert b.sampled_vertices is not None
-            assert b.meta is not None and "geom_label" in b.meta
+            assert b.meta is not None and "local_patches" in b.meta
+            assert "local_geom_label" in b.meta
             out.append(
                 {
-                    "pc_clean": b.sampled_vertices,
-                    "view_a": self.make_view_np(b.sampled_vertices),
-                    "view_b": self.make_view_np(b.sampled_vertices),
-                    "geom_label": b.meta["geom_label"],
+                    "local_patches": b.meta["local_patches"],
+                    "local_geom_label": b.meta["local_geom_label"],
                 }
             )
         return out

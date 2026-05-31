@@ -66,12 +66,20 @@ class GeometrySSLLazyAsset(LazyAsset):
     def load(self) -> 'Asset':
         data = np.load(self.path, allow_pickle=False)
         patch = data["patch"].astype(np.float32, copy=False)
-        label = np.asarray(data["label"], dtype=np.int64)
+        if "local_patches" not in data or "local_labels" not in data:
+            raise KeyError(
+                f"{self.path} is an old geometry SSL sample; rebuild the cache "
+                "with local_patches/local_labels."
+            )
+        meta = {
+            "local_patches": data["local_patches"].astype(np.float32, copy=False),
+            "local_geom_label": np.asarray(data["local_labels"], dtype=np.int64),
+        }
         asset = Asset(
             path=self.path,
             cls=self.cls,
             sampled_vertices=patch,
-            meta={"geom_label": label},
+            meta=meta,
         )
         return asset
 
