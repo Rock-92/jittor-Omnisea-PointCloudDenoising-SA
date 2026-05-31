@@ -1,6 +1,7 @@
 from typing import Dict, List
 
 import jittor as jt
+import numpy as np
 from jittor import nn
 
 from .feature import GlobalTokenGenerator, apply_point_linear
@@ -99,6 +100,7 @@ class GlobalTokenSSLModule(ModelSpec):
         return tokens.reshape(B, M, -1)
 
     def make_view(self, clean_patch):
+        clean_patch = self.dropout_resample(clean_patch)
         noise_std = jt.rand((clean_patch.shape[0], 1, 1)) * (
             self.noise_std_max - self.noise_std_min
         ) + self.noise_std_min
@@ -108,6 +110,23 @@ class GlobalTokenSSLModule(ModelSpec):
         laplace = -noise_std * sign * jt.log(1.0 - 2.0 * jt.abs(u) + 1e-12)
         jitter = jt.clamp(jt.randn(clean_patch.shape) * self.jitter_std, -self.jitter_clip, self.jitter_clip)
         return clean_patch + laplace + jitter
+
+    def dropout_resample(self, clean_patch):
+        n = clean_patch.shape[1]
+        if self.dropout_max <= 0.0 or n <= 1:
+            return clean_patch
+        pcs = []
+        for i in range(clean_patch.shape[0]):
+            drop = float(np.random.uniform(self.dropout_min, self.dropout_max))
+            keep = max(1, int(round(n * (1.0 - drop))))
+            keep_idx = np.random.choice(n, keep, replace=False)
+            pc = clean_patch[i][jt.array(keep_idx).int32()]
+            if keep < n:
+                add_idx = np.random.choice(keep, n - keep, replace=True)
+                pc = jt.concat([pc, pc[jt.array(add_idx).int32()]], dim=0)
+            perm = np.random.permutation(n)
+            pcs.append(pc[jt.array(perm).int32()][None, ...])
+        return jt.concat(pcs, dim=0)
 
     def sinkhorn(self, scores):
         q = jt.exp(scores / self.sinkhorn_epsilon).transpose(0, 1)
