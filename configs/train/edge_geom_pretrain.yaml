@@ -8,4 +8,4 @@ optimizer:
 scheduler: null
 
 trainer:
-  epochs: 10
+  epochs: 30

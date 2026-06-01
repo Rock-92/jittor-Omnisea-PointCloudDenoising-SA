@@ -134,6 +134,8 @@ configs/system/vm_edgegeom_pretrain.yaml
 edge_geom_cls_loss: 1.0
 ```
 
+默认预训练 30 个 epoch。训练后建议先跑诊断脚本，如果 `edge_condition` 的几何 AUC 仍低于 0.70，可以继续增加预训练轮数。
+
 ## Step 3: 主去噪训练
 
 预训练完成后，启动带 gate matching 的主训练：
