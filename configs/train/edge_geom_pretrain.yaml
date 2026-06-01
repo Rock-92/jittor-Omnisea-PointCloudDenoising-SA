@@ -1,0 +1,11 @@
+loss:
+  edge_geom_cls_loss: 1.0
+
+optimizer:
+  __target__: adam
+  lr: 0.00001
+
+scheduler: null
+
+trainer:
+  epochs: 10

@@ -16,7 +16,7 @@ num_edge_geom_classes: 12
 edge_geom_hidden_dim: 128
 edge_geom_knn: 32
 edge_geom_match_temperature: 1.0
-edge_geom_pretrain_only: false
+edge_geom_pretrain_only: true
 
 # Decoder
 decoder_hidden_dims: [128, 64]
@@ -30,7 +30,6 @@ num_train_points: 256
 predict_rounds: 1
 denoise_num_steps: 1
 predict_patch_size: 1000
-# FPS-based inference uses predict_seed_k. predict_seed_interval is kept for compatibility.
 predict_seed_k: 6
 predict_seed_interval: 200
 predict_seed_k_alpha: 1

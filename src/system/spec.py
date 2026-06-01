@@ -179,6 +179,7 @@ class DummySystem():
         self._epoch_metric_records = []
         if trainer_config is None:
             trainer_config = {}
+        self.trainer_config = trainer_config
         self.epochs = trainer_config.get('epochs', 1)
         
         if optimizer_config is not None and model is not None:
@@ -198,6 +199,7 @@ class DummySystem():
         self.best_epoch = None
         self.best_validation_loss = float("inf")
         self.best_validation_score = float("-inf")
+        self._current_epoch = 0
 
     def set_run_dir(self, run_dir: str):
         self.run_dir = run_dir
@@ -511,6 +513,7 @@ class DummySystem():
         assert self.optimizer is not None, "optimizer is None, cannot train"
         self.model.set_predict(False)
         for epoch in range(self.epochs):
+            self._current_epoch = epoch
             self.model.train()
             self.on_train_epoch_start()
             train_dataloader = self.dataset_module.train_dataloader()

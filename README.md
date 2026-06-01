@@ -7,15 +7,16 @@ target = pc_clean - pc_noisy
 pc_pred = pc_noisy + displacement
 ```
 
-当前主线模型包含：
+当前主线模型：
 
 ```text
-point-wise EdgeConv geometry conditioner
+point-wise EdgeConv geometry teacher
++ geometry-aware gate matching
 + 4-layer token-conditioned local denoising encoder
 + MLP displacement decoder
 ```
 
-当前主线不再使用 16 个 local token 或 SSL 预训练。模型先用 EdgeConv 为每个点提取一个 256 维 point-wise local geometry feature，再用这个 feature 调制后续 local attention 的 `scale_gate / temperature / rel_gate`。EdgeConv 分支还带一个辅助 displacement head，用同一个 `pc_clean - pc_noisy` 目标约束它不要跑偏。
+模型先用 `EdgeConvConditioner` 为每个点提取 256 维 point-wise local geometry feature。这个 feature 一方面作为几何 teacher 通过分类头学习局部曲率、尖锐法向变化和转角等几何伪标签，另一方面用于调制后续 local attention 的 `scale_gate / temperature / rel_gate`。主训练中还加入 gate matching loss，要求几何分类头认为相近的点具有相近 gate，几何分类头认为较远的点具有较远 gate。
 
 ## 环境
 
@@ -60,7 +61,7 @@ test_noisy/
         noisy.npy
 ```
 
-如果原始数据放在隔壁项目，例如：
+如果原始数据在隔壁项目，例如：
 
 ```text
 E:\Code\competition2_EdgeConv\dataset_clean
@@ -68,9 +69,9 @@ E:\Code\competition2_EdgeConv\dataset_clean
 
 下面命令里的 `--input_dataset_dir` 改成对应路径即可。
 
-## Step 1: 生成主训练 clean 缓存
+## Step 1: 生成 clean 缓存
 
-主去噪训练读取的是 clean 点云缓存，不直接从 mesh 训练。先从 OBJ 采样生成 `clean.npy`：
+主去噪训练读取 clean 点云缓存，不直接从 mesh 训练。先从 OBJ 采样生成 `clean.npy`：
 
 ```bash
 python scripts/cache_clean_points.py \
@@ -104,33 +105,80 @@ cache_clean_points/
         clean.npy
 ```
 
-命令中默认加入了 `--overwrite`，会重建已有缓存；如果想复用已有缓存，可以去掉 `--overwrite`。
+## Step 2: 预训练 EdgeConv 几何 teacher
 
-## Step 2: 训练 EdgeConv 调制去噪模型
-
-生成 `cache_clean_points` 后，直接启动主训练：
+先预训练 EdgeConv 几何 teacher，让 EdgeConv condition feature 和几何分类头能够输出明确的局部几何信息。几何伪标签由 clean patch 在线估计，主要来自局部曲率和法向转角分桶。
 
 ```bash
-python run.py --task configs/task/train_vm_ssl.yaml --seed 123
+python run.py --task configs/task/train_edge_geom_pretrain.yaml --seed 123
 ```
 
-这个入口会：
+输出 checkpoint：
 
 ```text
-1. 创建正常 VelocityModule 去噪模型
-2. 用 input_proj 得到每点初始特征
-3. EdgeConvConditioner 对每个点的 KNN 邻域提取 point-wise local feature
-4. 每个点自己的 EdgeConv feature 调制 local attention
-5. 主 decoder 输出 displacement
-6. EdgeConv auxiliary head 也输出辅助 displacement
-7. 按 displacement + edge_aux_displacement + surface loss 端到端训练
+outputs/checkpoints/vm_edgegeom_pretrain/checkpoint_best.pkl
 ```
 
 对应配置：
 
 ```text
-configs/system/vm_edgeconv.yaml
-configs/task/train_vm_ssl.yaml
+configs/task/train_edge_geom_pretrain.yaml
+configs/model/vm_edgegeom_pretrain.yaml
+configs/train/edge_geom_pretrain.yaml
+configs/system/vm_edgegeom_pretrain.yaml
+```
+
+预训练阶段只优化：
+
+```yaml
+edge_geom_cls_loss: 1.0
+```
+
+## Step 3: 主去噪训练
+
+预训练完成后，启动带 gate matching 的主训练：
+
+```bash
+python run.py --task configs/task/train_vm_edgegeom.yaml --seed 123
+```
+
+这个入口会加载：
+
+```text
+outputs/checkpoints/vm_edgegeom_pretrain/checkpoint_best.pkl
+```
+
+主训练流程：
+
+```text
+1. 创建 VelocityModule 去噪模型
+2. input_proj 得到每点初始特征
+3. EdgeConvConditioner 提取每点 point-wise local geometry feature
+4. edge_geom_head 预测局部几何类别
+5. scale_gate / temperature / rel_gate 根据 EdgeConv feature 调制 local attention
+6. edge_gate_match_loss 约束 gate 的距离结构匹配几何分类头的距离结构
+7. decoder 输出 displacement
+8. EdgeConv auxiliary decoder 输出辅助 displacement
+9. 联合 displacement、surface、geometry classification、gate matching loss 训练
+```
+
+主训练前 20 个 epoch 会冻结 EdgeConv geometry teacher：
+
+```text
+model.encoder.edge_conditioner
+model.edge_geom_head
+```
+
+这段时间 gate projection、denoising encoder 和 decoder 正常训练，gate 会向固定几何 teacher 学习。第 20 个 epoch 后自动解冻，全模型联合微调。
+
+主训练 loss 权重：
+
+```yaml
+displacement_loss: 0.9
+edge_aux_displacement_loss: 0.2
+normalized_surface_loss: 0.1
+edge_geom_cls_loss: 0.05
+edge_gate_match_loss: 0.02
 ```
 
 关键参数：
@@ -139,31 +187,60 @@ configs/task/train_vm_ssl.yaml
 edgeconv_knn: 24
 edgeconv_blocks: 2
 edgeconv_hidden_dim: 256
+num_edge_geom_classes: 12
+edge_geom_hidden_dim: 128
+edge_geom_knn: 32
+edge_geom_match_temperature: 1.0
+edge_geom_freeze_epochs: 20
 edge_aux_hidden_dims: [128, 64]
 ```
 
-主训练仍然读取 `cache_clean_points`：
-
-```text
-configs/data/train.yaml
-input_dataset_dir: ./cache_clean_points
-loader: clean_npy
-data_name: clean.npy
-```
-
-输出 checkpoint：
+主训练输出 checkpoint：
 
 ```text
 outputs/checkpoints/vm_edgeconv/checkpoint_best.pkl
 ```
 
-当前 loss 权重：
+如果不想使用几何 teacher 预训练，也可以跑旧入口：
 
-```yaml
-displacement_loss: 0.9
-edge_aux_displacement_loss: 0.2
-normalized_surface_loss: 0.1
+```bash
+python run.py --task configs/task/train_vm_ssl.yaml --seed 123
 ```
+
+但当前推荐流程是 `train_edge_geom_pretrain.yaml` 后接 `train_vm_edgegeom.yaml`。
+
+## 诊断 EdgeConv 和 gate 几何区分度
+
+训练后可以检查 EdgeConv condition feature 是否包含曲率、尖锐法向变化、转角信息，以及 gate 是否真正学到了几何调制：
+
+```bash
+python tools/diagnose_edgeconv_geometry.py \
+  --checkpoint outputs/checkpoints/vm_edgeconv/checkpoint_best.pkl \
+  --out-dir analysis_outputs/edgeconv_geometry \
+  --patches 40 \
+  --points-per-patch 384 \
+  --seed 20260601
+```
+
+输出：
+
+```text
+analysis_outputs/edgeconv_geometry/
+  summary.json
+  edge_condition_geometry.csv
+  edge_gate_geometry.csv
+```
+
+重点看：
+
+```text
+edge_condition_*_r2_pc16
+edge_condition_*_best_pc_auc_q75_vs_q25
+gate_*_r2_pc16
+gate_*_best_pc_auc_q75_vs_q25
+```
+
+如果 `edge_condition` 指标高但 `gate` 指标低，说明 EdgeConv 学到了几何，但调制没有跟上。加入 gate matching 后，期望 gate 的 AUC/R2 明显提高。
 
 ## 推理
 
@@ -199,7 +276,7 @@ zip -r ../../../result.zip shapenet/
 ## 推荐完整流程
 
 ```bash
-# 1. 生成主训练 clean 缓存
+# 1. 生成 clean 缓存
 python scripts/cache_clean_points.py \
   --input_dataset_dir dataset_clean \
   --output_dir cache_clean_points \
@@ -208,10 +285,18 @@ python scripts/cache_clean_points.py \
   --seed 123 \
   --overwrite
 
-# 2. 训练 EdgeConv point-wise condition 去噪模型
-python run.py --task configs/task/train_vm_ssl.yaml --seed 123
+# 2. 预训练 EdgeConv geometry teacher
+python run.py --task configs/task/train_edge_geom_pretrain.yaml --seed 123
 
-# 3. 推理
+# 3. 主去噪训练，前 20 epoch 冻结 geometry teacher
+python run.py --task configs/task/train_vm_edgegeom.yaml --seed 123
+
+# 4. 诊断 EdgeConv / gate 几何区分度
+python tools/diagnose_edgeconv_geometry.py \
+  --checkpoint outputs/checkpoints/vm_edgeconv/checkpoint_best.pkl \
+  --out-dir analysis_outputs/edgeconv_geometry
+
+# 5. 推理
 python scripts/infer.py --seed 123
 ```
 
