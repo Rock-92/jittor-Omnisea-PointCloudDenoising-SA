@@ -10,12 +10,12 @@ pc_pred = pc_noisy + displacement
 当前主线模型包含：
 
 ```text
-shared local geometry token encoder
-+ 4-layer local denoising encoder
+point-wise EdgeConv geometry conditioner
++ 4-layer token-conditioned local denoising encoder
 + MLP displacement decoder
 ```
 
-其中 local geometry token encoder 可以先用“局部几何伪标签 + SwAV prototype consistency”做自监督预训练，再接入主去噪训练。主去噪训练会把一个 patch 划成 16 个局部子 patch，共享同一套 token encoder 得到 16 个局部 token，每个点使用最近局部 token 调制 local attention。
+当前主线不再使用 16 个 local token 或 SSL 预训练。模型先用 EdgeConv 为每个点提取一个 256 维 point-wise local geometry feature，再用这个 feature 调制后续 local attention 的 `scale_gate / temperature / rel_gate`。EdgeConv 分支还带一个辅助 displacement head，用同一个 `pc_clean - pc_noisy` 目标约束它不要跑偏。
 
 ## 环境
 
@@ -106,122 +106,9 @@ cache_clean_points/
 
 命令中默认加入了 `--overwrite`，会重建已有缓存；如果想复用已有缓存，可以去掉 `--overwrite`。
 
-## Step 2: 生成 SSL 局部几何缓存
+## Step 2: 训练 EdgeConv 调制去噪模型
 
-local token 自监督预训练使用单独的几何缓存 `geometry_ssl_cache`。它会从真实 OBJ 采样 clean patch，再把每个 clean patch 划成 16 个局部子 patch；对每个局部子 patch 计算 PCA、局部曲率、normal variation 等几何特征，再用 k-means 生成局部几何伪标签。
-
-推荐第一版配置：
-
-```bash
-python scripts/build_geometry_ssl_cache.py \
-  --input_dataset_dir dataset_clean \
-  --datalist datalist/train.txt \
-  --output_dir geometry_ssl_cache \
-  --num_shapes 5000 \
-  --patches_per_shape 1 \
-  --local_token_count 16 \
-  --local_token_patch_size 128 \
-  --num_geom_classes 12 \
-  --seed 123 \
-  --overwrite
-```
-
-Windows 示例：
-
-```powershell
-C:\Users\Lenovo\anaconda3\envs\jittor\python.exe scripts\build_geometry_ssl_cache.py `
-  --input_dataset_dir E:\Code\competition2_EdgeConv\dataset_clean `
-  --datalist datalist\train.txt `
-  --output_dir geometry_ssl_cache `
-  --num_shapes 5000 `
-  --patches_per_shape 1 `
-  --local_token_count 16 `
-  --local_token_patch_size 128 `
-  --num_geom_classes 12 `
-  --seed 123 `
-  --overwrite
-```
-
-输出结构：
-
-```text
-geometry_ssl_cache/
-  samples/
-    00000000.npz
-    00000001.npz
-    ...
-  train.txt
-  patches_clean.npy
-  local_patches_clean.npy
-  local_labels.npy
-  local_geom_features.npy
-  kmeans.json
-  sources.json
-```
-
-其中：
-
-- `samples/*.npz`：单个 clean patch、16 个局部子 patch、16 个局部几何伪标签。
-- `local_patches_clean.npy`：所有局部子 patch。
-- `local_labels.npy`：局部 k-means 伪标签。
-- `local_geom_features.npy`：局部几何描述符。
-- `kmeans.json`：聚类中心、特征名、每类数量。
-
-## Step 3: 预训练 local token encoder
-
-生成 `geometry_ssl_cache` 后，启动 local token SSL 预训练：
-
-```bash
-python run.py --task configs/task/train_global_token_ssl.yaml --seed 123
-```
-
-训练配置：
-
-```text
-configs/model/global_token_ssl.yaml
-configs/data/global_token_ssl.yaml
-configs/train/global_token_ssl.yaml
-configs/task/train_global_token_ssl.yaml
-```
-
-默认设置：
-
-```text
-epochs = 30
-num_geom_classes = 12
-num_prototypes = 24
-swav_weight = 0.2
-batch_size = 16
-lr = 1e-4
-local_token_count = 16
-local_token_patch_size = 128
-```
-
-每个局部子 patch 会生成两个增强 view：
-
-```text
-local_view_a = Laplace noise + small jitter
-local_view_b = another Laplace noise + small jitter
-```
-
-预训练 loss：
-
-```text
-loss = geom_loss + 0.2 * swav_loss
-```
-
-loss 会在 16 个局部 token 上分别计算；16 个局部 token 共享同一套 `input_proj_1/input_proj_2/global_token_generator/geom_head/projector/prototype_head` 参数。
-
-输出 checkpoint：
-
-```text
-outputs/checkpoints/global_token_ssl/checkpoint_best.pkl
-outputs/checkpoints/global_token_ssl/checkpoint_<epoch>.pkl
-```
-
-## Step 4: 使用 SSL 权重开始主去噪训练
-
-SSL 预训练完成后，使用下面入口开始主训练：
+生成 `cache_clean_points` 后，直接启动主训练：
 
 ```bash
 python run.py --task configs/task/train_vm_ssl.yaml --seed 123
@@ -231,30 +118,28 @@ python run.py --task configs/task/train_vm_ssl.yaml --seed 123
 
 ```text
 1. 创建正常 VelocityModule 去噪模型
-2. 从 outputs/checkpoints/global_token_ssl/checkpoint_best.pkl 加载：
-   - input_proj_1
-   - input_proj_2
-   - global_token_generator
-3. 主模型用这套共享 token encoder 为每个 patch 提取 16 个局部 token
-4. 每个点使用最近局部 token 调制 local attention
-5. 前 8 个 epoch 冻结 token encoder
-6. 第 9 个 epoch 起解冻，并使用 0.2x token encoder gradient scale
-7. 按原 displacement + surface loss 训练主去噪模型
+2. 用 input_proj 得到每点初始特征
+3. EdgeConvConditioner 对每个点的 KNN 邻域提取 point-wise local feature
+4. 每个点自己的 EdgeConv feature 调制 local attention
+5. 主 decoder 输出 displacement
+6. EdgeConv auxiliary head 也输出辅助 displacement
+7. 按 displacement + edge_aux_displacement + surface loss 端到端训练
 ```
 
 对应配置：
 
 ```text
-configs/system/vm_ssl.yaml
+configs/system/vm_edgeconv.yaml
 configs/task/train_vm_ssl.yaml
 ```
 
 关键参数：
 
 ```yaml
-ssl_pretrained_ckpt: outputs/checkpoints/global_token_ssl/checkpoint_best.pkl
-freeze_global_epochs: 8
-global_lr_scale: 0.2
+edgeconv_knn: 24
+edgeconv_blocks: 2
+edgeconv_hidden_dim: 256
+edge_aux_hidden_dims: [128, 64]
 ```
 
 主训练仍然读取 `cache_clean_points`：
@@ -269,27 +154,15 @@ data_name: clean.npy
 输出 checkpoint：
 
 ```text
-outputs/checkpoints/vm_ssl/checkpoint_best.pkl
+outputs/checkpoints/vm_edgeconv/checkpoint_best.pkl
 ```
 
-## 不使用 SSL 的原始主训练
+当前 loss 权重：
 
-如果不想使用 global token 预训练，仍然可以走原来的训练入口：
-
-```bash
-python run.py --task configs/task/train_vm.yaml --seed 123
-```
-
-或者：
-
-```bash
-python scripts/train.py --seed 123
-```
-
-默认 checkpoint 输出：
-
-```text
-outputs/checkpoints/vm/checkpoint_best.pkl
+```yaml
+displacement_loss: 0.9
+edge_aux_displacement_loss: 0.2
+normalized_surface_loss: 0.1
 ```
 
 ## 推理
@@ -297,7 +170,7 @@ outputs/checkpoints/vm/checkpoint_best.pkl
 确认 `configs/task/predict_vm.yaml` 中的 `load_ckpt` 指向要使用的 checkpoint，例如：
 
 ```yaml
-load_ckpt: outputs/checkpoints/vm_ssl/checkpoint_best.pkl
+load_ckpt: outputs/checkpoints/vm_edgeconv/checkpoint_best.pkl
 ```
 
 然后运行：
@@ -335,48 +208,12 @@ python scripts/cache_clean_points.py \
   --seed 123 \
   --overwrite
 
-# 2. 生成 SSL 几何缓存
-python scripts/build_geometry_ssl_cache.py \
-  --input_dataset_dir dataset_clean \
-  --datalist datalist/train.txt \
-  --output_dir geometry_ssl_cache \
-  --num_shapes 5000 \
-  --patches_per_shape 1 \
-  --num_geom_classes 12 \
-  --seed 123 \
-  --overwrite
-
-# 3. 预训练 global token encoder
-python run.py --task configs/task/train_global_token_ssl.yaml --seed 123
-
-# 4. 加载 SSL 权重进行主去噪训练
+# 2. 训练 EdgeConv point-wise condition 去噪模型
 python run.py --task configs/task/train_vm_ssl.yaml --seed 123
 
-# 5. 推理
+# 3. 推理
 python scripts/infer.py --seed 123
 ```
-
-## 诊断 global token
-
-可以使用：
-
-```bash
-python tools/analyze_global_token.py \
-  --mesh-root dataset_clean \
-  --datalist datalist/validate.txt \
-  --checkpoint outputs/checkpoints/vm_ssl/checkpoint_best.pkl \
-  --num-shapes 16 \
-  --patches-per-shape 2 \
-  --num-patches 32 \
-  --seed 123 \
-  --output analysis_outputs/global_token_vm_ssl_real.json
-```
-
-它会检查：
-
-- global token 是否按真实 patch 几何特征聚类。
-- denoising encoder 是否关注 global token。
-- local attention 中 global token 权重是否高于 uniform baseline。
 
 ## 项目结构
 

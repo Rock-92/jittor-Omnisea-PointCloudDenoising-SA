@@ -9,13 +9,13 @@ attention_blocks: 4
 attention_weight_init: [1.0, 0.6, 0.3, 0.2]
 relative_position_bias_hidden_dim: 64
 attention_ffn_hidden_dim: 512
-global_token_blocks: 4
-global_token_ffn_hidden_dim: 512
-local_token_count: 16
-local_token_knn: 128
+edgeconv_knn: 24
+edgeconv_blocks: 2
+edgeconv_hidden_dim: 256
 
 # Decoder
 decoder_hidden_dims: [128, 64]
+edge_aux_hidden_dims: [128, 64]
 
 # Loss
 dsm_sigma: 0.01

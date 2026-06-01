@@ -1,5 +1,6 @@
 loss:
   displacement_loss: 0.9
+  edge_aux_displacement_loss: 0.2
   normalized_surface_loss: 0.1
 
 optimizer:

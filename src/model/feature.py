@@ -238,21 +238,22 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
         if linear.bias is not None:
             linear.bias.update(jt.zeros(linear.bias.shape))
 
-    def execute(self, x, xyz, graph_knn_idx, local_token=None):
+    def execute(self, x, xyz, graph_knn_idx, condition_feat=None):
         """
         x:       (B, N, C), point features.
         xyz:     (B, N, 3), noisy point coordinates for relative position bias.
         graph_knn_idx: (B, N, max(knn_scales)), neighbor indices used for
             attention neighbors and relative-position bias.
-        local_token: optional (B, N, C), token assigned to each point.
+        condition_feat: optional (B, N, C), point-wise local geometry features
+            used to modulate multi-scale attention.
         """
         x_norm = self.attn_norm(x)
         q = apply_point_linear(self.q_proj, x_norm)
         k = apply_point_linear(self.k_proj, x_norm)
         v = apply_point_linear(self.v_proj, x_norm)
         B, N, _ = x.shape
-        if local_token is not None:
-            local_norm = self.global_norm(local_token)
+        if condition_feat is not None:
+            local_norm = self.global_norm(condition_feat)
             scale_gate = nn.softmax(
                 apply_point_linear(self.scale_gate_proj, local_norm),
                 dim=-1,
@@ -274,13 +275,13 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
 
             dot_logits = (q.unsqueeze(2) * k_neighbors).sum(dim=-1) * self.scale
             rel_bias = self.rel_pos_bias(rel_pos)
-            if local_token is not None:
+            if condition_feat is not None:
                 dot_logits = dot_logits / temperature[:, :, scale_idx].reshape(B, N, 1)
                 rel_bias = rel_bias * rel_gate[:, :, scale_idx].reshape(B, N, 1)
             attn_logits = dot_logits + rel_bias
             attn = nn.softmax(attn_logits, dim=-1)
             scale_out = (attn.unsqueeze(-1) * v_neighbors).sum(dim=2)
-            if local_token is not None:
+            if condition_feat is not None:
                 scale_out = scale_out * scale_gate[:, :, scale_idx].reshape(B, N, 1)
             scale_outputs.append(scale_out)
 
@@ -295,6 +296,70 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
         return x + ffn
 
 
+class EdgeConvBlock(nn.Module):
+    def __init__(self, dim, hidden_dim=None):
+        super().__init__()
+        self.dim = int(dim)
+        if hidden_dim is None:
+            hidden_dim = dim
+        self.hidden_dim = int(hidden_dim)
+        self.edge_lin_1 = nn.Linear(self.dim * 2 + 3, self.hidden_dim)
+        self.edge_lin_2 = nn.Linear(self.hidden_dim, self.dim)
+        self.norm = PointLayerNorm(self.dim)
+        self.act = nn.ReLU()
+
+    def execute(self, feat, xyz, knn_idx):
+        """
+        feat:    (B, N, C)
+        xyz:     (B, N, 3)
+        knn_idx: (B, N, K), xyz-space neighbors.
+        return:  (B, N, C)
+        """
+        feat_neighbors = gather_neighbors(feat, knn_idx)
+        xyz_neighbors = gather_neighbors(xyz, knn_idx)
+        feat_center = feat.unsqueeze(2).broadcast(feat_neighbors.shape)
+        xyz_rel = xyz_neighbors - xyz.unsqueeze(2)
+        edge = jt.concat([feat_center, feat_neighbors - feat_center, xyz_rel], dim=-1)
+        edge_feat = apply_edge_linear(self.edge_lin_1, edge)
+        edge_feat = self.act(edge_feat)
+        edge_feat = apply_edge_linear(self.edge_lin_2, edge_feat)
+        pooled = edge_feat.max(dim=2)
+        return self.norm(feat + pooled)
+
+
+class EdgeConvConditioner(nn.Module):
+    def __init__(self, dim, knn=24, num_blocks=2, hidden_dim=None):
+        super().__init__()
+        self.dim = int(dim)
+        self.knn = int(knn)
+        self.num_blocks = int(num_blocks)
+        if hidden_dim is None:
+            hidden_dim = dim
+        self.hidden_dim = int(hidden_dim)
+        self.blocks = []
+        for i in range(self.num_blocks):
+            block = EdgeConvBlock(
+                dim=self.dim,
+                hidden_dim=self.hidden_dim,
+            )
+            setattr(self, f"block_{i}", block)
+            self.blocks.append(block)
+        self.out_norm = PointLayerNorm(self.dim)
+
+    def execute(self, feat, xyz):
+        """
+        feat: (B, N, C)
+        xyz:  (B, N, 3)
+        return point-wise local condition features: (B, N, C)
+        """
+        k = min(max(1, self.knn), xyz.shape[1] - 1)
+        knn_idx = get_knn_idx(xyz, xyz, k, offset=1)
+        out = feat
+        for block in self.blocks:
+            out = block(out, xyz, knn_idx)
+        return self.out_norm(out)
+
+
 class FeatureExtraction(nn.Module):
     def __init__(
         self,
@@ -307,10 +372,9 @@ class FeatureExtraction(nn.Module):
         knn_scales=None,
         relative_position_bias_hidden_dim=32,
         ffn_hidden_dim=None,
-        global_token_blocks=4,
-        global_token_ffn_hidden_dim=None,
-        local_token_count=16,
-        local_token_knn=128,
+        edgeconv_knn=24,
+        edgeconv_blocks=2,
+        edgeconv_hidden_dim=None,
     ):
         super().__init__()
 
@@ -327,20 +391,20 @@ class FeatureExtraction(nn.Module):
         if ffn_hidden_dim is None:
             ffn_hidden_dim = embedding_dim * 2
         self.ffn_hidden_dim = int(ffn_hidden_dim)
-        if global_token_ffn_hidden_dim is None:
-            global_token_ffn_hidden_dim = embedding_dim * 2
-        self.global_token_blocks = int(global_token_blocks)
-        self.global_token_ffn_hidden_dim = int(global_token_ffn_hidden_dim)
-        self.local_token_count = int(local_token_count)
-        self.local_token_knn = int(local_token_knn)
+        self.edgeconv_knn = int(edgeconv_knn)
+        self.edgeconv_blocks = int(edgeconv_blocks)
+        if edgeconv_hidden_dim is None:
+            edgeconv_hidden_dim = embedding_dim
+        self.edgeconv_hidden_dim = int(edgeconv_hidden_dim)
 
         self.input_proj_1 = nn.Linear(input_dim, input_expand_dim)
         self.input_proj_2 = nn.Linear(input_expand_dim, embedding_dim)
         self.act = nn.ReLU()
-        self.global_token_generator = GlobalTokenGenerator(
+        self.edge_conditioner = EdgeConvConditioner(
             dim=embedding_dim,
-            num_blocks=self.global_token_blocks,
-            ffn_hidden_dim=self.global_token_ffn_hidden_dim,
+            knn=self.edgeconv_knn,
+            num_blocks=self.edgeconv_blocks,
+            hidden_dim=self.edgeconv_hidden_dim,
         )
 
         if isinstance(attention_weight_init, (list, tuple)):
@@ -368,49 +432,7 @@ class FeatureExtraction(nn.Module):
 
         self.fuse = nn.Linear(embedding_dim * num_blocks, embedding_dim)
 
-    def generate_local_tokens(self, x):
-        """
-        x: (B, N, 3)
-        return:
-            local_tokens: (B, M, C)
-            assign_idx:   (B, N), nearest local token index for each point.
-        """
-        B, N, _ = x.shape
-        num_tokens = min(max(1, self.local_token_count), N)
-        local_knn = min(max(1, self.local_token_knn), N)
-
-        center_idx = farthest_point_sampling_idx(x, num_tokens)
-        centers = gather_points(x, center_idx)
-        _, local_idx = jt.misc.knn(centers, x, local_knn)
-        local_xyz = gather_neighbors(x, local_idx) - centers.unsqueeze(2)
-        local_xyz = local_xyz.reshape(B * num_tokens, local_knn, 3)
-
-        # Reuse the pretrained class-token encoder as a shared local patch
-        # tokenizer: each spatial sub-patch produces one geometry token.
-        local_feats = apply_point_linear(self.input_proj_1, local_xyz)
-        local_feats = self.act(local_feats)
-        local_feats = apply_point_linear(self.input_proj_2, local_feats)
-        local_feats = self.act(local_feats)
-        local_tokens = self.global_token_generator(local_feats).reshape(
-            B,
-            num_tokens,
-            self.embedding_dim,
-        )
-        assign_idx = nearest_center_idx(x, centers)
-        return local_tokens, assign_idx
-
-    def gather_assigned_tokens(self, local_tokens, assign_idx):
-        """
-        local_tokens: (B, M, C)
-        assign_idx:   (B, N)
-        return:       (B, N, C)
-        """
-        assigned = []
-        for b in range(local_tokens.shape[0]):
-            assigned.append(local_tokens[b][assign_idx[b]])
-        return jt.stack(assigned, dim=0)
-
-    def execute(self, x):
+    def execute(self, x, return_condition=False):
         """
         x: (B, N, 3)
         return: (B, N, 256)
@@ -422,8 +444,7 @@ class FeatureExtraction(nn.Module):
         feat = self.act(feat)
         feat = apply_point_linear(self.input_proj_2, feat)
         feat = self.act(feat)
-        local_tokens, local_assign_idx = self.generate_local_tokens(x)
-        point_tokens = self.gather_assigned_tokens(local_tokens, local_assign_idx)
+        condition_feat = self.edge_conditioner(feat, x)
 
         block_outputs = []
         for block_idx, (block, weight) in enumerate(zip(self.blocks, self.block_weights)):
@@ -434,11 +455,14 @@ class FeatureExtraction(nn.Module):
                 block_knn_idx = reuse_knn_idx
             else:
                 block_knn_idx = reuse_knn_idx
-            feat = block(feat, x, block_knn_idx, local_token=point_tokens)
+            feat = block(feat, x, block_knn_idx, condition_feat=condition_feat)
             block_outputs.append(feat * weight)
 
         feat = jt.concat(block_outputs, dim=-1)
-        return apply_point_linear(self.fuse, feat)
+        feat = apply_point_linear(self.fuse, feat)
+        if return_condition:
+            return feat, condition_feat
+        return feat
 
 
 class Decoder(nn.Module):

@@ -36,17 +36,14 @@ class VelocityModule(ModelSpec):
             'attention_ffn_hidden_dim',
             self.feat_embedding_dim * 2,
         )
-        self.global_token_blocks = cfg.get('global_token_blocks', 4)
-        self.global_token_ffn_hidden_dim = cfg.get(
-            'global_token_ffn_hidden_dim',
-            self.feat_embedding_dim * 2,
-        )
-        self.local_token_count = cfg.get('local_token_count', 16)
-        self.local_token_knn = cfg.get('local_token_knn', 128)
+        self.edgeconv_knn = cfg.get('edgeconv_knn', 24)
+        self.edgeconv_blocks = cfg.get('edgeconv_blocks', 2)
+        self.edgeconv_hidden_dim = cfg.get('edgeconv_hidden_dim', self.feat_embedding_dim)
         self.decoder_hidden_dims = cfg.get(
             'decoder_hidden_dims',
             [cfg.get('decoder_hidden_dim', 64)],
         )
+        self.edge_aux_hidden_dims = cfg.get('edge_aux_hidden_dims', [128, 64])
         
         # patch-based prediction
         self.predict_rounds = cfg.get('predict_rounds', 1)
@@ -70,10 +67,9 @@ class VelocityModule(ModelSpec):
             attention_weight_init=self.attention_weight_init,
             relative_position_bias_hidden_dim=self.relative_position_bias_hidden_dim,
             ffn_hidden_dim=self.attention_ffn_hidden_dim,
-            global_token_blocks=self.global_token_blocks,
-            global_token_ffn_hidden_dim=self.global_token_ffn_hidden_dim,
-            local_token_count=self.local_token_count,
-            local_token_knn=self.local_token_knn,
+            edgeconv_knn=self.edgeconv_knn,
+            edgeconv_blocks=self.edgeconv_blocks,
+            edgeconv_hidden_dim=self.edgeconv_hidden_dim,
         )
         
         self.decoder = Decoder(
@@ -81,20 +77,35 @@ class VelocityModule(ModelSpec):
             out_dim=3,
             hidden_dims=self.decoder_hidden_dims,
         )
+        self.edge_aux_decoder = Decoder(
+            z_dim=self.encoder.embedding_dim,
+            out_dim=3,
+            hidden_dims=self.edge_aux_hidden_dims,
+        )
     
-    def predict_displacement(self, pc_noisy, point_idx=None):
+    def predict_displacement(self, pc_noisy, point_idx=None, return_aux=False):
         """
         pc_noisy: (B, N, 3)
         point_idx: optional point indices decoded after full-patch encoding
         return:   (B, N, 3) or (B, M, 3)
         """
         B, N, d = pc_noisy.shape
-        feat = self.encoder(pc_noisy)  # (B, N, 256)
+        if return_aux:
+            feat, condition_feat = self.encoder(pc_noisy, return_condition=True)
+        else:
+            feat = self.encoder(pc_noisy)
+            condition_feat = None
         if point_idx is not None:
             feat = feat[:, point_idx, :]
+            if condition_feat is not None:
+                condition_feat = condition_feat[:, point_idx, :]
         N_out = feat.shape[1]
         F_dim = feat.shape[2]
-        return self.decoder(feat.reshape(-1, F_dim)).reshape(B, N_out, d)
+        pred = self.decoder(feat.reshape(-1, F_dim)).reshape(B, N_out, d)
+        if not return_aux:
+            return pred
+        aux = self.edge_aux_decoder(condition_feat.reshape(-1, F_dim)).reshape(B, N_out, d)
+        return pred, aux
     
     def get_normalized_surface_loss(self, pc_pred, pc_clean, pc_anchor):
         """
@@ -138,8 +149,15 @@ class VelocityModule(ModelSpec):
             target = target[:, point_idx, :]
             pc_noisy_for_loss = pc_noisy[:, point_idx, :]
             pc_clean_for_loss = pc_clean[:, point_idx, :]
-        pred_dir = self.predict_displacement(pc_noisy, point_idx=point_idx)
+        pred_dir, aux_pred_dir = self.predict_displacement(
+            pc_noisy,
+            point_idx=point_idx,
+            return_aux=True,
+        )
         displacement_loss = (((pred_dir - target) ** 2.0) / self.dsm_sigma).sum(dim=-1).mean()
+        edge_aux_displacement_loss = (
+            ((aux_pred_dir - target) ** 2.0) / self.dsm_sigma
+        ).sum(dim=-1).mean()
         normalized_surface_loss = self.get_normalized_surface_loss(
             pc_pred=pc_noisy_for_loss + pred_dir,
             pc_clean=pc_clean,
@@ -148,6 +166,7 @@ class VelocityModule(ModelSpec):
         
         return {
             "displacement_loss": displacement_loss,
+            "edge_aux_displacement_loss": edge_aux_displacement_loss,
             "normalized_surface_loss": normalized_surface_loss,
         }
 
