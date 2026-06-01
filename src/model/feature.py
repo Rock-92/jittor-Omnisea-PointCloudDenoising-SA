@@ -317,9 +317,13 @@ class EdgeConvBlock(nn.Module):
         """
         feat_neighbors = gather_neighbors(feat, knn_idx)
         xyz_neighbors = gather_neighbors(xyz, knn_idx)
-        feat_center = feat.unsqueeze(2).broadcast(feat_neighbors.shape)
+        feat_center = feat.unsqueeze(2)
         xyz_rel = xyz_neighbors - xyz.unsqueeze(2)
-        edge = jt.concat([feat_center, feat_neighbors - feat_center, xyz_rel], dim=-1)
+        feat_center_expand = feat_center + jt.zeros(feat_neighbors.shape)
+        edge = jt.concat(
+            [feat_center_expand, feat_neighbors - feat_center, xyz_rel],
+            dim=-1,
+        )
         edge_feat = apply_edge_linear(self.edge_lin_1, edge)
         edge_feat = self.act(edge_feat)
         edge_feat = apply_edge_linear(self.edge_lin_2, edge_feat)
