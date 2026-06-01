@@ -78,6 +78,8 @@ python scripts/cache_clean_points.py \
   --input_dataset_dir dataset_clean \
   --output_dir cache_clean_points \
   --datalist datalist/train.txt datalist/validate.txt \
+  --num_edge_geom_classes 12 \
+  --edge_geom_knn 32 \
   --workers 8 \
   --seed 123 \
   --overwrite
@@ -90,6 +92,8 @@ C:\Users\Lenovo\anaconda3\envs\jittor\python.exe scripts\cache_clean_points.py `
   --input_dataset_dir E:\Code\competition2_EdgeConv\dataset_clean `
   --output_dir cache_clean_points `
   --datalist datalist\train.txt datalist\validate.txt `
+  --num_edge_geom_classes 12 `
+  --edge_geom_knn 32 `
   --workers 8 `
   --seed 123 `
   --overwrite
@@ -103,11 +107,14 @@ cache_clean_points/
     <synset_id>/
       <model_id>/
         clean.npy
+        edge_geom_label.npy
 ```
+
+`edge_geom_label.npy` 是每个 clean 点的几何伪标签，由局部曲率和法向转角提前计算得到。预训练和主训练都会直接读取这个文件，不再在训练循环里在线计算几何伪标签。如果已有旧版 `cache_clean_points` 只有 `clean.npy`，重新运行上面的缓存命令即可；不加 `--overwrite` 时脚本也会为已有 `clean.npy` 补生成缺失的 `edge_geom_label.npy`。
 
 ## Step 2: 预训练 EdgeConv 几何 teacher
 
-先预训练 EdgeConv 几何 teacher，让 EdgeConv condition feature 和几何分类头能够输出明确的局部几何信息。几何伪标签由 clean patch 在线估计，主要来自局部曲率和法向转角分桶。
+先预训练 EdgeConv 几何 teacher，让 EdgeConv condition feature 和几何分类头能够输出明确的局部几何信息。几何伪标签来自缓存中的 `edge_geom_label.npy`，主要由局部曲率和法向转角分桶得到。
 
 ```bash
 python run.py --task configs/task/train_edge_geom_pretrain.yaml --seed 123
@@ -283,6 +290,8 @@ python scripts/cache_clean_points.py \
   --input_dataset_dir dataset_clean \
   --output_dir cache_clean_points \
   --datalist datalist/train.txt datalist/validate.txt \
+  --num_edge_geom_classes 12 \
+  --edge_geom_knn 32 \
   --workers 8 \
   --seed 123 \
   --overwrite

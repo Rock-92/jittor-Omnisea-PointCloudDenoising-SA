@@ -7,6 +7,7 @@ from typing import Iterable, List, Tuple
 
 import numpy as np
 import trimesh
+from scipy.spatial import cKDTree
 from tqdm import tqdm
 
 
@@ -15,6 +16,39 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.utils import sample_vertex_groups
+
+
+def compute_edge_geom_labels(points, num_classes=12, knn=32):
+    k = max(8, min(int(knn), points.shape[0]))
+    tree = cKDTree(points)
+    _, idx = tree.query(points, k=k)
+    curv = np.zeros((points.shape[0],), dtype=np.float64)
+    normals = np.zeros((points.shape[0], 3), dtype=np.float64)
+
+    for i, inds in enumerate(idx):
+        pts = points[inds]
+        centered = pts - pts.mean(axis=0, keepdims=True)
+        cov = centered.T @ centered / max(centered.shape[0] - 1, 1)
+        vals, vecs = np.linalg.eigh(cov)
+        vals = np.maximum(vals, 0.0)
+        total = float(vals.sum())
+        if total > 1e-12:
+            curv[i] = vals[0] / total
+        normal = vecs[:, 0]
+        normals[i] = normal / max(np.linalg.norm(normal), 1e-12)
+
+    normal_angle = np.zeros_like(curv)
+    for i, inds in enumerate(idx):
+        dots = np.abs(normals[inds] @ normals[i])
+        dots = np.clip(dots, 0.0, 1.0)
+        normal_angle[i] = np.percentile(np.arccos(dots), 90)
+
+    score = curv + 0.25 * normal_angle
+    order = np.argsort(score)
+    ranks = np.empty_like(order)
+    ranks[order] = np.arange(order.shape[0])
+    labels = np.floor(ranks * int(num_classes) / max(points.shape[0], 1)).astype(np.int32)
+    return np.clip(labels, 0, int(num_classes) - 1).astype(np.int32, copy=False)
 
 
 def read_datalists(paths: Iterable[Path]) -> List[str]:
@@ -31,24 +65,44 @@ def read_datalists(paths: Iterable[Path]) -> List[str]:
     return rel_paths
 
 
-def cache_one(args: Tuple[str, str, str, str, str, int, int, bool, int]):
+def atomic_save_npy(path, array):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}.npy")
+    np.save(tmp_path, array)
+    os.replace(tmp_path, path)
+
+
+def cache_one(args: Tuple[str, str, str, str, str, str, int, int, int, int, bool, int]):
     (
         rel_path,
         input_dataset_dir,
         output_dir,
         mesh_name,
         output_name,
+        edge_geom_label_name,
         num_samples,
         num_vertex_samples,
+        num_edge_geom_classes,
+        edge_geom_knn,
         overwrite,
         seed,
     ) = args
     np.random.seed(seed)
     mesh_path = Path(input_dataset_dir) / rel_path / mesh_name
     output_path = Path(output_dir) / rel_path / output_name
+    label_path = Path(output_dir) / rel_path / edge_geom_label_name
 
-    if output_path.exists() and not overwrite:
+    if output_path.exists() and label_path.exists() and not overwrite:
         return "skip", rel_path, None
+    if output_path.exists() and not label_path.exists() and not overwrite:
+        clean_points = np.load(output_path).astype(np.float32, copy=False)
+        labels = compute_edge_geom_labels(
+            clean_points,
+            num_classes=num_edge_geom_classes,
+            knn=edge_geom_knn,
+        )
+        atomic_save_npy(label_path, labels)
+        return "label", rel_path, labels.shape
     if not mesh_path.exists():
         return "missing", rel_path, str(mesh_path)
 
@@ -65,11 +119,14 @@ def cache_one(args: Tuple[str, str, str, str, str, int, int, bool, int]):
         num_vertex_samples=num_vertex_samples,
     )
     clean_points = clean_points.astype(np.float32, copy=False)
+    labels = compute_edge_geom_labels(
+        clean_points,
+        num_classes=num_edge_geom_classes,
+        knn=edge_geom_knn,
+    )
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = output_path.with_name(f"{output_path.name}.tmp.{os.getpid()}.npy")
-    np.save(tmp_path, clean_points)
-    os.replace(tmp_path, output_path)
+    atomic_save_npy(output_path, clean_points)
+    atomic_save_npy(label_path, labels)
     return "ok", rel_path, clean_points.shape
 
 
@@ -95,6 +152,9 @@ def parse_args():
     )
     parser.add_argument("--mesh_name", default="models/model_normalized.obj")
     parser.add_argument("--output_name", default="clean.npy")
+    parser.add_argument("--edge_geom_label_name", default="edge_geom_label.npy")
+    parser.add_argument("--num_edge_geom_classes", type=int, default=12)
+    parser.add_argument("--edge_geom_knn", type=int, default=32)
     parser.add_argument("--num_samples", type=int, default=32768)
     parser.add_argument("--num_vertex_samples", type=int, default=1024)
     parser.add_argument("--workers", type=int, default=8)
@@ -115,15 +175,18 @@ def main():
             args.output_dir,
             args.mesh_name,
             args.output_name,
+            args.edge_geom_label_name,
             args.num_samples,
             args.num_vertex_samples,
+            args.num_edge_geom_classes,
+            args.edge_geom_knn,
             args.overwrite,
             args.seed + i,
         )
         for i, rel_path in enumerate(rel_paths)
     ]
 
-    counts = {"ok": 0, "skip": 0, "missing": 0, "error": 0}
+    counts = {"ok": 0, "label": 0, "skip": 0, "missing": 0, "error": 0}
     if args.workers <= 1:
         iterator = map(cache_one, tasks)
         for status, rel_path, detail in tqdm(iterator, total=len(tasks)):
@@ -145,6 +208,7 @@ def main():
     print(
         "cache clean points done: "
         f"ok={counts.get('ok', 0)}, "
+        f"label={counts.get('label', 0)}, "
         f"skip={counts.get('skip', 0)}, "
         f"missing={counts.get('missing', 0)}, "
         f"error={counts.get('error', 0)}"

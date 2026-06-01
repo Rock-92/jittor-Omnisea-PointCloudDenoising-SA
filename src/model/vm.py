@@ -4,7 +4,6 @@ from typing import Dict, List
 import jittor as jt
 import numpy as np
 from jittor import nn
-from scipy.spatial import cKDTree
 
 from .feature import FeatureExtraction, Decoder
 from .spec import ModelSpec
@@ -122,56 +121,8 @@ class VelocityModule(ModelSpec):
             gate_parts.extend([scale_gate, temperature, rel_gate])
         return jt.concat(gate_parts, dim=-1)
 
-    def _make_edge_geom_labels_np(self, pc_clean_np):
-        """
-        Build ordinal local-geometry pseudo labels from clean patches. The score
-        combines local surface variation and normal angle changes, so higher
-        labels roughly mean sharper or more curved neighborhoods.
-        """
-        labels = []
-        k = max(8, min(int(self.edge_geom_knn), pc_clean_np.shape[1]))
-        for patch in pc_clean_np:
-            tree = cKDTree(patch)
-            _, idx = tree.query(patch, k=k)
-            curv = np.zeros((patch.shape[0],), dtype=np.float64)
-            normals = np.zeros((patch.shape[0], 3), dtype=np.float64)
-            for i, inds in enumerate(idx):
-                pts = patch[inds]
-                centered = pts - pts.mean(axis=0, keepdims=True)
-                cov = centered.T @ centered / max(centered.shape[0] - 1, 1)
-                vals, vecs = np.linalg.eigh(cov)
-                vals = np.maximum(vals, 0.0)
-                total = float(vals.sum())
-                if total > 1e-12:
-                    curv[i] = vals[0] / total
-                normal = vecs[:, 0]
-                normals[i] = normal / max(np.linalg.norm(normal), 1e-12)
-
-            normal_angle = np.zeros_like(curv)
-            for i, inds in enumerate(idx):
-                dots = np.abs(normals[inds] @ normals[i])
-                dots = np.clip(dots, 0.0, 1.0)
-                normal_angle[i] = np.percentile(np.arccos(dots), 90)
-
-            score = curv + 0.25 * normal_angle
-            order = np.argsort(score)
-            patch_labels = np.zeros((patch.shape[0],), dtype=np.int32)
-            ranks = np.empty_like(order)
-            ranks[order] = np.arange(order.shape[0])
-            patch_labels = np.floor(
-                ranks * self.num_edge_geom_classes / max(patch.shape[0], 1)
-            ).astype(np.int32)
-            patch_labels = np.clip(
-                patch_labels,
-                0,
-                self.num_edge_geom_classes - 1,
-            )
-            labels.append(patch_labels)
-        return np.stack(labels, axis=0).astype(np.int32, copy=False)
-
-    def get_edge_geom_labels(self, pc_clean, point_idx=None):
-        labels_np = self._make_edge_geom_labels_np(pc_clean.detach().numpy())
-        labels = jt.array(labels_np).int32()
+    def get_edge_geom_labels(self, edge_geom_label, point_idx=None):
+        labels = edge_geom_label.int32()
         if point_idx is not None:
             labels = labels[:, point_idx]
         return labels
@@ -242,7 +193,7 @@ class VelocityModule(ModelSpec):
         plane_dist = (((pc_pred - p0) * normal).sum(dim=-1) ** 2.0)
         return (plane_dist / self.dsm_sigma).mean()
 
-    def get_supervised_losses(self, pc_noisy, pc_clean):
+    def get_supervised_losses(self, pc_noisy, pc_clean, edge_geom_label):
         """
         pc_noisy: (B, N, 3)
         pc_clean: (B, N, 3)
@@ -256,7 +207,7 @@ class VelocityModule(ModelSpec):
         geom_logits = self.edge_geom_head(
             condition_feat_for_geom.reshape(-1, condition_feat_for_geom.shape[-1])
         )
-        geom_labels = self.get_edge_geom_labels(pc_clean, point_idx=point_idx).reshape(-1)
+        geom_labels = self.get_edge_geom_labels(edge_geom_label, point_idx=point_idx).reshape(-1)
         edge_geom_cls_loss = nn.cross_entropy_loss(geom_logits, geom_labels)
 
         if self.edge_geom_pretrain_only:
@@ -330,9 +281,16 @@ class VelocityModule(ModelSpec):
         patch_size = batch['pc_noisy'].shape[-2]
         pc_noisy = batch['pc_noisy'].reshape(-1, patch_size, 3)
         pc_clean = batch['pc_clean'].reshape(-1, patch_size, 3)
+        if "edge_geom_label" not in batch:
+            raise KeyError(
+                "edge_geom_label is missing. Rebuild cache_clean_points with "
+                "scripts/cache_clean_points.py so edge_geom_label.npy is generated."
+            )
+        edge_geom_label = batch["edge_geom_label"].reshape(-1, patch_size)
         losses = self.get_supervised_losses(
             pc_noisy=pc_noisy,
             pc_clean=pc_clean,
+            edge_geom_label=edge_geom_label,
         )
         return losses
     
@@ -369,6 +327,8 @@ class VelocityModule(ModelSpec):
                     "pc_noisy": b.meta['pc_noisy'], # (num_patches, patch_size, 3)
                     "pc_clean": b.meta['pc_clean'],
                 }
+                if "edge_geom_label" in b.meta:
+                    item["edge_geom_label"] = b.meta["edge_geom_label"]
                 if 'patch_seed' in b.meta:
                     item["patch_seed"] = b.meta['patch_seed']
                 res.append(item)
