@@ -113,13 +113,27 @@ class VelocityModule(ModelSpec):
         plane_dist = (((pc_pred - p0) * normal).sum(dim=-1) ** 2.0)
         return (plane_dist / self.dsm_sigma).mean()
 
+    def get_geometry_gate_match_loss(self, geometry_feat, gate_embedding):
+        geom = geometry_feat.detach()
+        gate = gate_embedding
+        geom_dist = ((geom.unsqueeze(2) - geom.unsqueeze(1)) ** 2.0).sum(dim=-1)
+        gate_dist = ((gate.unsqueeze(2) - gate.unsqueeze(1)) ** 2.0).sum(dim=-1)
+        geom_mean = geom_dist.mean(dim=2, keepdims=True).mean(dim=1, keepdims=True)
+        gate_mean = gate_dist.mean(dim=2, keepdims=True).mean(dim=1, keepdims=True)
+        geom_dist = geom_dist / (geom_mean + 1e-8)
+        gate_dist = gate_dist / (gate_mean + 1e-8)
+        return ((gate_dist - geom_dist) ** 2.0).mean()
+
     def get_supervised_losses(self, pc_noisy, pc_clean):
         """
         pc_noisy: (B, N, 3)
         pc_clean: (B, N, 3)
         """
         point_idx = get_random_indices(pc_noisy.shape[1], self.num_train_points)
-        feat = self.encoder(pc_noisy)
+        feat, geometry_feat, gate_embedding = self.encoder(
+            pc_noisy,
+            return_condition=True,
+        )
         target = pc_clean - pc_noisy
         pc_noisy_for_loss = pc_noisy
         pc_clean_for_loss = pc_clean
@@ -127,6 +141,8 @@ class VelocityModule(ModelSpec):
             target = target[:, point_idx, :]
             pc_noisy_for_loss = pc_noisy[:, point_idx, :]
             pc_clean_for_loss = pc_clean[:, point_idx, :]
+            geometry_feat = geometry_feat[:, point_idx, :]
+            gate_embedding = gate_embedding[:, point_idx, :]
         if point_idx is not None:
             feat_for_loss = feat[:, point_idx, :]
         else:
@@ -139,10 +155,15 @@ class VelocityModule(ModelSpec):
             pc_clean=pc_clean,
             pc_anchor=pc_clean_for_loss,
         )
+        geometry_gate_match_loss = self.get_geometry_gate_match_loss(
+            geometry_feat=geometry_feat,
+            gate_embedding=gate_embedding,
+        )
         
         return {
             "displacement_loss": displacement_loss,
             "normalized_surface_loss": normalized_surface_loss,
+            "geometry_gate_match_loss": geometry_gate_match_loss,
         }
 
     def denoise_langevin_dynamics(self, pcl_noisy, num_steps=None):

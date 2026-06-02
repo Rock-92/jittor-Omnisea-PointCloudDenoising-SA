@@ -213,6 +213,17 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
         if linear.bias is not None:
             linear.bias.update(jt.zeros(linear.bias.shape))
 
+    def get_gate_embedding(self, condition_feat):
+        local_norm = self.global_norm(condition_feat)
+        scale_gate = nn.softmax(
+            apply_point_linear(self.scale_gate_proj, local_norm),
+            dim=-1,
+        ) * len(self.knn_scales)
+        temperature = jt.exp(0.25 * jt.tanh(
+            apply_point_linear(self.temperature_proj, local_norm)
+        ))
+        return jt.concat([scale_gate, temperature], dim=-1)
+
     def execute(self, x, graph_knn_idx, condition_feat=None):
         """
         x:       (B, N, C), point features.
@@ -227,14 +238,10 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
         v = apply_point_linear(self.v_proj, x_norm)
         B, N, _ = x.shape
         if condition_feat is not None:
-            local_norm = self.global_norm(condition_feat)
-            scale_gate = nn.softmax(
-                apply_point_linear(self.scale_gate_proj, local_norm),
-                dim=-1,
-            ) * len(self.knn_scales)
-            temperature = jt.exp(0.25 * jt.tanh(
-                apply_point_linear(self.temperature_proj, local_norm)
-            ))
+            gate_embedding = self.get_gate_embedding(condition_feat)
+            num_scales = len(self.knn_scales)
+            scale_gate = gate_embedding[:, :, :num_scales]
+            temperature = gate_embedding[:, :, num_scales:]
 
         scale_outputs = []
         for scale_idx, scale_k in enumerate(self.knn_scales):
@@ -400,6 +407,12 @@ class FeatureExtraction(nn.Module):
 
         self.fuse = nn.Linear(embedding_dim * num_blocks, embedding_dim)
 
+    def get_gate_embedding(self, condition_feat):
+        gate_parts = []
+        for block in self.blocks:
+            gate_parts.append(block.get_gate_embedding(condition_feat))
+        return jt.concat(gate_parts, dim=-1)
+
     def execute(self, x, return_condition=False):
         """
         x: (B, N, 3)
@@ -412,7 +425,9 @@ class FeatureExtraction(nn.Module):
         feat = self.act(feat)
         feat = apply_point_linear(self.input_proj_2, feat)
         feat = self.act(feat)
+        geometry_feat = self.geometry_token_encoder._pointwise_geometry(x)
         condition_feat = self.geometry_token_encoder(feat, x)
+        gate_embedding = self.get_gate_embedding(condition_feat)
 
         block_outputs = []
         for block_idx, (block, weight) in enumerate(zip(self.blocks, self.block_weights)):
@@ -429,7 +444,7 @@ class FeatureExtraction(nn.Module):
         feat = jt.concat(block_outputs, dim=-1)
         feat = apply_point_linear(self.fuse, feat)
         if return_condition:
-            return feat, condition_feat
+            return feat, geometry_feat, gate_embedding
         return feat
 
 class Decoder(nn.Module):

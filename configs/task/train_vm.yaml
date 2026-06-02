@@ -1,6 +1,6 @@
 mode: train
 debug: False
-load_ckpt: outputs6.0/checkpoints/vm/checkpoint_best.pkl
+load_ckpt: null
 
 components:
   data: train
