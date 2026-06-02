@@ -96,6 +96,19 @@ class VelocityModule(ModelSpec):
             hidden_dims=[self.edge_geom_hidden_dim],
         )
 
+    def get_train_parameters(self):
+        if not self.edge_geom_pretrain_only:
+            return self.parameters()
+        params = []
+        for module in [
+            self.encoder.input_proj_1,
+            self.encoder.input_proj_2,
+            self.encoder.edge_conditioner,
+            self.edge_geom_head,
+        ]:
+            params.extend(list(module.parameters()))
+        return params
+
     def _get_gate_embedding(self, condition_feat):
         gate_parts = []
         for block in self.encoder.blocks:
@@ -213,10 +226,13 @@ class VelocityModule(ModelSpec):
         )
         geom_labels = self.get_edge_geom_labels(edge_geom_label, point_idx=point_idx).reshape(-1)
         edge_geom_cls_loss = nn.cross_entropy_loss(geom_logits, geom_labels)
+        geom_pred = geom_logits.argmax(dim=-1)[0]
+        edge_geom_acc = (geom_pred == geom_labels).float().mean()
 
         if self.edge_geom_pretrain_only:
             return {
                 "edge_geom_cls_loss": edge_geom_cls_loss,
+                "edge_geom_acc": edge_geom_acc,
             }
 
         target = pc_clean - pc_noisy
@@ -265,6 +281,7 @@ class VelocityModule(ModelSpec):
             "edge_aux_displacement_loss": edge_aux_displacement_loss,
             "normalized_surface_loss": normalized_surface_loss,
             "edge_geom_cls_loss": edge_geom_cls_loss,
+            "edge_geom_acc": edge_geom_acc,
             "edge_gate_match_loss": edge_gate_match_loss,
         }
 

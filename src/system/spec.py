@@ -41,7 +41,11 @@ def get_optimizer(optimizer_config, model):
     if __target__ not in MAPPING:
         raise ValueError(f"unsupported optimizer: {__target__}")
     OptimizerClass = MAPPING[__target__]
-    optimizer = OptimizerClass(model.parameters(), **optimizer_config)
+    if hasattr(model, "get_train_parameters"):
+        parameters = model.get_train_parameters()
+    else:
+        parameters = model.parameters()
+    optimizer = OptimizerClass(parameters, **optimizer_config)
     return optimizer
 
 def get_optimizer_lr(optimizer):

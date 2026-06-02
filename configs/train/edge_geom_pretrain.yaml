@@ -1,5 +1,6 @@
 loss:
   edge_geom_cls_loss: 1.0
+  edge_geom_acc: 0.0
 
 optimizer:
   __target__: adam
