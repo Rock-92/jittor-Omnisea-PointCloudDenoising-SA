@@ -9,4 +9,5 @@ dependencies:
   - libgomp
   - pip
   - pip:
+      # requirements.txt includes cupy-cuda11x for Jittor CUDA scalar ops.
       - -r requirements.txt
