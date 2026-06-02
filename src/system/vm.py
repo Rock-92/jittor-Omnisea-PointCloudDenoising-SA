@@ -227,6 +227,8 @@ class VMSystem(DummySystem):
         return base / "dataset_clean" / Path(*rel_parts) / "models" / "model_normalized.obj"
     
     def validation_metric_step(self, batch):
+        if bool(getattr(self.model, "edge_geom_pretrain_only", False)):
+            return None
         if "pc_noisy" not in batch or "pc_clean" not in batch:
             return None
         

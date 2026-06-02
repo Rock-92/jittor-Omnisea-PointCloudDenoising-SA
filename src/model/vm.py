@@ -199,7 +199,11 @@ class VelocityModule(ModelSpec):
         pc_clean: (B, N, 3)
         """
         point_idx = get_random_indices(pc_noisy.shape[1], self.num_train_points)
-        feat, condition_feat = self.encoder(pc_noisy, return_condition=True)
+        if self.edge_geom_pretrain_only:
+            feat = None
+            condition_feat = self.encoder.condition_only(pc_noisy)
+        else:
+            feat, condition_feat = self.encoder(pc_noisy, return_condition=True)
         if point_idx is not None:
             condition_feat_for_geom = condition_feat[:, point_idx, :]
         else:

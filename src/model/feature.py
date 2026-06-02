@@ -468,6 +468,18 @@ class FeatureExtraction(nn.Module):
             return feat, condition_feat
         return feat
 
+    def condition_only(self, x):
+        """
+        Compute only the point-wise EdgeConv geometry condition feature.
+        This skips the local attention encoder and is used for geometry-teacher
+        pretraining.
+        """
+        feat = apply_point_linear(self.input_proj_1, x)
+        feat = self.act(feat)
+        feat = apply_point_linear(self.input_proj_2, feat)
+        feat = self.act(feat)
+        return self.edge_conditioner(feat, x)
+
 
 class Decoder(nn.Module):
     def __init__(self, z_dim, out_dim, hidden_dims):
