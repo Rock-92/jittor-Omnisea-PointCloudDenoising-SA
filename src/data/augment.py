@@ -154,12 +154,6 @@ class AugmentPatch(Augment):
 
         pat_A = pc_noisy[nn_idx]  # (P, M, 3)
         pat_B = pc[nn_idx]        # (P, M, 3)
-        edge_geom_vector = None
-        if asset.meta is not None and "edge_geom_vector" in asset.meta:
-            edge_geom_vector = asset.meta["edge_geom_vector"][nn_idx].astype(
-                np.float32,
-                copy=False,
-            )
         seed_points = seed_points[:, None, :]
         
         pat_A = pat_A - seed_points
@@ -170,8 +164,6 @@ class AugmentPatch(Augment):
         asset.meta['pc_noisy'] = pat_A
         asset.meta['pc_clean'] = pat_B
         asset.meta['patch_seed'] = seed_points
-        if edge_geom_vector is not None:
-            asset.meta["edge_geom_vector"] = edge_geom_vector
 
 def get_augments(*args) -> List[Augment]:
     MAP = {

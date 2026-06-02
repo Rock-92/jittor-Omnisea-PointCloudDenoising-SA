@@ -106,27 +106,6 @@ class PointLayerNorm(nn.Module):
         return x * self.weight.reshape(1, 1, self.dim) + self.bias.reshape(1, 1, self.dim)
 
 
-class RelativePositionBias(nn.Module):
-    def __init__(self, hidden_dim):
-        super().__init__()
-        self.lin_1 = nn.Linear(4, hidden_dim)
-        self.lin_2 = nn.Linear(hidden_dim, 1)
-        self.act = nn.ReLU()
-
-    def execute(self, rel_pos):
-        """
-        rel_pos: (B, N, K, 3), neighbor_xyz - center_xyz
-        return:  (B, N, K), scalar attention bias for each local edge.
-        """
-        B, N, K, _ = rel_pos.shape
-        dist = jt.sqrt((rel_pos ** 2).sum(dim=-1, keepdims=True) + 1e-8)
-        rel_feat = jt.concat([rel_pos, dist], dim=-1)
-        bias = apply_edge_linear(self.lin_1, rel_feat)
-        bias = self.act(bias)
-        bias = apply_edge_linear(self.lin_2, bias)
-        return bias.reshape(B, N, K)
-
-
 class TokenSelfAttentionBlock(nn.Module):
     def __init__(self, dim, ffn_hidden_dim=None):
         super().__init__()
@@ -203,7 +182,6 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
         self,
         dim,
         knn_scales,
-        relative_position_bias_hidden_dim,
         ffn_hidden_dim=None,
     ):
         super().__init__()
@@ -218,15 +196,12 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
         self.q_proj = nn.Linear(dim, dim)
         self.k_proj = nn.Linear(dim, dim)
         self.v_proj = nn.Linear(dim, dim)
-        self.rel_pos_bias = RelativePositionBias(relative_position_bias_hidden_dim)
         self.out_proj = nn.Linear(dim * len(knn_scales), dim)
         self.global_norm = PointLayerNorm(dim)
         self.scale_gate_proj = nn.Linear(dim, len(self.knn_scales))
         self.temperature_proj = nn.Linear(dim, len(self.knn_scales))
-        self.rel_gate_proj = nn.Linear(dim, len(self.knn_scales))
         self._zero_linear(self.scale_gate_proj)
         self._zero_linear(self.temperature_proj)
-        self._zero_linear(self.rel_gate_proj)
 
         self.ffn_norm = PointLayerNorm(dim)
         self.ffn_lin_1 = nn.Linear(dim, self.ffn_hidden_dim)
@@ -238,13 +213,12 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
         if linear.bias is not None:
             linear.bias.update(jt.zeros(linear.bias.shape))
 
-    def execute(self, x, xyz, graph_knn_idx, condition_feat=None):
+    def execute(self, x, graph_knn_idx, condition_feat=None):
         """
         x:       (B, N, C), point features.
-        xyz:     (B, N, 3), noisy point coordinates for relative position bias.
         graph_knn_idx: (B, N, max(knn_scales)), neighbor indices used for
-            attention neighbors and relative-position bias.
-        condition_feat: optional (B, N, C), point-wise local geometry features
+            attention neighbors.
+        condition_feat: optional (B, N, C), point-wise geometry tokens
             used to modulate multi-scale attention.
         """
         x_norm = self.attn_norm(x)
@@ -261,24 +235,17 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
             temperature = jt.exp(0.25 * jt.tanh(
                 apply_point_linear(self.temperature_proj, local_norm)
             ))
-            rel_gate = 1.0 + 0.5 * jt.tanh(
-                apply_point_linear(self.rel_gate_proj, local_norm)
-            )
 
         scale_outputs = []
         for scale_idx, scale_k in enumerate(self.knn_scales):
             idx = graph_knn_idx[:, :, :scale_k]
             k_neighbors = gather_neighbors(k, idx)
             v_neighbors = gather_neighbors(v, idx)
-            xyz_neighbors = gather_neighbors(xyz, idx)
-            rel_pos = xyz_neighbors - xyz.unsqueeze(2)
 
             dot_logits = (q.unsqueeze(2) * k_neighbors).sum(dim=-1) * self.scale
-            rel_bias = self.rel_pos_bias(rel_pos)
             if condition_feat is not None:
                 dot_logits = dot_logits / temperature[:, :, scale_idx].reshape(B, N, 1)
-                rel_bias = rel_bias * rel_gate[:, :, scale_idx].reshape(B, N, 1)
-            attn_logits = dot_logits + rel_bias
+            attn_logits = dot_logits
             attn = nn.softmax(attn_logits, dim=-1)
             scale_out = (attn.unsqueeze(-1) * v_neighbors).sum(dim=2)
             if condition_feat is not None:
@@ -296,72 +263,76 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
         return x + ffn
 
 
-class EdgeConvBlock(nn.Module):
-    def __init__(self, dim, hidden_dim=None):
+class GeometryTokenEncoder(nn.Module):
+    def __init__(self, out_dim, hidden_dim=64, knn=32):
         super().__init__()
-        self.dim = int(dim)
-        if hidden_dim is None:
-            hidden_dim = dim
+        self.out_dim = int(out_dim)
         self.hidden_dim = int(hidden_dim)
-        self.edge_lin_1 = nn.Linear(self.dim * 2 + 3, self.hidden_dim)
-        self.edge_lin_2 = nn.Linear(self.hidden_dim, self.dim)
-        self.norm = PointLayerNorm(self.dim)
+        self.knn = int(knn)
+        self.lin_1 = nn.Linear(8, self.hidden_dim)
+        self.lin_2 = nn.Linear(self.hidden_dim, self.out_dim)
+        self.norm = PointLayerNorm(self.out_dim)
         self.act = nn.ReLU()
 
-    def execute(self, feat, xyz, knn_idx):
-        """
-        feat:    (B, N, C)
-        xyz:     (B, N, 3)
-        knn_idx: (B, N, K), xyz-space neighbors.
-        return:  (B, N, C)
-        """
-        feat_neighbors = gather_neighbors(feat, knn_idx)
+    def _pointwise_geometry(self, xyz):
+        k = min(max(3, self.knn), xyz.shape[1] - 1)
+        knn_idx = get_knn_idx(xyz, xyz, k, offset=1)
         xyz_neighbors = gather_neighbors(xyz, knn_idx)
-        feat_center = feat.unsqueeze(2)
         xyz_rel = xyz_neighbors - xyz.unsqueeze(2)
-        feat_center_expand = feat_center + jt.zeros(feat_neighbors.shape)
-        edge = jt.concat(
-            [feat_center_expand, feat_neighbors - feat_center, xyz_rel],
+        centered = xyz_rel - xyz_rel.mean(dim=2, keepdims=True)
+        cov = centered.transpose(2, 3) @ centered
+        cov = cov / float(max(k - 1, 1))
+        eigvals, eigvecs = jt.linalg.eigh(cov)
+        eigvals = jt.maximum(eigvals, 0.0)
+
+        l0 = eigvals[:, :, 0]
+        l1 = eigvals[:, :, 1]
+        l2 = eigvals[:, :, 2]
+        eig_sum = l0 + l1 + l2 + 1e-8
+        curvature = l0 / eig_sum
+        linearity = (l2 - l1) / (l2 + 1e-8)
+        planarity = (l1 - l0) / (l2 + 1e-8)
+        scattering = l0 / (l2 + 1e-8)
+
+        normals = eigvecs[:, :, :, 0]
+        normal_neighbors = gather_neighbors(normals, knn_idx)
+        normal_dot = jt.abs((normal_neighbors * normals.unsqueeze(2)).sum(dim=-1))
+        normal_variation = 1.0 - normal_dot.mean(dim=2)
+
+        radius = jt.sqrt((xyz_rel ** 2.0).sum(dim=-1) + 1e-8)
+        radius_mean = radius.mean(dim=2)
+        radius_var = ((radius - radius_mean.unsqueeze(-1)) ** 2.0).mean(dim=2)
+        radius_std = jt.sqrt(radius_var + 1e-8)
+        radius_max = radius.max(dim=2)
+        patch_radius = jt.sqrt((xyz ** 2.0).sum(dim=-1) + 1e-8).max(dim=1).reshape(-1, 1)
+        radius_mean = radius_mean / (patch_radius + 1e-8)
+        radius_std = radius_std / (patch_radius + 1e-8)
+        radius_max = radius_max / (patch_radius + 1e-8)
+
+        return jt.stack(
+            [
+                curvature,
+                linearity,
+                planarity,
+                scattering,
+                normal_variation,
+                radius_mean,
+                radius_std,
+                radius_max,
+            ],
             dim=-1,
         )
-        edge_feat = apply_edge_linear(self.edge_lin_1, edge)
-        edge_feat = self.act(edge_feat)
-        edge_feat = apply_edge_linear(self.edge_lin_2, edge_feat)
-        pooled = edge_feat.max(dim=2)
-        return self.norm(feat + pooled)
-
-
-class EdgeConvConditioner(nn.Module):
-    def __init__(self, dim, knn=24, num_blocks=2, hidden_dim=None):
-        super().__init__()
-        self.dim = int(dim)
-        self.knn = int(knn)
-        self.num_blocks = int(num_blocks)
-        if hidden_dim is None:
-            hidden_dim = dim
-        self.hidden_dim = int(hidden_dim)
-        self.blocks = []
-        for i in range(self.num_blocks):
-            block = EdgeConvBlock(
-                dim=self.dim,
-                hidden_dim=self.hidden_dim,
-            )
-            setattr(self, f"block_{i}", block)
-            self.blocks.append(block)
-        self.out_norm = PointLayerNorm(self.dim)
 
     def execute(self, feat, xyz):
         """
-        feat: (B, N, C)
-        xyz:  (B, N, 3)
-        return point-wise local condition features: (B, N, C)
+        xyz:  (B, N, 3), noisy patch coordinates.
+        return point-wise geometry modulation tokens: (B, N, C)
         """
-        k = min(max(1, self.knn), xyz.shape[1] - 1)
-        knn_idx = get_knn_idx(xyz, xyz, k, offset=1)
-        out = feat
-        for block in self.blocks:
-            out = block(out, xyz, knn_idx)
-        return self.out_norm(out)
+        geom = self._pointwise_geometry(xyz)
+        token = apply_point_linear(self.lin_1, geom)
+        token = self.act(token)
+        token = apply_point_linear(self.lin_2, token)
+        return self.norm(token)
 
 
 class FeatureExtraction(nn.Module):
@@ -374,11 +345,9 @@ class FeatureExtraction(nn.Module):
         num_blocks=4,
         attention_weight_init=1.0,
         knn_scales=None,
-        relative_position_bias_hidden_dim=32,
         ffn_hidden_dim=None,
-        edgeconv_knn=24,
-        edgeconv_blocks=2,
-        edgeconv_hidden_dim=None,
+        geometry_token_knn=32,
+        geometry_token_hidden_dim=64,
     ):
         super().__init__()
 
@@ -395,20 +364,16 @@ class FeatureExtraction(nn.Module):
         if ffn_hidden_dim is None:
             ffn_hidden_dim = embedding_dim * 2
         self.ffn_hidden_dim = int(ffn_hidden_dim)
-        self.edgeconv_knn = int(edgeconv_knn)
-        self.edgeconv_blocks = int(edgeconv_blocks)
-        if edgeconv_hidden_dim is None:
-            edgeconv_hidden_dim = embedding_dim
-        self.edgeconv_hidden_dim = int(edgeconv_hidden_dim)
+        self.geometry_token_knn = int(geometry_token_knn)
+        self.geometry_token_hidden_dim = int(geometry_token_hidden_dim)
 
         self.input_proj_1 = nn.Linear(input_dim, input_expand_dim)
         self.input_proj_2 = nn.Linear(input_expand_dim, embedding_dim)
         self.act = nn.ReLU()
-        self.edge_conditioner = EdgeConvConditioner(
-            dim=embedding_dim,
-            knn=self.edgeconv_knn,
-            num_blocks=self.edgeconv_blocks,
-            hidden_dim=self.edgeconv_hidden_dim,
+        self.geometry_token_encoder = GeometryTokenEncoder(
+            out_dim=embedding_dim,
+            hidden_dim=self.geometry_token_hidden_dim,
+            knn=self.geometry_token_knn,
         )
 
         if isinstance(attention_weight_init, (list, tuple)):
@@ -425,7 +390,6 @@ class FeatureExtraction(nn.Module):
             block = MultiScaleLocalSelfAttentionBlock(
                 dim=embedding_dim,
                 knn_scales=self.knn_scales,
-                relative_position_bias_hidden_dim=relative_position_bias_hidden_dim,
                 ffn_hidden_dim=self.ffn_hidden_dim,
             )
             weight = jt.ones((1,)) * float(block_weight_values[i])
@@ -448,7 +412,7 @@ class FeatureExtraction(nn.Module):
         feat = self.act(feat)
         feat = apply_point_linear(self.input_proj_2, feat)
         feat = self.act(feat)
-        condition_feat = self.edge_conditioner(feat, x)
+        condition_feat = self.geometry_token_encoder(feat, x)
 
         block_outputs = []
         for block_idx, (block, weight) in enumerate(zip(self.blocks, self.block_weights)):
@@ -459,7 +423,7 @@ class FeatureExtraction(nn.Module):
                 block_knn_idx = reuse_knn_idx
             else:
                 block_knn_idx = reuse_knn_idx
-            feat = block(feat, x, block_knn_idx, condition_feat=condition_feat)
+            feat = block(feat, block_knn_idx, condition_feat=condition_feat)
             block_outputs.append(feat * weight)
 
         feat = jt.concat(block_outputs, dim=-1)
@@ -467,19 +431,6 @@ class FeatureExtraction(nn.Module):
         if return_condition:
             return feat, condition_feat
         return feat
-
-    def condition_only(self, x):
-        """
-        Compute only the point-wise EdgeConv geometry condition feature.
-        This skips the local attention encoder and is used for geometry-teacher
-        pretraining.
-        """
-        feat = apply_point_linear(self.input_proj_1, x)
-        feat = self.act(feat)
-        feat = apply_point_linear(self.input_proj_2, feat)
-        feat = self.act(feat)
-        return self.edge_conditioner(feat, x)
-
 
 class Decoder(nn.Module):
     def __init__(self, z_dim, out_dim, hidden_dims):

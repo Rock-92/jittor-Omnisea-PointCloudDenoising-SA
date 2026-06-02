@@ -1,10 +1,6 @@
 loss:
   displacement_loss: 0.9
-  edge_aux_displacement_loss: 0.2
   normalized_surface_loss: 0.1
-  edge_geom_reg_loss: 0.05
-  edge_geom_mae: 0.0
-  edge_gate_match_loss: 0.02
 
 optimizer:
   __target__: adam
@@ -20,4 +16,3 @@ scheduler:
 
 trainer:
   epochs: 100
-  edge_geom_freeze_epochs: 20

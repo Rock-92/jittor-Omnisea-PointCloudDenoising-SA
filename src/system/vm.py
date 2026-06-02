@@ -128,43 +128,6 @@ class VMSystem(DummySystem):
             ckpt_save_name=ckpt_save_name,
         )
 
-    def _set_module_requires_grad(self, module, enabled: bool):
-        if module is None:
-            return
-        for p in module.parameters():
-            if enabled:
-                p.start_grad()
-            else:
-                p.stop_grad()
-
-    def _set_edge_geometry_teacher_requires_grad(self, enabled: bool):
-        encoder = getattr(self.model, "encoder", None)
-        self._set_module_requires_grad(
-            getattr(encoder, "edge_conditioner", None),
-            enabled,
-        )
-        self._set_module_requires_grad(
-            getattr(self.model, "edge_geom_head", None),
-            enabled,
-        )
-
-    def on_train_epoch_start(self):
-        super().on_train_epoch_start()
-        freeze_epochs = int(self.trainer_config.get("edge_geom_freeze_epochs", 0))
-        pretrain_only = bool(getattr(self.model, "edge_geom_pretrain_only", False))
-        if freeze_epochs <= 0 or pretrain_only:
-            self._set_edge_geometry_teacher_requires_grad(True)
-            return
-        frozen = self._current_epoch < freeze_epochs
-        self._set_edge_geometry_teacher_requires_grad(not frozen)
-        if self._current_epoch == 0 and frozen:
-            print(
-                "Freeze EdgeConv geometry teacher "
-                f"for first {freeze_epochs} epochs."
-            )
-        elif self._current_epoch == freeze_epochs:
-            print("Unfreeze EdgeConv geometry teacher.")
-    
     def on_train_end(self):
         if self.writer is None or self.dataset_module.predict_dataset_config is None:
             return
@@ -227,8 +190,6 @@ class VMSystem(DummySystem):
         return base / "dataset_clean" / Path(*rel_parts) / "models" / "model_normalized.obj"
     
     def validation_metric_step(self, batch):
-        if bool(getattr(self.model, "edge_geom_pretrain_only", False)):
-            return None
         if "pc_noisy" not in batch or "pc_clean" not in batch:
             return None
         

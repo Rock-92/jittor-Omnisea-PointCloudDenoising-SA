@@ -1,4 +1,0 @@
-__target__: vm
-
-ckpt_save_dir: outputs/checkpoints/vm_edgeconv
-ckpt_save_name: checkpoint

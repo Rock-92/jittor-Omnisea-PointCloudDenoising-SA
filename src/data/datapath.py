@@ -54,15 +54,10 @@ class CleanNpyLazyAsset(LazyAsset):
     # load cached clean point cloud samples for training/validation
     def load(self) -> 'Asset':
         pc = np.load(self.path).astype(np.float32, copy=False)
-        vector_path = os.path.join(os.path.dirname(self.path), "edge_geom_vector.npy")
-        meta = {}
-        if os.path.exists(vector_path):
-            meta["edge_geom_vector"] = np.load(vector_path).astype(np.float32, copy=False)
         asset = Asset(
             path=self.path,
             cls=self.cls,
             sampled_vertices=pc,
-            meta=meta if meta else None,
         )
         return asset
 

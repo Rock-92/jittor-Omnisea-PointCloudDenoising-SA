@@ -1,26 +1,27 @@
-# Jittor Point Cloud Denoising
+# Jittor 点云去噪
 
-这是一个基于 Jittor 的点云去噪项目。模型输入 noisy patch，预测每个点的去噪位移：
+这是一个基于 Jittor 的 patch 点云去噪项目。当前主线已经简化为：
+
+```text
+noisy patch
+  -> 在线几何 token 计算
+  -> 几何调制的局部 self-attention encoder
+  -> displacement decoder
+  -> denoised patch
+```
+
+模型输入带噪 patch，预测每个点的三维位移：
 
 ```text
 target = pc_clean - pc_noisy
 pc_pred = pc_noisy + displacement
 ```
 
-当前主线模型：
-
-```text
-point-wise EdgeConv geometry teacher
-+ geometry-aware gate matching
-+ 4-layer token-conditioned local denoising encoder
-+ MLP displacement decoder
-```
-
-模型先用 `EdgeConvConditioner` 为每个点提取 256 维 point-wise local geometry feature。这个 feature 一方面作为几何 teacher 通过分类头学习局部曲率、尖锐法向变化和转角等几何伪标签，另一方面用于调制后续 local attention 的 `scale_gate / temperature / rel_gate`。主训练中还加入 gate matching loss，要求几何分类头认为相近的点具有相近 gate，几何分类头认为较远的点具有较远 gate。
+当前没有 EdgeConv，没有显式 relative position bias，也没有几何分类头或几何预训练分支。几何信息会在训练和推理 forward 中直接从输入 noisy patch 在线计算。
 
 ## 环境
 
-推荐使用 NVIDIA CUDA 环境：
+推荐使用 CUDA 环境：
 
 ```bash
 conda env create -f environment.yml
@@ -28,7 +29,7 @@ conda activate jittor
 python -m pip install -r requirements.txt
 ```
 
-如果手动创建环境：
+也可以手动创建环境：
 
 ```bash
 conda create -n jittor python=3.9 -y
@@ -36,11 +37,9 @@ conda activate jittor
 python -m pip install -r requirements.txt
 ```
 
-ROCm/HIP/DCU 后端可能触发 Jittor fused operator 编译失败。训练建议使用 A800、4090、3090 等 NVIDIA CUDA 机器。
-
 ## 数据目录
 
-clean mesh 目录：
+clean mesh 数据目录：
 
 ```text
 dataset_clean/
@@ -61,24 +60,15 @@ test_noisy/
         noisy.npy
 ```
 
-如果原始数据在隔壁项目，例如：
+## 生成 clean 点云缓存
 
-```text
-E:\Code\competition2_EdgeConv\dataset_clean
-```
-
-下面命令里的 `--input_dataset_dir` 改成对应路径即可。
-
-## Step 1: 生成 clean 缓存
-
-主去噪训练读取 clean 点云缓存，不直接从 mesh 训练。先从 OBJ 采样生成 `clean.npy`：
+训练不直接从 OBJ mesh 读取，而是先把 mesh 采样成 `clean.npy` 缓存。现在缓存里只需要 clean 点云，不再需要任何几何标签或几何向量文件。
 
 ```bash
 python scripts/cache_clean_points.py \
   --input_dataset_dir dataset_clean \
   --output_dir cache_clean_points \
   --datalist datalist/train.txt datalist/validate.txt \
-  --edge_geom_knn 32 \
   --workers 8 \
   --seed 123 \
   --overwrite
@@ -91,7 +81,6 @@ C:\Users\Lenovo\anaconda3\envs\jittor\python.exe scripts\cache_clean_points.py `
   --input_dataset_dir E:\Code\competition2_EdgeConv\dataset_clean `
   --output_dir cache_clean_points `
   --datalist datalist\train.txt datalist\validate.txt `
-  --edge_geom_knn 32 `
   --workers 8 `
   --seed 123 `
   --overwrite
@@ -105,156 +94,86 @@ cache_clean_points/
     <synset_id>/
       <model_id>/
         clean.npy
-        edge_geom_vector.npy
 ```
 
-`edge_geom_vector.npy` 是每个 clean 点的连续几何伪标签向量，由局部 PCA 形状量和法向转角提前计算得到。预训练和主训练都会直接读取这个文件，不再在训练循环里在线计算几何伪标签。如果已有旧版 `cache_clean_points` 只有 `clean.npy`，重新运行上面的缓存命令即可；不加 `--overwrite` 时脚本也会为已有 `clean.npy` 补生成缺失的 `edge_geom_vector.npy`。
+## 当前模型结构
 
-## Step 2: 预训练 EdgeConv 几何 teacher
+训练时会先从 `clean.npy` 读取 clean 点云，然后在线加噪、切 patch：
 
-先预训练 EdgeConv 几何 teacher，让 EdgeConv condition feature 和几何回归头能够输出明确的局部几何信息。几何伪标签来自缓存中的 `edge_geom_vector.npy`，主要由局部曲率、PCA 形状量和法向转角得到。
+```text
+clean.npy
+  -> normalize
+  -> add_noise
+  -> 随机选 seed point
+  -> 在 noisy 点云中取 seed 周围 KNN 1000 个点
+  -> patch 坐标减 seed
+  -> 输入模型
+```
+
+模型内部结构：
+
+```text
+patch: (1000, 3)
+  -> input projection: (1000, 256)
+  -> 从 noisy patch 在线计算每点局部几何统计
+  -> GeometryTokenEncoder: (1000, 256)
+  -> 4 层 multi-scale local self-attention
+  -> fuse: (1000, 256)
+  -> decoder
+  -> displacement: (1000, 3)
+```
+
+在线几何 token 默认使用 `geometry_token_knn: 32`，会从每个点的局部邻域中计算：
+
+```text
+curvature
+linearity
+planarity
+scattering
+normal variation
+local radius mean
+local radius std
+local radius max
+```
+
+这些几何统计经过 MLP 投影成 256 维 token，用于调制 attention 的多尺度权重和 attention temperature。
+
+## 训练
 
 ```bash
-python run.py --task configs/task/train_edge_geom_pretrain.yaml --seed 123
+python run.py --task configs/task/train_vm.yaml --seed 123
 ```
 
-输出 checkpoint：
+主训练配置链路：
 
 ```text
-outputs/checkpoints/vm_edgegeom_pretrain/checkpoint_best.pkl
+configs/task/train_vm.yaml
+configs/data/train.yaml
+configs/transform/vm.yaml
+configs/model/vm.yaml
+configs/train/vm.yaml
+configs/system/vm.yaml
 ```
 
-对应配置：
-
-```text
-configs/task/train_edge_geom_pretrain.yaml
-configs/model/vm_edgegeom_pretrain.yaml
-configs/train/edge_geom_pretrain.yaml
-configs/system/vm_edgegeom_pretrain.yaml
-```
-
-预训练阶段只优化：
-
-```yaml
-edge_geom_reg_loss: 1.0
-```
-
-默认预训练 30 个 epoch。训练后建议先跑诊断脚本，如果 `edge_condition` 的几何 AUC 仍低于 0.70，可以继续增加预训练轮数。
-
-## Step 3: 主去噪训练
-
-预训练完成后，启动带 gate matching 的主训练：
-
-```bash
-python run.py --task configs/task/train_vm_edgegeom.yaml --seed 123
-```
-
-这个入口会加载：
-
-```text
-outputs/checkpoints/vm_edgegeom_pretrain/checkpoint_best.pkl
-```
-
-主训练流程：
-
-```text
-1. 创建 VelocityModule 去噪模型
-2. input_proj 得到每点初始特征
-3. EdgeConvConditioner 提取每点 point-wise local geometry feature
-4. edge_geom_head 预测局部几何类别
-5. scale_gate / temperature / rel_gate 根据 EdgeConv feature 调制 local attention
-6. edge_gate_match_loss 约束 gate 的距离结构匹配几何分类头的距离结构
-7. decoder 输出 displacement
-8. EdgeConv auxiliary decoder 输出辅助 displacement
-9. 联合 displacement、surface、geometry classification、gate matching loss 训练
-```
-
-主训练前 20 个 epoch 会冻结 EdgeConv geometry teacher：
-
-```text
-model.encoder.edge_conditioner
-model.edge_geom_head
-```
-
-这段时间 gate projection、denoising encoder 和 decoder 正常训练，gate 会向固定几何 teacher 学习。第 20 个 epoch 后自动解冻，全模型联合微调。
-
-主训练 loss 权重：
+当前训练 loss：
 
 ```yaml
 displacement_loss: 0.9
-edge_aux_displacement_loss: 0.2
 normalized_surface_loss: 0.1
-edge_geom_reg_loss: 0.05
-edge_gate_match_loss: 0.02
 ```
 
-关键参数：
-
-```yaml
-edgeconv_knn: 24
-edgeconv_blocks: 2
-edgeconv_hidden_dim: 256
-edge_geom_dim: 5
-edge_geom_hidden_dim: 128
-edge_geom_knn: 32
-edge_geom_match_temperature: 1.0
-edge_geom_freeze_epochs: 20
-edge_aux_hidden_dims: [128, 64]
-```
-
-主训练输出 checkpoint：
+训练输出 checkpoint：
 
 ```text
-outputs/checkpoints/vm_edgeconv/checkpoint_best.pkl
+outputs/checkpoints/vm/checkpoint_best.pkl
 ```
-
-如果不想使用几何 teacher 预训练，也可以跑旧入口：
-
-```bash
-python run.py --task configs/task/train_vm_ssl.yaml --seed 123
-```
-
-但当前推荐流程是 `train_edge_geom_pretrain.yaml` 后接 `train_vm_edgegeom.yaml`。
-
-## 诊断 EdgeConv 和 gate 几何区分度
-
-训练后可以检查 EdgeConv condition feature 是否包含曲率、尖锐法向变化、转角信息，以及 gate 是否真正学到了几何调制：
-
-```bash
-python tools/diagnose_edgeconv_geometry.py \
-  --checkpoint outputs/checkpoints/vm_edgeconv/checkpoint_best.pkl \
-  --out-dir analysis_outputs/edgeconv_geometry \
-  --patches 40 \
-  --points-per-patch 384 \
-  --seed 20260601
-```
-
-输出：
-
-```text
-analysis_outputs/edgeconv_geometry/
-  summary.json
-  edge_condition_geometry.csv
-  edge_gate_geometry.csv
-```
-
-重点看：
-
-```text
-edge_condition_*_r2_pc16
-edge_condition_*_best_pc_auc_q75_vs_q25
-gate_*_r2_pc16
-gate_*_best_pc_auc_q75_vs_q25
-```
-
-如果 `edge_condition` 指标高但 `gate` 指标低，说明 EdgeConv 学到了几何，但调制没有跟上。加入 gate matching 后，期望 gate 的 AUC/R2 明显提高。
 
 ## 推理
 
 确认 `configs/task/predict_vm.yaml` 中的 `load_ckpt` 指向要使用的 checkpoint，例如：
 
 ```yaml
-load_ckpt: outputs/checkpoints/vm_edgeconv/checkpoint_best.pkl
+load_ckpt: outputs/checkpoints/vm/checkpoint_best.pkl
 ```
 
 然后运行：
@@ -273,40 +192,7 @@ outputs/result/test_noisy/
         denoised.npy
 ```
 
-打包提交：
-
-```bash
-cd outputs/result/test_noisy
-zip -r ../../../result.zip shapenet/
-```
-
-## 推荐完整流程
-
-```bash
-# 1. 生成 clean 缓存
-python scripts/cache_clean_points.py \
-  --input_dataset_dir dataset_clean \
-  --output_dir cache_clean_points \
-  --datalist datalist/train.txt datalist/validate.txt \
-  --edge_geom_knn 32 \
-  --workers 8 \
-  --seed 123 \
-  --overwrite
-
-# 2. 预训练 EdgeConv geometry teacher
-python run.py --task configs/task/train_edge_geom_pretrain.yaml --seed 123
-
-# 3. 主去噪训练，前 20 epoch 冻结 geometry teacher
-python run.py --task configs/task/train_vm_edgegeom.yaml --seed 123
-
-# 4. 诊断 EdgeConv / gate 几何区分度
-python tools/diagnose_edgeconv_geometry.py \
-  --checkpoint outputs/checkpoints/vm_edgeconv/checkpoint_best.pkl \
-  --out-dir analysis_outputs/edgeconv_geometry
-
-# 5. 推理
-python scripts/infer.py --seed 123
-```
+推理时会对整云做 patch-based denoise：FPS 选 seed，KNN 切 patch，patch 内预测 displacement，再融合回整云。
 
 ## 项目结构
 
@@ -314,11 +200,13 @@ python scripts/infer.py --seed 123
 configs/       配置文件
 datalist/      train / validate / test 列表
 scripts/       缓存、训练、推理、评估脚本
-src/           核心代码
-tools/         诊断工具
+src/data/      数据路径、Dataset、Transform、Augment
+src/model/     去噪模型、特征 encoder、decoder
+src/system/    训练、验证、推理流程
+tools/         分析工具
 outputs/       checkpoint、日志、推理结果
 ```
 
 ## 说明
 
-仓库不包含数据集、训练权重和大缓存文件。`cache_clean_points/`、`geometry_ssl_cache/`、`outputs/` 都是运行时产物。
+当前仓库不包含数据集、训练权重和大缓存文件。`cache_clean_points/`、`outputs/` 都是运行时产物。

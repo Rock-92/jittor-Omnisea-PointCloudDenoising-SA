@@ -3,7 +3,6 @@ from typing import Dict, List
 
 import jittor as jt
 import numpy as np
-from jittor import nn
 
 from .feature import FeatureExtraction, Decoder
 from .spec import ModelSpec
@@ -29,29 +28,16 @@ class VelocityModule(ModelSpec):
         self.feat_embedding_dim = cfg['feat_embedding_dim']
         self.attention_blocks = cfg.get('attention_blocks', 4)
         self.attention_weight_init = cfg.get('attention_weight_init', 1.0)
-        self.relative_position_bias_hidden_dim = cfg.get(
-            'relative_position_bias_hidden_dim',
-            32,
-        )
         self.attention_ffn_hidden_dim = cfg.get(
             'attention_ffn_hidden_dim',
             self.feat_embedding_dim * 2,
         )
-        self.edgeconv_knn = cfg.get('edgeconv_knn', 24)
-        self.edgeconv_blocks = cfg.get('edgeconv_blocks', 2)
-        self.edgeconv_hidden_dim = cfg.get('edgeconv_hidden_dim', self.feat_embedding_dim)
+        self.geometry_token_knn = cfg.get('geometry_token_knn', 32)
+        self.geometry_token_hidden_dim = cfg.get('geometry_token_hidden_dim', 64)
         self.decoder_hidden_dims = cfg.get(
             'decoder_hidden_dims',
             [cfg.get('decoder_hidden_dim', 64)],
         )
-        self.edge_aux_hidden_dims = cfg.get('edge_aux_hidden_dims', [128, 64])
-        self.edge_geom_dim = int(cfg.get('edge_geom_dim', 5))
-        self.edge_geom_hidden_dim = int(cfg.get('edge_geom_hidden_dim', 128))
-        self.edge_geom_knn = int(cfg.get('edge_geom_knn', 32))
-        self.edge_geom_match_temperature = float(
-            cfg.get('edge_geom_match_temperature', 1.0)
-        )
-        self.edge_geom_pretrain_only = bool(cfg.get('edge_geom_pretrain_only', False))
         
         # patch-based prediction
         self.predict_rounds = cfg.get('predict_rounds', 1)
@@ -73,11 +59,9 @@ class VelocityModule(ModelSpec):
             embedding_dim=self.feat_embedding_dim,
             num_blocks=self.attention_blocks,
             attention_weight_init=self.attention_weight_init,
-            relative_position_bias_hidden_dim=self.relative_position_bias_hidden_dim,
             ffn_hidden_dim=self.attention_ffn_hidden_dim,
-            edgeconv_knn=self.edgeconv_knn,
-            edgeconv_blocks=self.edgeconv_blocks,
-            edgeconv_hidden_dim=self.edgeconv_hidden_dim,
+            geometry_token_knn=self.geometry_token_knn,
+            geometry_token_hidden_dim=self.geometry_token_hidden_dim,
         )
         
         self.decoder = Decoder(
@@ -85,97 +69,20 @@ class VelocityModule(ModelSpec):
             out_dim=3,
             hidden_dims=self.decoder_hidden_dims,
         )
-        self.edge_aux_decoder = Decoder(
-            z_dim=self.encoder.embedding_dim,
-            out_dim=3,
-            hidden_dims=self.edge_aux_hidden_dims,
-        )
-        self.edge_geom_head = Decoder(
-            z_dim=self.encoder.embedding_dim,
-            out_dim=self.edge_geom_dim,
-            hidden_dims=[self.edge_geom_hidden_dim],
-        )
-
-    def get_train_parameters(self):
-        if not self.edge_geom_pretrain_only:
-            return self.parameters()
-        params = []
-        for module in [
-            self.encoder.input_proj_1,
-            self.encoder.input_proj_2,
-            self.encoder.edge_conditioner,
-            self.edge_geom_head,
-        ]:
-            params.extend(list(module.parameters()))
-        return params
-
-    def _get_gate_embedding(self, condition_feat):
-        gate_parts = []
-        for block in self.encoder.blocks:
-            local_norm = block.global_norm(condition_feat)
-            scale_gate = nn.softmax(
-                block.scale_gate_proj(local_norm.reshape(-1, local_norm.shape[-1]))
-                .reshape(local_norm.shape[0], local_norm.shape[1], -1),
-                dim=-1,
-            ) * len(block.knn_scales)
-            temperature = jt.exp(
-                0.25
-                * jt.tanh(
-                    block.temperature_proj(
-                        local_norm.reshape(-1, local_norm.shape[-1])
-                    ).reshape(local_norm.shape[0], local_norm.shape[1], -1)
-                )
-            )
-            rel_gate = 1.0 + 0.5 * jt.tanh(
-                block.rel_gate_proj(
-                    local_norm.reshape(-1, local_norm.shape[-1])
-                ).reshape(local_norm.shape[0], local_norm.shape[1], -1)
-            )
-            gate_parts.extend([scale_gate, temperature, rel_gate])
-        return jt.concat(gate_parts, dim=-1)
-
-    def get_edge_geom_vectors(self, edge_geom_vector, point_idx=None):
-        vectors = edge_geom_vector.float32()
-        if point_idx is not None:
-            vectors = vectors[:, point_idx, :]
-        return vectors
-
-    def get_gate_geometry_match_loss(self, geom_vector, gate_embedding):
-        geom = geom_vector.detach()
-        gate = gate_embedding
-        geom_dist = ((geom.unsqueeze(2) - geom.unsqueeze(1)) ** 2.0).sum(dim=-1)
-        gate_dist = ((gate.unsqueeze(2) - gate.unsqueeze(1)) ** 2.0).sum(dim=-1)
-        geom_mean = geom_dist.mean(dim=2, keepdims=True).mean(dim=1, keepdims=True)
-        gate_mean = gate_dist.mean(dim=2, keepdims=True).mean(dim=1, keepdims=True)
-        geom_dist = geom_dist / (geom_mean + 1e-8)
-        gate_dist = gate_dist / (gate_mean + 1e-8)
-        if abs(self.edge_geom_match_temperature - 1.0) > 1e-12:
-            geom_dist = geom_dist / self.edge_geom_match_temperature
-        return ((gate_dist - geom_dist) ** 2.0).mean()
     
-    def predict_displacement(self, pc_noisy, point_idx=None, return_aux=False):
+    def predict_displacement(self, pc_noisy, point_idx=None):
         """
         pc_noisy: (B, N, 3)
         point_idx: optional point indices decoded after full-patch encoding
         return:   (B, N, 3) or (B, M, 3)
         """
         B, N, d = pc_noisy.shape
-        if return_aux:
-            feat, condition_feat = self.encoder(pc_noisy, return_condition=True)
-        else:
-            feat = self.encoder(pc_noisy)
-            condition_feat = None
+        feat = self.encoder(pc_noisy)
         if point_idx is not None:
             feat = feat[:, point_idx, :]
-            if condition_feat is not None:
-                condition_feat = condition_feat[:, point_idx, :]
         N_out = feat.shape[1]
         F_dim = feat.shape[2]
-        pred = self.decoder(feat.reshape(-1, F_dim)).reshape(B, N_out, d)
-        if not return_aux:
-            return pred
-        aux = self.edge_aux_decoder(condition_feat.reshape(-1, F_dim)).reshape(B, N_out, d)
-        return pred, aux
+        return self.decoder(feat.reshape(-1, F_dim)).reshape(B, N_out, d)
     
     def get_normalized_surface_loss(self, pc_pred, pc_clean, pc_anchor):
         """
@@ -206,38 +113,13 @@ class VelocityModule(ModelSpec):
         plane_dist = (((pc_pred - p0) * normal).sum(dim=-1) ** 2.0)
         return (plane_dist / self.dsm_sigma).mean()
 
-    def get_supervised_losses(self, pc_noisy, pc_clean, edge_geom_vector):
+    def get_supervised_losses(self, pc_noisy, pc_clean):
         """
         pc_noisy: (B, N, 3)
         pc_clean: (B, N, 3)
         """
         point_idx = get_random_indices(pc_noisy.shape[1], self.num_train_points)
-        if self.edge_geom_pretrain_only:
-            feat = None
-            condition_feat = self.encoder.condition_only(pc_noisy)
-        else:
-            feat, condition_feat = self.encoder(pc_noisy, return_condition=True)
-        if point_idx is not None:
-            condition_feat_for_geom = condition_feat[:, point_idx, :]
-        else:
-            condition_feat_for_geom = condition_feat
-        geom_pred = self.edge_geom_head(
-            condition_feat_for_geom.reshape(-1, condition_feat_for_geom.shape[-1])
-        ).reshape(
-            condition_feat_for_geom.shape[0],
-            condition_feat_for_geom.shape[1],
-            self.edge_geom_dim,
-        )
-        geom_target = self.get_edge_geom_vectors(edge_geom_vector, point_idx=point_idx)
-        edge_geom_reg_loss = ((geom_pred - geom_target) ** 2.0).mean()
-        edge_geom_mae = jt.abs(geom_pred - geom_target).mean()
-
-        if self.edge_geom_pretrain_only:
-            return {
-                "edge_geom_reg_loss": edge_geom_reg_loss,
-                "edge_geom_mae": edge_geom_mae,
-            }
-
+        feat = self.encoder(pc_noisy)
         target = pc_clean - pc_noisy
         pc_noisy_for_loss = pc_noisy
         pc_clean_for_loss = pc_clean
@@ -247,28 +129,11 @@ class VelocityModule(ModelSpec):
             pc_clean_for_loss = pc_clean[:, point_idx, :]
         if point_idx is not None:
             feat_for_loss = feat[:, point_idx, :]
-            condition_feat_for_loss = condition_feat[:, point_idx, :]
         else:
             feat_for_loss = feat
-            condition_feat_for_loss = condition_feat
         B, N_out, F_dim = feat_for_loss.shape
         pred_dir = self.decoder(feat_for_loss.reshape(-1, F_dim)).reshape(B, N_out, 3)
-        aux_pred_dir = self.edge_aux_decoder(
-            condition_feat_for_loss.reshape(-1, F_dim)
-        ).reshape(B, N_out, 3)
-        if point_idx is not None:
-            condition_feat_for_geom = condition_feat[:, point_idx, :]
-        else:
-            condition_feat_for_geom = condition_feat
-        gate_embedding = self._get_gate_embedding(condition_feat_for_geom)
-        edge_gate_match_loss = self.get_gate_geometry_match_loss(
-            geom_pred,
-            gate_embedding,
-        )
         displacement_loss = (((pred_dir - target) ** 2.0) / self.dsm_sigma).sum(dim=-1).mean()
-        edge_aux_displacement_loss = (
-            ((aux_pred_dir - target) ** 2.0) / self.dsm_sigma
-        ).sum(dim=-1).mean()
         normalized_surface_loss = self.get_normalized_surface_loss(
             pc_pred=pc_noisy_for_loss + pred_dir,
             pc_clean=pc_clean,
@@ -277,11 +142,7 @@ class VelocityModule(ModelSpec):
         
         return {
             "displacement_loss": displacement_loss,
-            "edge_aux_displacement_loss": edge_aux_displacement_loss,
             "normalized_surface_loss": normalized_surface_loss,
-            "edge_geom_reg_loss": edge_geom_reg_loss,
-            "edge_geom_mae": edge_geom_mae,
-            "edge_gate_match_loss": edge_gate_match_loss,
         }
 
     def denoise_langevin_dynamics(self, pcl_noisy, num_steps=None):
@@ -301,20 +162,9 @@ class VelocityModule(ModelSpec):
         patch_size = batch['pc_noisy'].shape[-2]
         pc_noisy = batch['pc_noisy'].reshape(-1, patch_size, 3)
         pc_clean = batch['pc_clean'].reshape(-1, patch_size, 3)
-        if "edge_geom_vector" not in batch:
-            raise KeyError(
-                "edge_geom_vector is missing. Rebuild cache_clean_points with "
-                "scripts/cache_clean_points.py so edge_geom_vector.npy is generated."
-            )
-        edge_geom_vector = batch["edge_geom_vector"].reshape(
-            -1,
-            patch_size,
-            batch["edge_geom_vector"].shape[-1],
-        )
         losses = self.get_supervised_losses(
             pc_noisy=pc_noisy,
             pc_clean=pc_clean,
-            edge_geom_vector=edge_geom_vector,
         )
         return losses
     
@@ -351,8 +201,6 @@ class VelocityModule(ModelSpec):
                     "pc_noisy": b.meta['pc_noisy'], # (num_patches, patch_size, 3)
                     "pc_clean": b.meta['pc_clean'],
                 }
-                if "edge_geom_vector" in b.meta:
-                    item["edge_geom_vector"] = b.meta["edge_geom_vector"]
                 if 'patch_seed' in b.meta:
                     item["patch_seed"] = b.meta['patch_seed']
                 res.append(item)
