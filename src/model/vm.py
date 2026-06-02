@@ -45,7 +45,7 @@ class VelocityModule(ModelSpec):
             [cfg.get('decoder_hidden_dim', 64)],
         )
         self.edge_aux_hidden_dims = cfg.get('edge_aux_hidden_dims', [128, 64])
-        self.num_edge_geom_classes = int(cfg.get('num_edge_geom_classes', 12))
+        self.edge_geom_dim = int(cfg.get('edge_geom_dim', 5))
         self.edge_geom_hidden_dim = int(cfg.get('edge_geom_hidden_dim', 128))
         self.edge_geom_knn = int(cfg.get('edge_geom_knn', 32))
         self.edge_geom_match_temperature = float(
@@ -92,7 +92,7 @@ class VelocityModule(ModelSpec):
         )
         self.edge_geom_head = Decoder(
             z_dim=self.encoder.embedding_dim,
-            out_dim=self.num_edge_geom_classes,
+            out_dim=self.edge_geom_dim,
             hidden_dims=[self.edge_geom_hidden_dim],
         )
 
@@ -134,16 +134,16 @@ class VelocityModule(ModelSpec):
             gate_parts.extend([scale_gate, temperature, rel_gate])
         return jt.concat(gate_parts, dim=-1)
 
-    def get_edge_geom_labels(self, edge_geom_label, point_idx=None):
-        labels = edge_geom_label.int32()
+    def get_edge_geom_vectors(self, edge_geom_vector, point_idx=None):
+        vectors = edge_geom_vector.float32()
         if point_idx is not None:
-            labels = labels[:, point_idx]
-        return labels
+            vectors = vectors[:, point_idx, :]
+        return vectors
 
-    def get_gate_geometry_match_loss(self, geom_logits, gate_embedding):
-        geom_prob = nn.softmax(geom_logits, dim=-1).detach()
+    def get_gate_geometry_match_loss(self, geom_vector, gate_embedding):
+        geom = geom_vector.detach()
         gate = gate_embedding
-        geom_dist = ((geom_prob.unsqueeze(2) - geom_prob.unsqueeze(1)) ** 2.0).sum(dim=-1)
+        geom_dist = ((geom.unsqueeze(2) - geom.unsqueeze(1)) ** 2.0).sum(dim=-1)
         gate_dist = ((gate.unsqueeze(2) - gate.unsqueeze(1)) ** 2.0).sum(dim=-1)
         geom_mean = geom_dist.mean(dim=2, keepdims=True).mean(dim=1, keepdims=True)
         gate_mean = gate_dist.mean(dim=2, keepdims=True).mean(dim=1, keepdims=True)
@@ -206,7 +206,7 @@ class VelocityModule(ModelSpec):
         plane_dist = (((pc_pred - p0) * normal).sum(dim=-1) ** 2.0)
         return (plane_dist / self.dsm_sigma).mean()
 
-    def get_supervised_losses(self, pc_noisy, pc_clean, edge_geom_label):
+    def get_supervised_losses(self, pc_noisy, pc_clean, edge_geom_vector):
         """
         pc_noisy: (B, N, 3)
         pc_clean: (B, N, 3)
@@ -221,18 +221,21 @@ class VelocityModule(ModelSpec):
             condition_feat_for_geom = condition_feat[:, point_idx, :]
         else:
             condition_feat_for_geom = condition_feat
-        geom_logits = self.edge_geom_head(
+        geom_pred = self.edge_geom_head(
             condition_feat_for_geom.reshape(-1, condition_feat_for_geom.shape[-1])
+        ).reshape(
+            condition_feat_for_geom.shape[0],
+            condition_feat_for_geom.shape[1],
+            self.edge_geom_dim,
         )
-        geom_labels = self.get_edge_geom_labels(edge_geom_label, point_idx=point_idx).reshape(-1)
-        edge_geom_cls_loss = nn.cross_entropy_loss(geom_logits, geom_labels)
-        geom_pred = geom_logits.argmax(dim=-1)[0]
-        edge_geom_acc = (geom_pred == geom_labels).float().mean()
+        geom_target = self.get_edge_geom_vectors(edge_geom_vector, point_idx=point_idx)
+        edge_geom_reg_loss = ((geom_pred - geom_target) ** 2.0).mean()
+        edge_geom_mae = jt.abs(geom_pred - geom_target).mean()
 
         if self.edge_geom_pretrain_only:
             return {
-                "edge_geom_cls_loss": edge_geom_cls_loss,
-                "edge_geom_acc": edge_geom_acc,
+                "edge_geom_reg_loss": edge_geom_reg_loss,
+                "edge_geom_mae": edge_geom_mae,
             }
 
         target = pc_clean - pc_noisy
@@ -259,11 +262,7 @@ class VelocityModule(ModelSpec):
             condition_feat_for_geom = condition_feat
         gate_embedding = self._get_gate_embedding(condition_feat_for_geom)
         edge_gate_match_loss = self.get_gate_geometry_match_loss(
-            geom_logits.reshape(
-                condition_feat_for_geom.shape[0],
-                condition_feat_for_geom.shape[1],
-                self.num_edge_geom_classes,
-            ),
+            geom_pred,
             gate_embedding,
         )
         displacement_loss = (((pred_dir - target) ** 2.0) / self.dsm_sigma).sum(dim=-1).mean()
@@ -280,8 +279,8 @@ class VelocityModule(ModelSpec):
             "displacement_loss": displacement_loss,
             "edge_aux_displacement_loss": edge_aux_displacement_loss,
             "normalized_surface_loss": normalized_surface_loss,
-            "edge_geom_cls_loss": edge_geom_cls_loss,
-            "edge_geom_acc": edge_geom_acc,
+            "edge_geom_reg_loss": edge_geom_reg_loss,
+            "edge_geom_mae": edge_geom_mae,
             "edge_gate_match_loss": edge_gate_match_loss,
         }
 
@@ -302,16 +301,20 @@ class VelocityModule(ModelSpec):
         patch_size = batch['pc_noisy'].shape[-2]
         pc_noisy = batch['pc_noisy'].reshape(-1, patch_size, 3)
         pc_clean = batch['pc_clean'].reshape(-1, patch_size, 3)
-        if "edge_geom_label" not in batch:
+        if "edge_geom_vector" not in batch:
             raise KeyError(
-                "edge_geom_label is missing. Rebuild cache_clean_points with "
-                "scripts/cache_clean_points.py so edge_geom_label.npy is generated."
+                "edge_geom_vector is missing. Rebuild cache_clean_points with "
+                "scripts/cache_clean_points.py so edge_geom_vector.npy is generated."
             )
-        edge_geom_label = batch["edge_geom_label"].reshape(-1, patch_size)
+        edge_geom_vector = batch["edge_geom_vector"].reshape(
+            -1,
+            patch_size,
+            batch["edge_geom_vector"].shape[-1],
+        )
         losses = self.get_supervised_losses(
             pc_noisy=pc_noisy,
             pc_clean=pc_clean,
-            edge_geom_label=edge_geom_label,
+            edge_geom_vector=edge_geom_vector,
         )
         return losses
     
@@ -348,8 +351,8 @@ class VelocityModule(ModelSpec):
                     "pc_noisy": b.meta['pc_noisy'], # (num_patches, patch_size, 3)
                     "pc_clean": b.meta['pc_clean'],
                 }
-                if "edge_geom_label" in b.meta:
-                    item["edge_geom_label"] = b.meta["edge_geom_label"]
+                if "edge_geom_vector" in b.meta:
+                    item["edge_geom_vector"] = b.meta["edge_geom_vector"]
                 if 'patch_seed' in b.meta:
                     item["patch_seed"] = b.meta['patch_seed']
                 res.append(item)

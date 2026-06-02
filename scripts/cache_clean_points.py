@@ -18,11 +18,21 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.data.utils import sample_vertex_groups
 
 
-def compute_edge_geom_labels(points, num_classes=12, knn=32):
-    k = max(8, min(int(knn), points.shape[0]))
+def robust_normalize(values):
+    lo = np.percentile(values, 5, axis=0, keepdims=True)
+    hi = np.percentile(values, 95, axis=0, keepdims=True)
+    values = (values - lo) / (hi - lo + 1e-8)
+    return np.clip(values, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def compute_edge_geom_vectors(points, knn=32):
+    k = min(points.shape[0], max(3, min(int(knn), points.shape[0])))
     tree = cKDTree(points)
     _, idx = tree.query(points, k=k)
     curv = np.zeros((points.shape[0],), dtype=np.float64)
+    linearity = np.zeros_like(curv)
+    planarity = np.zeros_like(curv)
+    scattering = np.zeros_like(curv)
     normals = np.zeros((points.shape[0], 3), dtype=np.float64)
 
     for i, inds in enumerate(idx):
@@ -31,10 +41,15 @@ def compute_edge_geom_labels(points, num_classes=12, knn=32):
         cov = centered.T @ centered / max(centered.shape[0] - 1, 1)
         vals, vecs = np.linalg.eigh(cov)
         vals = np.maximum(vals, 0.0)
+        vals = vals[::-1]
+        vecs = vecs[:, ::-1]
         total = float(vals.sum())
         if total > 1e-12:
-            curv[i] = vals[0] / total
-        normal = vecs[:, 0]
+            curv[i] = vals[2] / total
+            linearity[i] = (vals[0] - vals[1]) / (vals[0] + 1e-12)
+            planarity[i] = (vals[1] - vals[2]) / (vals[0] + 1e-12)
+            scattering[i] = vals[2] / (vals[0] + 1e-12)
+        normal = vecs[:, 2]
         normals[i] = normal / max(np.linalg.norm(normal), 1e-12)
 
     normal_angle = np.zeros_like(curv)
@@ -43,12 +58,11 @@ def compute_edge_geom_labels(points, num_classes=12, knn=32):
         dots = np.clip(dots, 0.0, 1.0)
         normal_angle[i] = np.percentile(np.arccos(dots), 90)
 
-    score = curv + 0.25 * normal_angle
-    order = np.argsort(score)
-    ranks = np.empty_like(order)
-    ranks[order] = np.arange(order.shape[0])
-    labels = np.floor(ranks * int(num_classes) / max(points.shape[0], 1)).astype(np.int32)
-    return np.clip(labels, 0, int(num_classes) - 1).astype(np.int32, copy=False)
+    geom = np.stack(
+        [curv, linearity, planarity, scattering, normal_angle],
+        axis=-1,
+    )
+    return robust_normalize(geom)
 
 
 def read_datalists(paths: Iterable[Path]) -> List[str]:
@@ -72,17 +86,16 @@ def atomic_save_npy(path, array):
     os.replace(tmp_path, path)
 
 
-def cache_one(args: Tuple[str, str, str, str, str, str, int, int, int, int, bool, int]):
+def cache_one(args: Tuple[str, str, str, str, str, str, int, int, int, bool, int]):
     (
         rel_path,
         input_dataset_dir,
         output_dir,
         mesh_name,
         output_name,
-        edge_geom_label_name,
+        edge_geom_vector_name,
         num_samples,
         num_vertex_samples,
-        num_edge_geom_classes,
         edge_geom_knn,
         overwrite,
         seed,
@@ -90,19 +103,18 @@ def cache_one(args: Tuple[str, str, str, str, str, str, int, int, int, int, bool
     np.random.seed(seed)
     mesh_path = Path(input_dataset_dir) / rel_path / mesh_name
     output_path = Path(output_dir) / rel_path / output_name
-    label_path = Path(output_dir) / rel_path / edge_geom_label_name
+    vector_path = Path(output_dir) / rel_path / edge_geom_vector_name
 
-    if output_path.exists() and label_path.exists() and not overwrite:
+    if output_path.exists() and vector_path.exists() and not overwrite:
         return "skip", rel_path, None
-    if output_path.exists() and not label_path.exists() and not overwrite:
+    if output_path.exists() and not vector_path.exists() and not overwrite:
         clean_points = np.load(output_path).astype(np.float32, copy=False)
-        labels = compute_edge_geom_labels(
+        vectors = compute_edge_geom_vectors(
             clean_points,
-            num_classes=num_edge_geom_classes,
             knn=edge_geom_knn,
         )
-        atomic_save_npy(label_path, labels)
-        return "label", rel_path, labels.shape
+        atomic_save_npy(vector_path, vectors)
+        return "vector", rel_path, vectors.shape
     if not mesh_path.exists():
         return "missing", rel_path, str(mesh_path)
 
@@ -119,14 +131,13 @@ def cache_one(args: Tuple[str, str, str, str, str, str, int, int, int, int, bool
         num_vertex_samples=num_vertex_samples,
     )
     clean_points = clean_points.astype(np.float32, copy=False)
-    labels = compute_edge_geom_labels(
+    vectors = compute_edge_geom_vectors(
         clean_points,
-        num_classes=num_edge_geom_classes,
         knn=edge_geom_knn,
     )
 
     atomic_save_npy(output_path, clean_points)
-    atomic_save_npy(label_path, labels)
+    atomic_save_npy(vector_path, vectors)
     return "ok", rel_path, clean_points.shape
 
 
@@ -152,8 +163,7 @@ def parse_args():
     )
     parser.add_argument("--mesh_name", default="models/model_normalized.obj")
     parser.add_argument("--output_name", default="clean.npy")
-    parser.add_argument("--edge_geom_label_name", default="edge_geom_label.npy")
-    parser.add_argument("--num_edge_geom_classes", type=int, default=12)
+    parser.add_argument("--edge_geom_vector_name", default="edge_geom_vector.npy")
     parser.add_argument("--edge_geom_knn", type=int, default=32)
     parser.add_argument("--num_samples", type=int, default=32768)
     parser.add_argument("--num_vertex_samples", type=int, default=1024)
@@ -175,10 +185,9 @@ def main():
             args.output_dir,
             args.mesh_name,
             args.output_name,
-            args.edge_geom_label_name,
+            args.edge_geom_vector_name,
             args.num_samples,
             args.num_vertex_samples,
-            args.num_edge_geom_classes,
             args.edge_geom_knn,
             args.overwrite,
             args.seed + i,
@@ -186,7 +195,7 @@ def main():
         for i, rel_path in enumerate(rel_paths)
     ]
 
-    counts = {"ok": 0, "label": 0, "skip": 0, "missing": 0, "error": 0}
+    counts = {"ok": 0, "vector": 0, "skip": 0, "missing": 0, "error": 0}
     if args.workers <= 1:
         iterator = map(cache_one, tasks)
         for status, rel_path, detail in tqdm(iterator, total=len(tasks)):
@@ -208,7 +217,7 @@ def main():
     print(
         "cache clean points done: "
         f"ok={counts.get('ok', 0)}, "
-        f"label={counts.get('label', 0)}, "
+        f"vector={counts.get('vector', 0)}, "
         f"skip={counts.get('skip', 0)}, "
         f"missing={counts.get('missing', 0)}, "
         f"error={counts.get('error', 0)}"

@@ -78,7 +78,6 @@ python scripts/cache_clean_points.py \
   --input_dataset_dir dataset_clean \
   --output_dir cache_clean_points \
   --datalist datalist/train.txt datalist/validate.txt \
-  --num_edge_geom_classes 12 \
   --edge_geom_knn 32 \
   --workers 8 \
   --seed 123 \
@@ -92,7 +91,6 @@ C:\Users\Lenovo\anaconda3\envs\jittor\python.exe scripts\cache_clean_points.py `
   --input_dataset_dir E:\Code\competition2_EdgeConv\dataset_clean `
   --output_dir cache_clean_points `
   --datalist datalist\train.txt datalist\validate.txt `
-  --num_edge_geom_classes 12 `
   --edge_geom_knn 32 `
   --workers 8 `
   --seed 123 `
@@ -107,14 +105,14 @@ cache_clean_points/
     <synset_id>/
       <model_id>/
         clean.npy
-        edge_geom_label.npy
+        edge_geom_vector.npy
 ```
 
-`edge_geom_label.npy` 是每个 clean 点的几何伪标签，由局部曲率和法向转角提前计算得到。预训练和主训练都会直接读取这个文件，不再在训练循环里在线计算几何伪标签。如果已有旧版 `cache_clean_points` 只有 `clean.npy`，重新运行上面的缓存命令即可；不加 `--overwrite` 时脚本也会为已有 `clean.npy` 补生成缺失的 `edge_geom_label.npy`。
+`edge_geom_vector.npy` 是每个 clean 点的连续几何伪标签向量，由局部 PCA 形状量和法向转角提前计算得到。预训练和主训练都会直接读取这个文件，不再在训练循环里在线计算几何伪标签。如果已有旧版 `cache_clean_points` 只有 `clean.npy`，重新运行上面的缓存命令即可；不加 `--overwrite` 时脚本也会为已有 `clean.npy` 补生成缺失的 `edge_geom_vector.npy`。
 
 ## Step 2: 预训练 EdgeConv 几何 teacher
 
-先预训练 EdgeConv 几何 teacher，让 EdgeConv condition feature 和几何分类头能够输出明确的局部几何信息。几何伪标签来自缓存中的 `edge_geom_label.npy`，主要由局部曲率和法向转角分桶得到。
+先预训练 EdgeConv 几何 teacher，让 EdgeConv condition feature 和几何回归头能够输出明确的局部几何信息。几何伪标签来自缓存中的 `edge_geom_vector.npy`，主要由局部曲率、PCA 形状量和法向转角得到。
 
 ```bash
 python run.py --task configs/task/train_edge_geom_pretrain.yaml --seed 123
@@ -138,7 +136,7 @@ configs/system/vm_edgegeom_pretrain.yaml
 预训练阶段只优化：
 
 ```yaml
-edge_geom_cls_loss: 1.0
+edge_geom_reg_loss: 1.0
 ```
 
 默认预训练 30 个 epoch。训练后建议先跑诊断脚本，如果 `edge_condition` 的几何 AUC 仍低于 0.70，可以继续增加预训练轮数。
@@ -186,7 +184,7 @@ model.edge_geom_head
 displacement_loss: 0.9
 edge_aux_displacement_loss: 0.2
 normalized_surface_loss: 0.1
-edge_geom_cls_loss: 0.05
+edge_geom_reg_loss: 0.05
 edge_gate_match_loss: 0.02
 ```
 
@@ -196,7 +194,7 @@ edge_gate_match_loss: 0.02
 edgeconv_knn: 24
 edgeconv_blocks: 2
 edgeconv_hidden_dim: 256
-num_edge_geom_classes: 12
+edge_geom_dim: 5
 edge_geom_hidden_dim: 128
 edge_geom_knn: 32
 edge_geom_match_temperature: 1.0
@@ -290,7 +288,6 @@ python scripts/cache_clean_points.py \
   --input_dataset_dir dataset_clean \
   --output_dir cache_clean_points \
   --datalist datalist/train.txt datalist/validate.txt \
-  --num_edge_geom_classes 12 \
   --edge_geom_knn 32 \
   --workers 8 \
   --seed 123 \

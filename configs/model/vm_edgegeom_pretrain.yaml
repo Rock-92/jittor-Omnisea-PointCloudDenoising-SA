@@ -12,7 +12,7 @@ attention_ffn_hidden_dim: 512
 edgeconv_knn: 24
 edgeconv_blocks: 2
 edgeconv_hidden_dim: 256
-num_edge_geom_classes: 12
+edge_geom_dim: 5
 edge_geom_hidden_dim: 128
 edge_geom_knn: 32
 edge_geom_match_temperature: 1.0
