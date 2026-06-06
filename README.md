@@ -138,6 +138,87 @@ local radius max
 
 这些几何统计经过 MLP 投影成 256 维 token，用于调制 attention 的多尺度权重和 attention temperature。
 
+## PointNet++ 基线模型
+
+仓库里也提供了一个 PointNet++ 去噪基线，对应配置名为 `pointnet2`。它和当前 VM 主线使用同一套数据、patch 采样、loss 和 patch-based 推理流程，只是模型内部 encoder 换成 PointNet++ set abstraction + feature propagation：
+
+```text
+patch: (1024, 3)
+  -> FPS 采样中心点
+  -> KNN 分组，默认 k = 32
+  -> Set Abstraction 层提取局部特征
+  -> Feature Propagation 插值回原始 patch 点
+  -> displacement decoder
+  -> displacement: (1024, 3)
+```
+
+PointNet++ 的主要参数在 `configs/model/pointnet2.yaml`：
+
+```yaml
+k: 32
+sa_npoints: [256, 64, 8]
+sa_channels: [128, 256, 1024]
+fp_channels: [256, 128, 128]
+decoder_hidden_dims: [128, 64]
+```
+
+训练前同样需要先生成 `cache_clean_points/`。训练命令：
+
+```bash
+python run.py --task configs/task/train_pointnet2.yaml --seed 123
+```
+
+Windows 示例：
+
+```powershell
+C:\Users\Lenovo\anaconda3\envs\jittor\python.exe run.py `
+  --task configs\task\train_pointnet2.yaml `
+  --seed 123
+```
+
+PointNet++ 训练配置链路：
+
+```text
+configs/task/train_pointnet2.yaml
+configs/data/train.yaml
+configs/transform/pointnet2.yaml
+configs/model/pointnet2.yaml
+configs/train/pointnet2.yaml
+configs/system/pointnet2.yaml
+```
+
+推理前先确认 `configs/task/predict_pointnet2.yaml` 里的 `load_ckpt` 指向训练得到的 checkpoint，例如：
+
+```yaml
+load_ckpt: outputs_result/outputs_pointnet2_baseline/checkpoints/vm/checkpoint_best.pkl
+```
+
+然后运行：
+
+```bash
+python run.py --task configs/task/predict_pointnet2.yaml --seed 123
+```
+
+Windows 示例：
+
+```powershell
+C:\Users\Lenovo\anaconda3\envs\jittor\python.exe run.py `
+  --task configs\task\predict_pointnet2.yaml `
+  --seed 123
+```
+
+PointNet++ 推理输出默认写到：
+
+```text
+outputs_result/outputs_pointnet2_baseline/result/test_noisy/
+  shapenet/
+    <synset_id>/
+      <model_id>/
+        denoised.npy
+```
+
+注意：`scripts/train.py` 和 `scripts/infer.py` 默认加载的是 VM 配置。使用 PointNet++ 时请显式调用 `run.py --task configs/task/train_pointnet2.yaml` 或 `run.py --task configs/task/predict_pointnet2.yaml`。
+
 ## 训练
 
 ```bash

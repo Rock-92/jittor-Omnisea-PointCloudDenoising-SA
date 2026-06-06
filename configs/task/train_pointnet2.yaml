@@ -1,0 +1,16 @@
+mode: train
+debug: False
+load_ckpt: null
+
+components:
+  data: train
+  transform: pointnet2
+  system: pointnet2
+  model: pointnet2
+  train: pointnet2
+
+writer:
+  __target__: vm
+  save_dir: outputs_result/outputs_pointnet2_baseline/result/test_noisy
+  save_name: denoised
+  result_zip: outputs_result/outputs_pointnet2_baseline/result.zip

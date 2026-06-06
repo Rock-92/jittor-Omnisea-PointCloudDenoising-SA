@@ -1,0 +1,22 @@
+__target__: PointNet2VelocityModule
+
+# PointNet++ set abstraction
+k: 32
+sa_npoints: [256, 64, 8]
+sa_channels: [128, 256, 1024]
+fp_channels: [256, 128, 128]
+
+# Per-point displacement decoder
+decoder_hidden_dims: [128, 64]
+
+# Loss
+dsm_sigma: 0.01
+num_train_points: 256
+
+# Patch-based prediction
+predict_rounds: 1
+denoise_num_steps: 1
+predict_patch_size: 1024
+predict_seed_k: 6
+predict_seed_interval: 200
+predict_seed_k_alpha: 1

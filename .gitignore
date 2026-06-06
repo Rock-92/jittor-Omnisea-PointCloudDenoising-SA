@@ -7,7 +7,12 @@ experiments/
 tmp_predict/
 result/
 result.zip
-tools/
+tools/*
+!tools/README.md
+!tools/check_geometry_modulation_outputs62.py
+!tools/check_patch_score_distribution_outputs62.py
+!tools/analyze_low_patch_modulation_outputs62.py
+!tools/expanded_patch_lowpoint_outputs62.py
 
 # Datasets and ground truth
 dataset_train/
