@@ -1,4 +1,0 @@
-__target__: dummy
-
-ckpt_save_dir: outputs/checkpoints/global_token_ssl
-ckpt_save_name: checkpoint

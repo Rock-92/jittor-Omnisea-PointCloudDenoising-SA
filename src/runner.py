@@ -36,10 +36,21 @@ def load_config(name: str, path: str) -> Dict:
     return config  # type: ignore[return-value]
 
 
-def save_run_metadata(mode: str, seed: int) -> str:
-    """Save command and resolved configs to outputs/runs/<mode>/<timestamp>."""
+def get_output_root(components: Dict) -> str:
+    model_name = components.get("model", "")
+    model_output_names = {
+        "vm": "vm",
+        "pointnet2": "point_net2",
+    }
+    if model_name in model_output_names:
+        return os.path.join("outputs", model_output_names[model_name])
+    return "outputs"
+
+
+def save_run_metadata(mode: str, seed: int, output_root: str) -> str:
+    """Save command and resolved configs under the model-specific output root."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join("outputs", "runs", mode, timestamp)
+    run_dir = os.path.join(output_root, "runs", mode, timestamp)
     os.makedirs(run_dir, exist_ok=True)
 
     with open(os.path.join(run_dir, "command.txt"), "w", encoding="utf-8") as f:
@@ -190,7 +201,8 @@ def main(argv: Optional[List[str]] = None):
     else:
         system = None
 
-    run_dir = save_run_metadata(mode=mode, seed=args.seed)
+    output_root = get_output_root(components)
+    run_dir = save_run_metadata(mode=mode, seed=args.seed, output_root=output_root)
     if system is not None:
         system.set_run_dir(run_dir)
     print(f"\033[92msaved run metadata: {run_dir}\033[0m")

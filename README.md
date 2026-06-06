@@ -190,7 +190,7 @@ configs/system/pointnet2.yaml
 推理前先确认 `configs/task/predict_pointnet2.yaml` 里的 `load_ckpt` 指向训练得到的 checkpoint，例如：
 
 ```yaml
-load_ckpt: outputs_result/outputs_pointnet2_baseline/checkpoints/vm/checkpoint_best.pkl
+load_ckpt: outputs/point_net2/checkpoints/checkpoint_best.pkl
 ```
 
 然后运行：
@@ -210,7 +210,7 @@ C:\Users\Lenovo\anaconda3\envs\jittor\python.exe run.py `
 PointNet++ 推理输出默认写到：
 
 ```text
-outputs_result/outputs_pointnet2_baseline/result/test_noisy/
+outputs/point_net2/result/test_noisy/
   shapenet/
     <synset_id>/
       <model_id>/
@@ -246,7 +246,7 @@ normalized_surface_loss: 0.1
 训练输出 checkpoint：
 
 ```text
-outputs/checkpoints/vm/checkpoint_best.pkl
+outputs/vm/checkpoints/checkpoint_best.pkl
 ```
 
 ## 推理
@@ -254,7 +254,7 @@ outputs/checkpoints/vm/checkpoint_best.pkl
 确认 `configs/task/predict_vm.yaml` 中的 `load_ckpt` 指向要使用的 checkpoint，例如：
 
 ```yaml
-load_ckpt: outputs/checkpoints/vm/checkpoint_best.pkl
+load_ckpt: outputs/vm/checkpoints/checkpoint_best.pkl
 ```
 
 然后运行：
@@ -266,7 +266,7 @@ python scripts/infer.py --seed 123
 推理输出：
 
 ```text
-outputs/result/test_noisy/
+outputs/vm/result/test_noisy/
   shapenet/
     <synset_id>/
       <model_id>/
@@ -285,7 +285,7 @@ src/data/      数据路径、Dataset、Transform、Augment
 src/model/     去噪模型、特征 encoder、decoder
 src/system/    训练、验证、推理流程
 tools/         分析工具
-outputs/       checkpoint、日志、推理结果
+outputs/       checkpoint、日志、推理结果，按模型分为 vm/ 和 point_net2/
 ```
 
 ## 说明

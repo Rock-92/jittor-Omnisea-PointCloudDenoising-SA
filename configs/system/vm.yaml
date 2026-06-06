@@ -1,4 +1,4 @@
 __target__: vm
 
-ckpt_save_dir: outputs/checkpoints/vm
+ckpt_save_dir: outputs/vm/checkpoints
 ckpt_save_name: checkpoint

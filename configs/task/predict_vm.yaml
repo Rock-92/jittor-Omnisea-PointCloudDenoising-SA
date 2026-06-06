@@ -1,6 +1,6 @@
 mode: predict
 debug: False
-load_ckpt: outputs/checkpoints/vm_ssl/checkpoint_best.pkl
+load_ckpt: outputs/vm/checkpoints/checkpoint_best.pkl
 
 components:
   data: predict
@@ -10,6 +10,6 @@ components:
 
 writer:
   __target__: vm
-  save_dir: outputs/result/test_noisy
+  save_dir: outputs/vm/result/test_noisy
   save_name: denoised
-  result_zip: result.zip
+  result_zip: outputs/vm/result/result.zip

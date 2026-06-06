@@ -1,6 +1,7 @@
 # Runtime outputs
 output/
 outputs*
+outputs_result/
 analysis/
 analysis_outputs/
 experiments/

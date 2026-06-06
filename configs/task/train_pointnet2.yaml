@@ -11,6 +11,6 @@ components:
 
 writer:
   __target__: vm
-  save_dir: outputs_result/outputs_pointnet2_baseline/result/test_noisy
+  save_dir: outputs/point_net2/result/test_noisy
   save_name: denoised
-  result_zip: outputs_result/outputs_pointnet2_baseline/result.zip
+  result_zip: outputs/point_net2/result/result.zip

@@ -1,12 +1,10 @@
 from .spec import ModelSpec
 from .vm import VelocityModule
-from .global_token_ssl import GlobalTokenSSLModule
 from .pointnet2 import PointNet2VelocityModule
 
 def get_model(model_config, **kwargs) -> ModelSpec:
     MAP = {
         'VelocityModule': VelocityModule,
-        'GlobalTokenSSLModule': GlobalTokenSSLModule,
         'PointNet2VelocityModule': PointNet2VelocityModule,
     }
     __target__ = model_config['__target__']
