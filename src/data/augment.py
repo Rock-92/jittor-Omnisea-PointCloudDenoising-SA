@@ -131,6 +131,8 @@ class AugmentPatch(Augment):
     patch_size: int
     
     num_patches: int
+
+    mix_with_clean: bool=False
     
     @classmethod
     def parse(cls, **kwargs) -> 'AugmentPatch':
@@ -155,15 +157,33 @@ class AugmentPatch(Augment):
         pat_A = pc_noisy[nn_idx]  # (P, M, 3)
         pat_B = pc[nn_idx]        # (P, M, 3)
         seed_points = seed_points[:, None, :]
-        
-        pat_A = pat_A - seed_points
-        pat_B = pat_B - seed_points
+        if self.mix_with_clean:
+            t = np.random.rand(self.num_patches, self.patch_size, 1).astype(
+                np.float32,
+                copy=False,
+            )
+            t = (1.0 - 1e-8) * t + 1e-8
+            seed_points_t = (
+                t[:, 0:1, :] * pc[seed_idx][:, None, :]
+                + (1.0 - t[:, 0:1, :]) * pc_noisy[seed_idx][:, None, :]
+            ).astype(np.float32, copy=False)
+            pat_t = (t * pat_B + (1.0 - t) * pat_A).astype(np.float32, copy=False)
+            pat_A = pat_A - seed_points_t
+            pat_B = pat_B - seed_points_t
+            pat_t = pat_t - seed_points_t
+            patch_seed = seed_points_t
+        else:
+            pat_A = pat_A - seed_points
+            pat_B = pat_B - seed_points
+            patch_seed = seed_points
         
         if asset.meta is None:
             asset.meta = {}
         asset.meta['pc_noisy'] = pat_A
         asset.meta['pc_clean'] = pat_B
-        asset.meta['patch_seed'] = seed_points
+        asset.meta['patch_seed'] = patch_seed
+        if self.mix_with_clean:
+            asset.meta['pc_mix'] = pat_t
 
 def get_augments(*args) -> List[Augment]:
     MAP = {

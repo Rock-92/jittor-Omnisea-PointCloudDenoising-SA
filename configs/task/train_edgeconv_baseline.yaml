@@ -1,0 +1,16 @@
+mode: train
+debug: False
+load_ckpt: null
+
+components:
+  data: edgeconv_baseline
+  transform: edgeconv_baseline
+  system: edgeconv_baseline
+  model: edgeconv_baseline
+  train: edgeconv_baseline
+
+writer:
+  __target__: vm
+  save_dir: outputs/EdgeConv/result/test_noisy
+  save_name: denoised
+  result_zip: outputs/EdgeConv/result/result.zip

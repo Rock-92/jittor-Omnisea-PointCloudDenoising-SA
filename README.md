@@ -17,7 +17,7 @@ target = pc_clean - pc_noisy
 pc_pred = pc_noisy + displacement
 ```
 
-当前没有 EdgeConv，没有显式 relative position bias，也没有几何分类头或几何预训练分支。几何信息会在训练和推理 forward 中直接从输入 noisy patch 在线计算。
+当前 VM 主线没有 EdgeConv，没有显式 relative position bias，也没有几何分类头或几何预训练分支。几何信息会在训练和推理 forward 中直接从输入 noisy patch 在线计算。
 
 ## 环境
 
@@ -219,6 +219,75 @@ outputs/point_net2/result/test_noisy/
 
 注意：`scripts/train.py` 和 `scripts/infer.py` 默认加载的是 VM 配置。使用 PointNet++ 时请显式调用 `run.py --task configs/task/train_pointnet2.yaml` 或 `run.py --task configs/task/predict_pointnet2.yaml`。
 
+## EdgeConv_Baseline 官方基线
+
+仓库里也迁入了官方 starter code 的 EdgeConv baseline，对应配置名为 `edgeconv_baseline`。这条分支不使用 `cache_clean_points/`，而是和官方 baseline 一样直接从 OBJ mesh 在线采样 clean 点云：
+
+```text
+dataset_clean/
+  shapenet/
+    <synset_id>/
+      <model_id>/
+        models/model_normalized.obj
+```
+
+训练 transform：
+
+```text
+OBJ mesh
+  -> sample: 表面采样 32768 点，并混入 1024 个原始顶点
+  -> normalize_pc
+  -> add_noise: Laplace 噪声，std 从 [0.005, 0.020] 随机采样
+  -> linear: 随机旋转/缩放配置保留官方设置
+  -> patch: noisy KNN 取 1000 点，并生成 pc_mix
+```
+
+模型结构：
+
+```text
+patch pc_mix: (1000, 3)
+  -> DynamicEdgeConv(3 -> 32), KNN k=16
+  -> DynamicEdgeConv(32 -> 64), KNN k=16
+  -> concat(x1, x2): (1000, 96)
+  -> DynamicEdgeConv(96 -> 256), KNN k=16
+  -> decoder: 256 -> 256 -> 64 -> 3
+```
+
+训练 target 保持官方 baseline 写法：
+
+```text
+input = pc_mix
+target = pc_clean - pc_noisy
+loss = MSE(pred_dir, target) / dsm_sigma
+```
+
+训练命令：
+
+```bash
+python run.py --task configs/task/train_edgeconv_baseline.yaml --seed 123
+```
+
+推理前确认 checkpoint 路径：
+
+```yaml
+load_ckpt: outputs/EdgeConv/checkpoints/checkpoint_best.pkl
+```
+
+推理命令：
+
+```bash
+python run.py --task configs/task/predict_edgeconv_baseline.yaml --seed 123
+```
+
+EdgeConv_Baseline 的所有运行产物都保存到：
+
+```text
+outputs/EdgeConv/
+  checkpoints/
+  runs/
+  result/
+```
+
 ## 训练
 
 ```bash
@@ -285,7 +354,7 @@ src/data/      数据路径、Dataset、Transform、Augment
 src/model/     去噪模型、特征 encoder、decoder
 src/system/    训练、验证、推理流程
 tools/         分析工具
-outputs/       checkpoint、日志、推理结果，按模型分为 vm/ 和 point_net2/
+outputs/       checkpoint、日志、推理结果，按模型分为 vm/、point_net2/ 和 EdgeConv/
 ```
 
 ## 说明

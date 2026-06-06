@@ -1,0 +1,48 @@
+data_name: &data_name models/model_normalized.obj
+loader: &loader obj
+
+train_dataset:
+  shuffle: True
+  batch_size: 16
+  num_workers: 8
+  datapath:
+    input_dataset_dir: ./dataset_clean
+    use_prob: True
+    num_files: 10000
+    loader: *loader
+    data_name: *data_name
+    ignore_check: True
+    data_path:
+      shapenet: [
+        [./datalist/train.txt, 1.0],
+      ]
+
+validate_dataset:
+  shuffle: False
+  batch_size: 1
+  num_workers: 8
+  datapath:
+    input_dataset_dir: ./dataset_clean
+    use_prob: False
+    loader: *loader
+    data_name: *data_name
+    ignore_check: True
+    data_path:
+      shapenet: [
+        [./datalist/validate.txt, 1.0],
+      ]
+
+predict_dataset:
+  shuffle: False
+  batch_size: 1
+  num_workers: 8
+  datapath:
+    input_dataset_dir: ./test_noisy
+    use_prob: False
+    loader: npy
+    data_name: noisy.npy
+    ignore_check: True
+    data_path:
+      shapenet: [
+        [./datalist/test.txt, 1.0],
+      ]

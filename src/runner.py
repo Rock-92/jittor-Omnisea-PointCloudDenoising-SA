@@ -41,6 +41,7 @@ def get_output_root(components: Dict) -> str:
     model_output_names = {
         "vm": "vm",
         "pointnet2": "point_net2",
+        "edgeconv_baseline": "EdgeConv",
     }
     if model_name in model_output_names:
         return os.path.join("outputs", model_output_names[model_name])
