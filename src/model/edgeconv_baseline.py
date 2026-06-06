@@ -4,9 +4,7 @@ import jittor as jt
 import numpy as np
 from jittor import nn
 
-from .feature import get_knn_idx
 from .spec import ModelSpec
-from .vm import patch_based_denoise
 
 from ..data.asset import Asset
 
@@ -68,6 +66,9 @@ class EdgeConv(nn.Module):
 
 
 class DynamicEdgeConv(EdgeConv):
+    def __init__(self, in_channels, out_channels, activation: Optional[str] = "ReLU"):
+        super().__init__(in_channels, out_channels, activation)
+
     def execute(self, x, edge_index):
         return super().execute(x, edge_index)
 
@@ -94,13 +95,13 @@ class EdgeConvFeatureExtraction(nn.Module):
         return flattened batch edge index: (2, B*N*k)
         """
         B, N, _ = x.shape
-        k = min(self.k, N - 1)
-        knn_idx = get_knn_idx(x, x, k, offset=1)
+        knn_idx = get_knn_idx(x, x, self.k + 1)
+        knn_idx = knn_idx[:, :, 1:]
         base = (jt.arange(B) * N).reshape(B, 1, 1)
         knn_idx = knn_idx + base
 
         dst = jt.arange(N)
-        dst = dst.reshape(1, N, 1).broadcast((B, N, k))
+        dst = dst.reshape(1, N, 1).broadcast((B, N, self.k))
         dst = dst + base
 
         return jt.stack([knn_idx.reshape(-1), dst.reshape(-1)], dim=0)
@@ -257,7 +258,6 @@ class EdgeConvBaselineModule(ModelSpec):
                     pcl_noisy=pc_next,
                     patch_size=self.predict_patch_size,
                     seed_k=self.predict_seed_k,
-                    seed_interval=self.predict_seed_interval,
                     seed_k_alpha=self.predict_seed_k_alpha,
                 )
             res.append({"pc_denoised": pc_next.detach().numpy()})
@@ -282,3 +282,117 @@ class EdgeConvBaselineModule(ModelSpec):
                     d["pc_clean"] = b.sampled_vertices
                 res.append(d)
         return res
+
+
+def farthest_point_sampling(pcls, num_pnts):
+    """
+    pcls: (B, N, 3)
+    return:
+        sampled: (B, num_pnts, 3)
+        indices: (B, num_pnts)
+    """
+    B, N, _ = pcls.shape
+    sampled = []
+    indices = []
+    for b in range(B):
+        pts = pcls[b]
+        selected = []
+        dist = jt.ones((N,)) * 1e10
+        farthest = 0
+        for _ in range(num_pnts):
+            selected.append(farthest)
+            centroid = pts[farthest]
+            d = ((pts - centroid) ** 2).sum(dim=1)
+            dist = jt.minimum(dist, d)
+            farthest, _ = jt.argmax(dist, dim=-1)
+            farthest = farthest.item()
+        idx = jt.array(selected).int32()
+        sampled.append(pts[idx][None, ...])
+        indices.append(idx[None, ...])
+    return jt.concat(sampled, dim=0), jt.concat(indices, dim=0)
+
+
+def knn_points(x, y, k):
+    """
+    x: (B, P, 3)
+    y: (B, N, 3)
+    return:
+        dist: (B, P, k)
+        idx:  (B, P, k)
+        nn:   (B, P, k, 3)
+    """
+    dist = ((x.unsqueeze(2) - y.unsqueeze(1)) ** 2).sum(-1)
+    dist_k, idx = jt.topk(dist, k=k, dim=-1, largest=False)
+    nn = []
+    for b in range(x.shape[0]):
+        nn.append(y[b][idx[b]])
+    return dist_k, idx, jt.stack(nn, dim=0)
+
+
+def patch_based_denoise(model: EdgeConvBaselineModule, pcl_noisy, patch_size=1000, seed_k=6, seed_k_alpha=1) -> jt.Var:
+    """
+    Starter-code patch denoise and hard patch fusion.
+    pcl_noisy: (N, 3)
+    """
+    assert len(pcl_noisy.shape) == 2
+
+    N, _ = pcl_noisy.shape
+    num_patches = int(seed_k * N / patch_size)
+    pcl_noisy = pcl_noisy.unsqueeze(0)
+
+    seed_pnts, _ = farthest_point_sampling(pcl_noisy, num_patches)
+    patch_dists, point_idxs, patches = knn_points(seed_pnts, pcl_noisy, patch_size)
+
+    patches = patches[0]
+    patch_dists = patch_dists[0]
+    point_idxs = point_idxs[0]
+
+    seed_expand = seed_pnts.squeeze().unsqueeze(1).broadcast(patches.shape)
+    patches = patches - seed_expand
+
+    patch_dists = patch_dists / (patch_dists[:, -1:].broadcast(patch_dists.shape) + 1e-8)
+    all_dists = jt.ones((num_patches, N)) * 1e10
+
+    for i in range(num_patches):
+        all_dists[i][point_idxs[i]] = patch_dists[i]
+
+    weights = jt.exp(-all_dists)
+    best_weights_idx, _ = jt.argmax(weights, dim=0)
+    patches_denoised = []
+
+    i = 0
+    patch_step = int(np.ceil(N / (seed_k_alpha * patch_size)))
+    assert patch_step > 0
+    while i < num_patches:
+        curr = patches[i:i + patch_step]
+        try:
+            out, _ = model.denoise_langevin_dynamics(curr)
+        except Exception as e:
+            print("Denoise error:", e)
+            return None
+        patches_denoised.append(out)
+        i += patch_step
+
+    patches_denoised = jt.concat(patches_denoised, dim=0)
+    patches_denoised = patches_denoised + seed_expand
+    pcl_out = []
+    for pidx in range(N):
+        patch_id = best_weights_idx[pidx].item()
+        mask = point_idxs[patch_id] == pidx
+        pcl_out.append(patches_denoised[patch_id][mask])
+    return jt.concat(pcl_out, dim=0)
+
+
+def get_knn_idx(x, y, k, offset=0):
+    """
+    x: (B, N, d)
+    y: (B, M, d)
+    return: (B, N, k)
+    """
+    K = k + offset
+    if x.shape[-1] == 3:
+        _, idx = jt.misc.knn(x, y, K)
+    else:
+        dist = ((x.unsqueeze(2) - y.unsqueeze(1)) ** 2).sum(-1)
+        _, idx = jt.topk(dist, k=K, dim=-1, largest=False)
+    return idx[:, :, offset:]
