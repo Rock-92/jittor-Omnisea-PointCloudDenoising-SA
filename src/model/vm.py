@@ -171,7 +171,7 @@ class VelocityModule(ModelSpec):
             feat_for_loss = feat
         B, N_out, F_dim = feat_for_loss.shape
         eps_pred = self.decoder(feat_for_loss.reshape(-1, F_dim)).reshape(B, N_out, 3)
-        displacement_loss = ((eps_pred - target) ** 2.0).sum(dim=-1).mean()
+        displacement_loss = (((eps_pred - target) ** 2.0) / self.dsm_sigma).sum(dim=-1).mean()
         sigma_for_loss = bridge_sigma.reshape(bridge_sigma.shape[0], 1, 1)
         normalized_surface_loss = self.get_normalized_surface_loss(
             pc_pred=pc_bridge_for_loss - sigma_for_loss * eps_pred,

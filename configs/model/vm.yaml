@@ -22,7 +22,7 @@ num_train_points: 256
 # Patch-based prediction
 predict_rounds: 1
 denoise_num_steps: 4
-bridge_sde_noise: 0.002
+bridge_sde_noise: 0.0
 bridge_sigma_min: 0.001
 predict_patch_size: 1000
 # FPS-based inference uses predict_seed_k. predict_seed_interval is kept for compatibility.
