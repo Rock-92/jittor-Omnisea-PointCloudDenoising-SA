@@ -172,10 +172,6 @@ class AugmentPatch(Augment):
                 size=(self.num_patches, 1, 1),
             ).astype(np.float32, copy=False)
             sigma = np.maximum(t, 1e-6).astype(np.float32, copy=False)
-            seed_points_t = (
-                t * pc_noisy[seed_idx][:, None, :]
-                + (1.0 - t) * pc[seed_idx][:, None, :]
-            ).astype(np.float32, copy=False)
             pat_t = (t * pat_A + (1.0 - t) * pat_B).astype(np.float32, copy=False)
             if self.bridge_noise_std > 0:
                 bridge_noise_scale = (
@@ -186,10 +182,10 @@ class AugmentPatch(Augment):
                     np.float32,
                     copy=False,
                 )
-            pat_A = pat_A - seed_points_t
-            pat_B = pat_B - seed_points_t
-            pat_t = pat_t - seed_points_t
-            patch_seed = seed_points_t
+            pat_A = pat_A - seed_points
+            pat_B = pat_B - seed_points
+            pat_t = pat_t - seed_points
+            patch_seed = seed_points
         elif self.mix_with_clean:
             t = np.random.rand(self.num_patches, self.patch_size, 1).astype(
                 np.float32,
