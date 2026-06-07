@@ -3,6 +3,7 @@ from typing import List
 from jittor import nn
 
 import jittor as jt
+import numpy as np
 
 
 def get_knn_idx(x, y, k, offset=0):
@@ -129,8 +130,10 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
         self.global_norm = PointLayerNorm(dim)
         self.scale_gate_proj = nn.Linear(dim, len(self.knn_scales))
         self.temperature_proj = nn.Linear(dim, len(self.knn_scales))
+        self.bridge_proj = nn.Linear(dim, 2 * dim)
         self._zero_linear(self.scale_gate_proj)
         self._zero_linear(self.temperature_proj)
+        self._zero_linear(self.bridge_proj)
 
         self.ffn_norm = PointLayerNorm(dim)
         self.ffn_lin_1 = nn.Linear(dim, self.ffn_hidden_dim)
@@ -153,7 +156,15 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
         ))
         return jt.concat([scale_gate, temperature], dim=-1)
 
-    def execute(self, x, graph_knn_idx, condition_feat=None):
+    def _apply_bridge_modulation(self, x, bridge_feat):
+        if bridge_feat is None:
+            return x
+        bridge_params = self.bridge_proj(bridge_feat)
+        scale = bridge_params[:, :self.dim].reshape(bridge_feat.shape[0], 1, self.dim)
+        shift = bridge_params[:, self.dim:].reshape(bridge_feat.shape[0], 1, self.dim)
+        return x * (1.0 + scale) + shift
+
+    def execute(self, x, graph_knn_idx, condition_feat=None, bridge_feat=None):
         """
         x:       (B, N, C), point features.
         graph_knn_idx: (B, N, max(knn_scales)), neighbor indices used for
@@ -162,6 +173,7 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
             used to modulate multi-scale attention.
         """
         x_norm = self.attn_norm(x)
+        x_norm = self._apply_bridge_modulation(x_norm, bridge_feat)
         q = apply_point_linear(self.q_proj, x_norm)
         k = apply_point_linear(self.k_proj, x_norm)
         v = apply_point_linear(self.v_proj, x_norm)
@@ -193,10 +205,49 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
         x = x + out
 
         ffn = self.ffn_norm(x)
+        ffn = self._apply_bridge_modulation(ffn, bridge_feat)
         ffn = apply_point_linear(self.ffn_lin_1, ffn)
         ffn = self.act(ffn)
         ffn = apply_point_linear(self.ffn_lin_2, ffn)
         return x + ffn
+
+
+class BridgeTimeEncoder(nn.Module):
+    def __init__(self, out_dim, hidden_dim=64):
+        super().__init__()
+        self.out_dim = int(out_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.lin_1 = nn.Linear(6, self.hidden_dim)
+        self.lin_2 = nn.Linear(self.hidden_dim, self.out_dim)
+        self.act = nn.ReLU()
+
+    def execute(self, t):
+        """
+        t: (B,), (B, 1), or (B, 1, 1). t=0 is clean, t=1 is noisy.
+        return: bridge condition vector (B, C)
+        """
+        if len(t.shape) == 3:
+            t = t.reshape(t.shape[0], -1)[:, :1]
+        elif len(t.shape) == 1:
+            t = t.reshape(-1, 1)
+        else:
+            t = t[:, :1]
+        one_minus_t = 1.0 - t
+        bridge_sigma = jt.sqrt(jt.maximum(t * one_minus_t, 0.0) + 1e-8)
+        feat = jt.concat(
+            [
+                t,
+                one_minus_t,
+                t * one_minus_t,
+                bridge_sigma,
+                jt.sin(np.pi * t),
+                jt.cos(np.pi * t),
+            ],
+            dim=-1,
+        )
+        feat = self.lin_1(feat)
+        feat = self.act(feat)
+        return self.lin_2(feat)
 
 
 class GeometryTokenEncoder(nn.Module):
@@ -284,6 +335,7 @@ class FeatureExtraction(nn.Module):
         ffn_hidden_dim=None,
         geometry_token_knn=32,
         geometry_token_hidden_dim=64,
+        bridge_hidden_dim=64,
     ):
         super().__init__()
 
@@ -302,6 +354,7 @@ class FeatureExtraction(nn.Module):
         self.ffn_hidden_dim = int(ffn_hidden_dim)
         self.geometry_token_knn = int(geometry_token_knn)
         self.geometry_token_hidden_dim = int(geometry_token_hidden_dim)
+        self.bridge_hidden_dim = int(bridge_hidden_dim)
 
         self.input_proj_1 = nn.Linear(input_dim, input_expand_dim)
         self.input_proj_2 = nn.Linear(input_expand_dim, embedding_dim)
@@ -310,6 +363,10 @@ class FeatureExtraction(nn.Module):
             out_dim=embedding_dim,
             hidden_dim=self.geometry_token_hidden_dim,
             knn=self.geometry_token_knn,
+        )
+        self.bridge_time_encoder = BridgeTimeEncoder(
+            out_dim=embedding_dim,
+            hidden_dim=self.bridge_hidden_dim,
         )
 
         if isinstance(attention_weight_init, (list, tuple)):
@@ -340,7 +397,7 @@ class FeatureExtraction(nn.Module):
             gate_parts.append(block.get_gate_embedding(condition_feat))
         return jt.concat(gate_parts, dim=-1)
 
-    def execute(self, x, return_condition=False):
+    def execute(self, x, bridge_t=None, return_condition=False):
         """
         x: (B, N, 3)
         return: (B, N, 256)
@@ -352,13 +409,21 @@ class FeatureExtraction(nn.Module):
         geometry_feat = self.geometry_token_encoder._pointwise_geometry(x)
         condition_feat = self.geometry_token_encoder(feat, x)
         gate_embedding = self.get_gate_embedding(condition_feat)
+        bridge_feat = None
+        if bridge_t is not None:
+            bridge_feat = self.bridge_time_encoder(bridge_t)
 
         for block_idx, block in enumerate(self.blocks):
             if block_idx == 0:
                 block_knn_idx = get_knn_idx(x, x, self.max_knn, offset=1)
             else:
                 block_knn_idx = get_knn_idx(feat, feat, self.max_knn, offset=1)
-            feat = block(feat, block_knn_idx, condition_feat=condition_feat)
+            feat = block(
+                feat,
+                block_knn_idx,
+                condition_feat=condition_feat,
+                bridge_feat=bridge_feat,
+            )
 
         if return_condition:
             return feat, geometry_feat, gate_embedding

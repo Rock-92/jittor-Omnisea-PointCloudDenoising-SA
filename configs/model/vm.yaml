@@ -10,6 +10,7 @@ attention_weight_init: [1.0, 1.0, 1.0]
 attention_ffn_hidden_dim: 512
 geometry_token_knn: 32
 geometry_token_hidden_dim: 64
+bridge_hidden_dim: 64
 
 # Decoder
 decoder_hidden_dims: [128, 64]
@@ -21,6 +22,8 @@ num_train_points: 256
 # Patch-based prediction
 predict_rounds: 1
 denoise_num_steps: 4
+bridge_sde_noise: 0.002
+bridge_sigma_min: 0.001
 predict_patch_size: 1000
 # FPS-based inference uses predict_seed_k. predict_seed_interval is kept for compatibility.
 predict_seed_k: 6

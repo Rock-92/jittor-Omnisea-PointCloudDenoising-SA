@@ -133,6 +133,14 @@ class AugmentPatch(Augment):
     num_patches: int
 
     mix_with_clean: bool=False
+
+    bridge_sample_t: bool=False
+
+    bridge_t_min: float=1e-3
+
+    bridge_t_max: float=1.0
+
+    bridge_noise_std: float=0.0
     
     @classmethod
     def parse(cls, **kwargs) -> 'AugmentPatch':
@@ -157,7 +165,32 @@ class AugmentPatch(Augment):
         pat_A = pc_noisy[nn_idx]  # (P, M, 3)
         pat_B = pc[nn_idx]        # (P, M, 3)
         seed_points = seed_points[:, None, :]
-        if self.mix_with_clean:
+        if self.bridge_sample_t:
+            t = np.random.uniform(
+                self.bridge_t_min,
+                self.bridge_t_max,
+                size=(self.num_patches, 1, 1),
+            ).astype(np.float32, copy=False)
+            sigma = np.maximum(t, 1e-6).astype(np.float32, copy=False)
+            seed_points_t = (
+                t * pc_noisy[seed_idx][:, None, :]
+                + (1.0 - t) * pc[seed_idx][:, None, :]
+            ).astype(np.float32, copy=False)
+            pat_t = (t * pat_A + (1.0 - t) * pat_B).astype(np.float32, copy=False)
+            if self.bridge_noise_std > 0:
+                bridge_noise_scale = (
+                    self.bridge_noise_std * np.sqrt(np.maximum(t * (1.0 - t), 0.0))
+                ).astype(np.float32, copy=False)
+                bridge_noise = np.random.randn(*pat_t.shape).astype(np.float32, copy=False)
+                pat_t = (pat_t + bridge_noise_scale * bridge_noise).astype(
+                    np.float32,
+                    copy=False,
+                )
+            pat_A = pat_A - seed_points_t
+            pat_B = pat_B - seed_points_t
+            pat_t = pat_t - seed_points_t
+            patch_seed = seed_points_t
+        elif self.mix_with_clean:
             t = np.random.rand(self.num_patches, self.patch_size, 1).astype(
                 np.float32,
                 copy=False,
@@ -182,6 +215,16 @@ class AugmentPatch(Augment):
         asset.meta['pc_noisy'] = pat_A
         asset.meta['pc_clean'] = pat_B
         asset.meta['patch_seed'] = patch_seed
+        if self.bridge_sample_t:
+            asset.meta['pc_bridge'] = pat_t
+            asset.meta['bridge_t'] = t.reshape(self.num_patches, 1).astype(
+                np.float32,
+                copy=False,
+            )
+            asset.meta['bridge_sigma'] = sigma.reshape(self.num_patches, 1).astype(
+                np.float32,
+                copy=False,
+            )
         if self.mix_with_clean:
             asset.meta['pc_mix'] = pat_t
 
