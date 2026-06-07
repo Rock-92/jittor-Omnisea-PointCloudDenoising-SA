@@ -25,7 +25,7 @@ from tools.check_patch_score_distribution_outputs62 import (  # noqa: E402
 )
 
 
-DEFAULT_OUT_DIR = PROJECT_ROOT / "outputs_result/analysis_outputs/low_patch_modulation_outputs6.2"
+DEFAULT_OUT_DIR = PROJECT_ROOT / "outputs_result/outputs_analysis/low_patch_modulation_outputs6.2"
 
 
 def pearson(x, y):

@@ -1,23 +1,21 @@
 # Jittor 点云去噪
 
-这是一个基于 Jittor 的 patch 点云去噪项目。当前主线已经简化为：
+这是一个基于 Jittor 的 patch 点云去噪项目。仓库里目前保留三条模型流程：
 
 ```text
-noisy patch
-  -> 在线几何 token 计算
-  -> 几何调制的局部 self-attention encoder
-  -> displacement decoder
-  -> denoised patch
+1. VM 主线：3 层 SA + 在线几何 token 调制的 self-attention 去噪模型
+2. EdgeConv Baseline：迁入官方 starter code 风格的 EdgeConv 基线
+3. PointNet++ Baseline：Set Abstraction + Feature Propagation 的点云基线
 ```
 
-模型输入带噪 patch，预测每个点的三维位移：
+三个模型最终都预测每个点的三维位移：
 
 ```text
 target = pc_clean - pc_noisy
 pc_pred = pc_noisy + displacement
 ```
 
-当前 VM 主线没有 EdgeConv，没有显式 relative position bias，也没有几何分类头或几何预训练分支。几何信息会在训练和推理 forward 中直接从输入 noisy patch 在线计算。
+README 下面把三条流程分开说明，避免把 VM、EdgeConv baseline 和 PointNet++ baseline 的数据、配置、训练和推理命令混在一起。
 
 ## 环境
 
@@ -37,9 +35,15 @@ conda activate jittor
 python -m pip install -r requirements.txt
 ```
 
+Windows 示例命令中的 Python 解释器可以替换成自己的环境路径，例如：
+
+```powershell
+C:\Users\Lenovo\anaconda3\envs\jittor\python.exe run.py --task configs\task\train_vm.yaml --seed 123
+```
+
 ## 数据目录
 
-clean mesh 数据目录：
+训练用 clean mesh 目录：
 
 ```text
 dataset_clean/
@@ -50,7 +54,7 @@ dataset_clean/
           model_normalized.obj
 ```
 
-测试 noisy 点云目录：
+测试用 noisy 点云目录：
 
 ```text
 test_noisy/
@@ -60,9 +64,9 @@ test_noisy/
         noisy.npy
 ```
 
-## 生成 clean 点云缓存
+## 公共 clean 点云缓存
 
-训练不直接从 OBJ mesh 读取，而是先把 mesh 采样成 `clean.npy` 缓存。现在缓存里只需要 clean 点云，不再需要任何几何标签或几何向量文件。
+VM 和 PointNet++ 训练前需要先把 mesh 采样成 `clean.npy` 缓存。缓存里只需要 clean 点云，不需要几何标签或几何向量文件。
 
 ```bash
 python scripts/cache_clean_points.py \
@@ -96,9 +100,15 @@ cache_clean_points/
         clean.npy
 ```
 
-## 当前模型结构
+注意：EdgeConv baseline 不走这个缓存流程，它会按官方 baseline 的方式直接从 OBJ mesh 在线采样。
 
-训练时会先从 `clean.npy` 读取 clean 点云，然后在线加噪、切 patch：
+## VM 主线流程
+
+VM 是当前自己设计的主线模型，对应配置名为 `vm`。它使用 3 层 multi-scale local self-attention，并从 noisy patch 在线计算几何 token 来调制 attention。
+
+### VM 数据流
+
+训练时先读取 `cache_clean_points/` 里的 `clean.npy`，然后在线加噪、切 patch：
 
 ```text
 clean.npy
@@ -107,23 +117,35 @@ clean.npy
   -> 随机选 seed point
   -> 在 noisy 点云中取 seed 周围 KNN 1000 个点
   -> patch 坐标减 seed
-  -> 输入模型
+  -> 输入 VM
 ```
 
-模型内部结构：
+推理时对整云做 patch-based denoise：
+
+```text
+noisy.npy
+  -> FPS 选 seed
+  -> KNN 切 patch
+  -> patch 内预测 displacement
+  -> 融合回整云
+  -> denoised.npy
+```
+
+### VM 模型结构
 
 ```text
 patch: (1000, 3)
-  -> input projection: (1000, 256)
+  -> input projection: 3 -> 128 -> 256
   -> 从 noisy patch 在线计算每点局部几何统计
-  -> GeometryTokenEncoder: (1000, 256)
-  -> 4 层 multi-scale local self-attention
-  -> fuse: (1000, 256)
-  -> decoder
+  -> GeometryTokenEncoder: 8 维几何统计 -> 64 -> 256
+  -> 3 层 multi-scale local self-attention
+       attention_knn: [8, 16, 32]
+       geometry token 调制 scale gate 和 attention temperature
+  -> displacement decoder: 256 -> 128 -> 64 -> 3
   -> displacement: (1000, 3)
 ```
 
-在线几何 token 默认使用 `geometry_token_knn: 32`，会从每个点的局部邻域中计算：
+在线几何 token 默认使用 `geometry_token_knn: 32`，每个点会计算：
 
 ```text
 curvature
@@ -136,92 +158,88 @@ local radius std
 local radius max
 ```
 
-这些几何统计经过 MLP 投影成 256 维 token，用于调制 attention 的多尺度权重和 attention temperature。
+当前 VM 主线没有 EdgeConv，没有显式 relative position bias，也没有几何分类头或几何预训练分支。几何信息在训练和推理 forward 中直接从输入 noisy patch 在线计算。
 
-## PointNet++ 基线模型
-
-仓库里也提供了一个 PointNet++ 去噪基线，对应配置名为 `pointnet2`。它和当前 VM 主线使用同一套数据、patch 采样、loss 和 patch-based 推理流程，只是模型内部 encoder 换成 PointNet++ set abstraction + feature propagation：
+主要配置：
 
 ```text
-patch: (1024, 3)
-  -> FPS 采样中心点
-  -> KNN 分组，默认 k = 32
-  -> Set Abstraction 层提取局部特征
-  -> Feature Propagation 插值回原始 patch 点
-  -> displacement decoder
-  -> displacement: (1024, 3)
+configs/task/train_vm.yaml
+configs/task/predict_vm.yaml
+configs/data/train.yaml
+configs/data/predict.yaml
+configs/transform/vm.yaml
+configs/model/vm.yaml
+configs/train/vm.yaml
+configs/system/vm.yaml
 ```
 
-PointNet++ 的主要参数在 `configs/model/pointnet2.yaml`：
+当前训练 loss：
 
 ```yaml
-k: 32
-sa_npoints: [256, 64, 8]
-sa_channels: [128, 256, 1024]
-fp_channels: [256, 128, 128]
-decoder_hidden_dims: [128, 64]
+displacement_loss: 0.9
+normalized_surface_loss: 0.1
+geometry_gate_match_loss: 0.02
 ```
 
-训练前同样需要先生成 `cache_clean_points/`。训练命令：
+### VM 训练
 
 ```bash
-python run.py --task configs/task/train_pointnet2.yaml --seed 123
+python run.py --task configs/task/train_vm.yaml --seed 123
 ```
 
 Windows 示例：
 
 ```powershell
 C:\Users\Lenovo\anaconda3\envs\jittor\python.exe run.py `
-  --task configs\task\train_pointnet2.yaml `
+  --task configs\task\train_vm.yaml `
   --seed 123
 ```
 
-PointNet++ 训练配置链路：
+训练输出：
 
 ```text
-configs/task/train_pointnet2.yaml
-configs/data/train.yaml
-configs/transform/pointnet2.yaml
-configs/model/pointnet2.yaml
-configs/train/pointnet2.yaml
-configs/system/pointnet2.yaml
+outputs/vm/checkpoints/checkpoint_best.pkl
+outputs/vm/runs/
 ```
 
-推理前先确认 `configs/task/predict_pointnet2.yaml` 里的 `load_ckpt` 指向训练得到的 checkpoint，例如：
+### VM 推理
+
+先确认 `configs/task/predict_vm.yaml` 里的 `load_ckpt` 指向要使用的 checkpoint：
 
 ```yaml
-load_ckpt: outputs/point_net2/checkpoints/checkpoint_best.pkl
+load_ckpt: outputs/vm/checkpoints/checkpoint_best.pkl
 ```
 
 然后运行：
 
 ```bash
-python run.py --task configs/task/predict_pointnet2.yaml --seed 123
+python run.py --task configs/task/predict_vm.yaml --seed 123
 ```
 
-Windows 示例：
+也可以使用默认加载 VM 配置的脚本：
 
-```powershell
-C:\Users\Lenovo\anaconda3\envs\jittor\python.exe run.py `
-  --task configs\task\predict_pointnet2.yaml `
-  --seed 123
+```bash
+python scripts/infer.py --seed 123
 ```
 
-PointNet++ 推理输出默认写到：
+推理输出：
 
 ```text
-outputs/point_net2/result/test_noisy/
+outputs/vm/result/test_noisy/
   shapenet/
     <synset_id>/
       <model_id>/
         denoised.npy
+outputs/vm/result/result.zip
 ```
 
-注意：`scripts/train.py` 和 `scripts/infer.py` 默认加载的是 VM 配置。使用 PointNet++ 时请显式调用 `run.py --task configs/task/train_pointnet2.yaml` 或 `run.py --task configs/task/predict_pointnet2.yaml`。
+## EdgeConv Baseline 流程
 
-## EdgeConv_Baseline 官方基线
+EdgeConv baseline 对应配置名为 `edgeconv_baseline`，用于复现/对照官方 starter code 风格的基线。它不使用 `cache_clean_points/`，而是直接从 OBJ mesh 在线采样 clean 点云。
 
-仓库里也迁入了官方 starter code 的 EdgeConv baseline，对应配置名为 `edgeconv_baseline`。这条分支不使用 `cache_clean_points/`，而是和官方 baseline 一样直接从 OBJ mesh 在线采样 clean 点云：
+### EdgeConv 数据流
+
+训练数据来源：
 
 ```text
 dataset_clean/
@@ -242,7 +260,17 @@ OBJ mesh
   -> patch: noisy KNN 取 1000 点，并生成 pc_mix
 ```
 
-模型结构：
+训练目标保持官方 baseline 写法：
+
+```text
+input = pc_mix
+target = pc_clean - pc_noisy
+loss = MSE(pred_dir, target) / dsm_sigma
+```
+
+推理同样使用 patch-based denoise 和 hard patch fusion。
+
+### EdgeConv 模型结构
 
 ```text
 patch pc_mix: (1000, 3)
@@ -251,98 +279,182 @@ patch pc_mix: (1000, 3)
   -> concat(x1, x2): (1000, 96)
   -> DynamicEdgeConv(96 -> 256), KNN k=16
   -> decoder: 256 -> 256 -> 64 -> 3
+  -> displacement: (1000, 3)
 ```
 
-训练 target 保持官方 baseline 写法：
+主要配置：
 
 ```text
-input = pc_mix
-target = pc_clean - pc_noisy
-loss = MSE(pred_dir, target) / dsm_sigma
+configs/task/train_edgeconv_baseline.yaml
+configs/task/predict_edgeconv_baseline.yaml
+configs/data/edgeconv_baseline.yaml
+configs/transform/edgeconv_baseline.yaml
+configs/model/edgeconv_baseline.yaml
+configs/train/edgeconv_baseline.yaml
+configs/system/edgeconv_baseline.yaml
 ```
 
-训练命令：
+### EdgeConv 训练
 
 ```bash
 python run.py --task configs/task/train_edgeconv_baseline.yaml --seed 123
 ```
 
-推理前确认 checkpoint 路径：
+Windows 示例：
+
+```powershell
+C:\Users\Lenovo\anaconda3\envs\jittor\python.exe run.py `
+  --task configs\task\train_edgeconv_baseline.yaml `
+  --seed 123
+```
+
+训练输出：
+
+```text
+outputs/EdgeConv/checkpoints/checkpoint_best.pkl
+outputs/EdgeConv/runs/
+```
+
+### EdgeConv 推理
+
+先确认 `configs/task/predict_edgeconv_baseline.yaml` 里的 `load_ckpt` 指向要使用的 checkpoint：
 
 ```yaml
 load_ckpt: outputs/EdgeConv/checkpoints/checkpoint_best.pkl
 ```
 
-推理命令：
+然后运行：
 
 ```bash
 python run.py --task configs/task/predict_edgeconv_baseline.yaml --seed 123
 ```
 
-EdgeConv_Baseline 的所有运行产物都保存到：
+推理输出：
 
 ```text
-outputs/EdgeConv/
-  checkpoints/
-  runs/
-  result/
+outputs/EdgeConv/result/test_noisy/
+  shapenet/
+    <synset_id>/
+      <model_id>/
+        denoised.npy
+outputs/EdgeConv/result/result.zip
 ```
 
-## 训练
+## PointNet++ Baseline 流程
+
+PointNet++ baseline 对应配置名为 `pointnet2`。它和 VM 一样使用 `cache_clean_points/`、patch 训练和 patch-based 推理，但模型内部 encoder 换成 PointNet++ set abstraction + feature propagation。
+
+### PointNet++ 数据流
+
+训练前同样需要先生成 `cache_clean_points/`。
+
+训练数据流：
+
+```text
+clean.npy
+  -> normalize
+  -> add_noise
+  -> 随机选 seed point
+  -> 在 noisy 点云中取 seed 周围 KNN 1024 个点
+  -> patch 坐标减 seed
+  -> 输入 PointNet++
+```
+
+推理数据流：
+
+```text
+noisy.npy
+  -> FPS 选 seed
+  -> KNN 切 patch
+  -> patch 内预测 displacement
+  -> 融合回整云
+  -> denoised.npy
+```
+
+### PointNet++ 模型结构
+
+```text
+patch: (1024, 3)
+  -> FPS 采样中心点
+  -> KNN 分组，默认 k = 32
+  -> Set Abstraction: [256, 64, 8] 个中心层级
+  -> Feature Propagation 插值回原始 patch 点
+  -> displacement decoder: 128 -> 64 -> 3
+  -> displacement: (1024, 3)
+```
+
+主要参数在 `configs/model/pointnet2.yaml`：
+
+```yaml
+k: 32
+sa_npoints: [256, 64, 8]
+sa_channels: [128, 256, 1024]
+fp_channels: [256, 128, 128]
+decoder_hidden_dims: [128, 64]
+denoise_num_steps: 1
+predict_patch_size: 1024
+```
+
+主要配置：
+
+```text
+configs/task/train_pointnet2.yaml
+configs/task/predict_pointnet2.yaml
+configs/data/train.yaml
+configs/data/predict.yaml
+configs/transform/pointnet2.yaml
+configs/model/pointnet2.yaml
+configs/train/pointnet2.yaml
+configs/system/pointnet2.yaml
+```
+
+### PointNet++ 训练
 
 ```bash
-python run.py --task configs/task/train_vm.yaml --seed 123
+python run.py --task configs/task/train_pointnet2.yaml --seed 123
 ```
 
-主训练配置链路：
+Windows 示例：
+
+```powershell
+C:\Users\Lenovo\anaconda3\envs\jittor\python.exe run.py `
+  --task configs\task\train_pointnet2.yaml `
+  --seed 123
+```
+
+训练输出：
 
 ```text
-configs/task/train_vm.yaml
-configs/data/train.yaml
-configs/transform/vm.yaml
-configs/model/vm.yaml
-configs/train/vm.yaml
-configs/system/vm.yaml
+outputs/point_net2/checkpoints/checkpoint_best.pkl
+outputs/point_net2/runs/
 ```
 
-当前训练 loss：
+### PointNet++ 推理
+
+先确认 `configs/task/predict_pointnet2.yaml` 里的 `load_ckpt` 指向要使用的 checkpoint：
 
 ```yaml
-displacement_loss: 0.9
-normalized_surface_loss: 0.1
-```
-
-训练输出 checkpoint：
-
-```text
-outputs/vm/checkpoints/checkpoint_best.pkl
-```
-
-## 推理
-
-确认 `configs/task/predict_vm.yaml` 中的 `load_ckpt` 指向要使用的 checkpoint，例如：
-
-```yaml
-load_ckpt: outputs/vm/checkpoints/checkpoint_best.pkl
+load_ckpt: outputs/point_net2/checkpoints/checkpoint_best.pkl
 ```
 
 然后运行：
 
 ```bash
-python scripts/infer.py --seed 123
+python run.py --task configs/task/predict_pointnet2.yaml --seed 123
 ```
 
 推理输出：
 
 ```text
-outputs/vm/result/test_noisy/
+outputs/point_net2/result/test_noisy/
   shapenet/
     <synset_id>/
       <model_id>/
         denoised.npy
+outputs/point_net2/result/result.zip
 ```
 
-推理时会对整云做 patch-based denoise：FPS 选 seed，KNN 切 patch，patch 内预测 displacement，再融合回整云。
+注意：`scripts/train.py` 和 `scripts/infer.py` 默认加载 VM 配置。使用 PointNet++ 时请显式调用 `run.py --task configs/task/train_pointnet2.yaml` 或 `run.py --task configs/task/predict_pointnet2.yaml`。
 
 ## 项目结构
 
@@ -351,10 +463,10 @@ configs/       配置文件
 datalist/      train / validate / test 列表
 scripts/       缓存、训练、推理、评估脚本
 src/data/      数据路径、Dataset、Transform、Augment
-src/model/     去噪模型、特征 encoder、decoder
+src/model/     VM、EdgeConv、PointNet++ 模型和公共特征模块
 src/system/    训练、验证、推理流程
 tools/         分析工具
-outputs/       checkpoint、日志、推理结果，按模型分为 vm/、point_net2/ 和 EdgeConv/
+outputs/       checkpoint、日志、推理结果，按模型分为 vm/、EdgeConv/、point_net2/
 ```
 
 ## 说明

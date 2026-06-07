@@ -4,6 +4,7 @@ outputs*
 outputs_result/
 analysis/
 analysis_outputs/
+outputs_analysis/
 experiments/
 tmp_predict/
 result/

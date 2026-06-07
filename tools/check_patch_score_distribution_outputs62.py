@@ -26,7 +26,7 @@ from src.model.parse import get_model  # noqa: E402
 
 
 DEFAULT_CHECKPOINT = PROJECT_ROOT / "outputs_result/outputs6.2/checkpoints/vm/checkpoint_best.pkl"
-DEFAULT_OUT_DIR = PROJECT_ROOT / "outputs_result/analysis_outputs/patch_score_distribution_outputs6.2"
+DEFAULT_OUT_DIR = PROJECT_ROOT / "outputs_result/outputs_analysis/patch_score_distribution_outputs6.2"
 
 
 def normalize_pc(pc):

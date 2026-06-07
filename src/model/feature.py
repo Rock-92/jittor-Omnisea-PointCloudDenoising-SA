@@ -334,8 +334,6 @@ class FeatureExtraction(nn.Module):
             self.blocks.append(block)
             self.block_weights.append(weight)
 
-        self.fuse = nn.Linear(embedding_dim * num_blocks, embedding_dim)
-
     def get_gate_embedding(self, condition_feat):
         gate_parts = []
         for block in self.blocks:
@@ -347,9 +345,6 @@ class FeatureExtraction(nn.Module):
         x: (B, N, 3)
         return: (B, N, 256)
         """
-        graph_knn_idx = get_knn_idx(x, x, self.max_knn, offset=1)
-        reuse_knn_idx = None
-
         feat = apply_point_linear(self.input_proj_1, x)
         feat = self.act(feat)
         feat = apply_point_linear(self.input_proj_2, feat)
@@ -358,20 +353,13 @@ class FeatureExtraction(nn.Module):
         condition_feat = self.geometry_token_encoder(feat, x)
         gate_embedding = self.get_gate_embedding(condition_feat)
 
-        block_outputs = []
-        for block_idx, (block, weight) in enumerate(zip(self.blocks, self.block_weights)):
+        for block_idx, block in enumerate(self.blocks):
             if block_idx == 0:
-                block_knn_idx = graph_knn_idx
-            elif block_idx == 1:
-                reuse_knn_idx = get_knn_idx(feat, feat, self.max_knn, offset=1)
-                block_knn_idx = reuse_knn_idx
+                block_knn_idx = get_knn_idx(x, x, self.max_knn, offset=1)
             else:
-                block_knn_idx = reuse_knn_idx
+                block_knn_idx = get_knn_idx(feat, feat, self.max_knn, offset=1)
             feat = block(feat, block_knn_idx, condition_feat=condition_feat)
-            block_outputs.append(feat * weight)
 
-        feat = jt.concat(block_outputs, dim=-1)
-        feat = apply_point_linear(self.fuse, feat)
         if return_condition:
             return feat, geometry_feat, gate_embedding
         return feat

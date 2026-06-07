@@ -41,7 +41,7 @@ class VelocityModule(ModelSpec):
         
         # patch-based prediction
         self.predict_rounds = cfg.get('predict_rounds', 1)
-        self.denoise_num_steps = cfg.get('denoise_num_steps', 1)
+        self.denoise_num_steps = cfg.get('denoise_num_steps', 4)
         self.predict_patch_size = cfg.get('predict_patch_size', 1000)
         self.predict_seed_k = cfg.get('predict_seed_k', 6)
         self.predict_seed_interval = cfg.get('predict_seed_interval', 200)
@@ -124,14 +124,16 @@ class VelocityModule(ModelSpec):
         gate_dist = gate_dist / (gate_mean + 1e-8)
         return ((gate_dist - geom_dist) ** 2.0).mean()
 
-    def get_supervised_losses(self, pc_noisy, pc_clean):
+    def get_supervised_losses(self, pc_noisy, pc_clean, pc_mix=None):
         """
         pc_noisy: (B, N, 3)
         pc_clean: (B, N, 3)
         """
+        if pc_mix is None:
+            pc_mix = pc_noisy
         point_idx = get_random_indices(pc_noisy.shape[1], self.num_train_points)
         feat, geometry_feat, gate_embedding = self.encoder(
-            pc_noisy,
+            pc_mix,
             return_condition=True,
         )
         target = pc_clean - pc_noisy
@@ -183,9 +185,11 @@ class VelocityModule(ModelSpec):
         patch_size = batch['pc_noisy'].shape[-2]
         pc_noisy = batch['pc_noisy'].reshape(-1, patch_size, 3)
         pc_clean = batch['pc_clean'].reshape(-1, patch_size, 3)
+        pc_mix = batch.get('pc_mix', batch['pc_noisy']).reshape(-1, patch_size, 3)
         losses = self.get_supervised_losses(
             pc_noisy=pc_noisy,
             pc_clean=pc_clean,
+            pc_mix=pc_mix,
         )
         return losses
     
@@ -222,6 +226,8 @@ class VelocityModule(ModelSpec):
                     "pc_noisy": b.meta['pc_noisy'], # (num_patches, patch_size, 3)
                     "pc_clean": b.meta['pc_clean'],
                 }
+                if 'pc_mix' in b.meta:
+                    item["pc_mix"] = b.meta['pc_mix']
                 if 'patch_seed' in b.meta:
                     item["patch_seed"] = b.meta['patch_seed']
                 res.append(item)
@@ -301,40 +307,18 @@ def patch_based_denoise(
     """
     assert len(pcl_noisy.shape) == 2
     
-    N, _ = pcl_noisy.shape
-    patch_size = min(int(patch_size), N)
-    num_patches = min(N, max(1, int(seed_k * N / patch_size)))
+    N, d = pcl_noisy.shape
+    num_patches = int(seed_k * N / patch_size)
     pcl_noisy = pcl_noisy.unsqueeze(0)  # (1, N, 3)
     
     seed_pnts, seed_idx = farthest_point_sampling(pcl_noisy, num_patches)
     patch_dists, point_idxs, patches = knn_points(seed_pnts, pcl_noisy, patch_size)
-    
-    covered = np.zeros((N,), dtype=np.bool_)
-    covered[point_idxs[0].numpy().reshape(-1)] = True
-    missing_idx = np.flatnonzero(~covered).astype(np.int32)
-    if missing_idx.size > 0:
-        extra_seed_idx = jt.array(missing_idx).int32()
-        extra_seed_pnts = pcl_noisy[:, extra_seed_idx, :]
-        extra_patch_dists, extra_point_idxs, extra_patches = knn_points(
-            extra_seed_pnts,
-            pcl_noisy,
-            patch_size,
-        )
-        seed_pnts = jt.concat([seed_pnts, extra_seed_pnts], dim=1)
-        patch_dists = jt.concat([patch_dists, extra_patch_dists], dim=1)
-        point_idxs = jt.concat([point_idxs, extra_point_idxs], dim=1)
-        patches = jt.concat([patches, extra_patches], dim=1)
-        num_patches += missing_idx.size
-        print(
-            f"Patch coverage: added {missing_idx.size} extra seed patches "
-            "for points missed by FPS seeds."
-        )
-    
+
     patches = patches[0]              # (P, M, 3)
     patch_dists = patch_dists[0]      # (P, M)
     point_idxs = point_idxs[0]        # (P, M)
     
-    seed_expand = seed_pnts[0].unsqueeze(1).broadcast(patches.shape)
+    seed_expand = seed_pnts.squeeze().unsqueeze(1).broadcast(patches.shape)
     patches = patches - seed_expand
     
     patch_dists = patch_dists / (patch_dists[:, -1:].broadcast(patch_dists.shape) + 1e-8)
@@ -364,22 +348,9 @@ def patch_based_denoise(
     patches_denoised = jt.concat(patches_denoised, dim=0)
     patches_denoised = patches_denoised + seed_expand
     pcl_out = []
-    pcl_noisy_flat = pcl_noisy[0]
-    missing_count = 0
     for pidx in range(N):
         patch_id = best_weights_idx[pidx].item()
         mask = (point_idxs[patch_id] == pidx)
-        selected = patches_denoised[patch_id][mask]
-        if selected.shape[0] == 0:
-            missing_count += 1
-            selected = pcl_noisy_flat[pidx:pidx+1]
-        else:
-            selected = selected[:1]
-        pcl_out.append(selected)
+        pcl_out.append(patches_denoised[patch_id][mask])
     pcl_out = jt.concat(pcl_out, dim=0)
-    if missing_count > 0:
-        print(
-            f"Patch fusion warning: {missing_count}/{N} points were not covered "
-            "by any denoised patch; kept their noisy coordinates."
-        )
     return pcl_out

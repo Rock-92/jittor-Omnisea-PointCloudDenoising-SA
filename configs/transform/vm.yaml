@@ -9,6 +9,7 @@ train_transform:
     - __target__: patch
       patch_size: 1000
       num_patches: 1
+      mix_with_clean: true
 
 validate_transform: &validate_transform
   augments:
@@ -21,5 +22,6 @@ validate_transform: &validate_transform
     - __target__: patch
       patch_size: 1000
       num_patches: 1
+      mix_with_clean: true
 
 predict_transform: {}

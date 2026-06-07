@@ -30,7 +30,7 @@ from tools.check_patch_score_distribution_outputs62 import (  # noqa: E402
 )
 
 
-DEFAULT_OUT_DIR = PROJECT_ROOT / "outputs_result/analysis_outputs/expanded_patch_lowpoint_outputs6.2"
+DEFAULT_OUT_DIR = PROJECT_ROOT / "outputs_result/outputs_analysis/expanded_patch_lowpoint_outputs6.2"
 
 
 def write_csv(path, rows):
