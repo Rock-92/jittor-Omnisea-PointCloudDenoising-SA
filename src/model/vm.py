@@ -43,7 +43,10 @@ class VelocityModule(ModelSpec):
         # patch-based prediction
         self.predict_rounds = cfg.get('predict_rounds', 1)
         self.denoise_num_steps = cfg.get('denoise_num_steps', 4)
-        self.bridge_sde_noise = cfg.get('bridge_sde_noise', 0.0)
+        self.score_sigma_min = cfg.get('score_sigma_min', 0.005)
+        self.score_sigma_max = cfg.get('score_sigma_max', 0.020)
+        self.score_step_scale = cfg.get('score_step_scale', 1.0)
+        self.score_sde_noise = cfg.get('score_sde_noise', 0.0)
         self.predict_patch_size = cfg.get('predict_patch_size', 1000)
         self.predict_seed_k = cfg.get('predict_seed_k', 6)
         self.predict_seed_interval = cfg.get('predict_seed_interval', 200)
@@ -131,29 +134,28 @@ class VelocityModule(ModelSpec):
         self,
         pc_noisy,
         pc_clean,
-        pc_bridge=None,
-        bridge_t=None,
+        score_sigma=None,
     ):
         """
         pc_noisy: (B, N, 3)
         pc_clean: (B, N, 3)
         """
-        if pc_bridge is None:
-            pc_bridge = pc_noisy
-        if bridge_t is None:
-            bridge_t = jt.ones((pc_noisy.shape[0], 1))
+        if score_sigma is None:
+            score_sigma = jt.ones((pc_noisy.shape[0], 1)) * self.dsm_sigma
+        score_condition = score_sigma / self.dsm_sigma
         point_idx = get_random_indices(pc_noisy.shape[1], self.num_train_points)
         feat, geometry_feat, gate_embedding = self.encoder(
-            pc_bridge,
-            bridge_t=bridge_t,
+            pc_noisy,
+            bridge_t=score_condition,
             return_condition=True,
         )
-        target = pc_noisy - pc_clean
-        pc_bridge_for_loss = pc_bridge
+        sigma_view = score_sigma.reshape(score_sigma.shape[0], 1, 1)
+        target = (pc_clean - pc_noisy) / ((sigma_view ** 2.0) + 1e-8)
+        pc_noisy_for_loss = pc_noisy
         pc_clean_for_loss = pc_clean
         if point_idx is not None:
             target = target[:, point_idx, :]
-            pc_bridge_for_loss = pc_bridge[:, point_idx, :]
+            pc_noisy_for_loss = pc_noisy[:, point_idx, :]
             pc_clean_for_loss = pc_clean[:, point_idx, :]
             geometry_feat = geometry_feat[:, point_idx, :]
             gate_embedding = gate_embedding[:, point_idx, :]
@@ -162,11 +164,12 @@ class VelocityModule(ModelSpec):
         else:
             feat_for_loss = feat
         B, N_out, F_dim = feat_for_loss.shape
-        velocity_pred = self.decoder(feat_for_loss.reshape(-1, F_dim)).reshape(B, N_out, 3)
-        displacement_loss = (((velocity_pred - target) ** 2.0) / self.dsm_sigma).sum(dim=-1).mean()
-        t_for_loss = bridge_t.reshape(bridge_t.shape[0], 1, 1)
+        score_pred = self.decoder(feat_for_loss.reshape(-1, F_dim)).reshape(B, N_out, 3)
+        score_weight = (sigma_view ** 2.0)
+        displacement_loss = (((score_pred - target) ** 2.0) * score_weight).sum(dim=-1).mean()
+        sigma_for_loss = score_sigma.reshape(score_sigma.shape[0], 1, 1)
         normalized_surface_loss = self.get_normalized_surface_loss(
-            pc_pred=pc_bridge_for_loss - t_for_loss * velocity_pred,
+            pc_pred=pc_noisy_for_loss + (sigma_for_loss ** 2.0) * score_pred,
             pc_clean=pc_clean,
             pc_anchor=pc_clean_for_loss,
         )
@@ -190,30 +193,35 @@ class VelocityModule(ModelSpec):
         with jt.no_grad():
             pcl_next = pcl_noisy.clone()
             num_steps = max(1, int(num_steps))
-            dt = 1.0 / num_steps
+            if num_steps == 1:
+                sigma_values = [float(self.score_sigma_max)]
+            else:
+                sigma_values = np.linspace(
+                    float(self.score_sigma_max),
+                    float(self.score_sigma_min),
+                    num_steps,
+                ).tolist()
             for it in range(num_steps):
-                t_value = 1.0 - it * dt
-                bridge_t = jt.ones((pcl_next.shape[0], 1)) * t_value
-                velocity_pred = self.predict_displacement(pcl_next, bridge_t=bridge_t)
-                pcl_next = pcl_next - dt * velocity_pred
-                if self.bridge_sde_noise > 0 and it < num_steps - 1:
-                    sigma = self.bridge_sde_noise * (t_value * max(1.0 - t_value, 0.0)) ** 0.5
-                    pcl_next = pcl_next + (dt ** 0.5) * sigma * jt.randn(pcl_next.shape)
+                sigma_value = sigma_values[it]
+                score_condition = jt.ones((pcl_next.shape[0], 1)) * (sigma_value / self.dsm_sigma)
+                score_pred = self.predict_displacement(pcl_next, bridge_t=score_condition)
+                step = self.score_step_scale * (sigma_value ** 2.0)
+                pcl_next = pcl_next + step * score_pred
+                if self.score_sde_noise > 0 and it < num_steps - 1:
+                    pcl_next = pcl_next + self.score_sde_noise * sigma_value * jt.randn(pcl_next.shape)
         return pcl_next, None
     
     def training_step(self, batch: Dict) -> Dict:
         patch_size = batch['pc_noisy'].shape[-2]
         pc_noisy = batch['pc_noisy'].reshape(-1, patch_size, 3)
         pc_clean = batch['pc_clean'].reshape(-1, patch_size, 3)
-        pc_bridge = batch.get('pc_bridge', batch['pc_noisy']).reshape(-1, patch_size, 3)
-        bridge_t = batch.get('bridge_t')
-        if bridge_t is not None:
-            bridge_t = bridge_t.reshape(-1, 1)
+        score_sigma = batch.get('score_sigma')
+        if score_sigma is not None:
+            score_sigma = score_sigma.reshape(-1, 1)
         losses = self.get_supervised_losses(
             pc_noisy=pc_noisy,
             pc_clean=pc_clean,
-            pc_bridge=pc_bridge,
-            bridge_t=bridge_t,
+            score_sigma=score_sigma,
         )
         return losses
     
@@ -250,10 +258,8 @@ class VelocityModule(ModelSpec):
                     "pc_noisy": b.meta['pc_noisy'], # (num_patches, patch_size, 3)
                     "pc_clean": b.meta['pc_clean'],
                 }
-                if 'pc_bridge' in b.meta:
-                    item["pc_bridge"] = b.meta['pc_bridge']
-                if 'bridge_t' in b.meta:
-                    item["bridge_t"] = b.meta['bridge_t']
+                if 'score_sigma' in b.meta:
+                    item["score_sigma"] = b.meta['score_sigma']
                 if 'patch_seed' in b.meta:
                     item["patch_seed"] = b.meta['patch_seed']
                 res.append(item)

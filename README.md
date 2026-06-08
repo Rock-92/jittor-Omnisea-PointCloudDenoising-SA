@@ -15,7 +15,7 @@ target = pc_clean - pc_noisy
 pc_pred = pc_noisy + displacement
 ```
 
-其中 VM 主线已经改成 bridge/velocity 训练：模型输入 `x_t` 和 `t`，预测 `v = x1 - x0`，推理时从 `t=1` 的 noisy patch 出发，按 `x_{t-dt} = x_t - dt * v` 逐步走到 `t=0`。EdgeConv 和 PointNet++ baseline 仍保留 displacement 预测表述。
+其中 VM 主线当前是 score-based 训练：模型输入 noisy patch 和噪声强度 `sigma`，预测局部 score，推理时按照 sigma schedule 多步更新点位置。EdgeConv 和 PointNet++ baseline 仍保留 displacement 预测表述。
 
 README 下面把三条流程分开说明，避免把 VM、EdgeConv baseline 和 PointNet++ baseline 的数据、配置、训练和推理命令混在一起。
 
@@ -106,7 +106,7 @@ cache_clean_points/
 
 ## VM 主线流程
 
-VM 是当前自己设计的主线模型，对应配置名为 `vm`。它使用 3 层 multi-scale local self-attention，并采用 bridge 时间条件调制每层 attention/FFN；几何 token 从当前加噪后的 bridge patch 在线计算。
+VM 是当前自己设计的主线模型，对应配置名为 `vm`。它使用 3 层 multi-scale local self-attention，并采用噪声强度条件调制每层 attention/FFN；几何 token 从当前 noisy patch 在线计算。
 
 ### VM 数据流
 
@@ -116,10 +116,9 @@ VM 是当前自己设计的主线模型，对应配置名为 `vm`。它使用 3 
 clean.npy
   -> normalize
   -> add_noise
-  -> 随机采样 patch 级 t in [0, 1]
   -> 随机选 seed point
   -> 在 noisy 点云中取 seed 周围 KNN 1000 个点
-  -> 构造 x_t = (1 - t) * pc_clean + t * pc_noisy
+  -> 保存本次加噪强度 sigma
   -> patch 坐标减 noisy seed
   -> 输入 VM
 ```
@@ -140,15 +139,15 @@ noisy.npy
 ```text
 patch: (1000, 3)
   -> input projection: 3 -> 128 -> 256
-  -> 从 bridge patch 在线计算每点局部几何统计
+  -> 从 noisy patch 在线计算每点局部几何统计
   -> GeometryTokenEncoder: 8 维几何统计 -> 64 -> 256
-  -> BridgeTimeEncoder: bridge t -> 256
+  -> NoiseLevelEncoder: sigma -> 256
   -> 3 层 multi-scale local self-attention
        attention_knn: [8, 16, 32]
        geometry token 调制 scale gate 和 attention temperature
-       bridge time embedding 对每层 attention/FFN 做 FiLM 调制
-  -> velocity decoder: 256 -> 128 -> 64 -> 3
-  -> velocity: (1000, 3)
+       noise-level embedding 对每层 attention/FFN 做 FiLM 调制
+  -> score decoder: 256 -> 128 -> 64 -> 3
+  -> score: (1000, 3)
 ```
 
 在线几何 token 默认使用 `geometry_token_knn: 32`，每个点会计算：
@@ -164,7 +163,7 @@ local radius std
 local radius max
 ```
 
-当前 VM 主线没有 EdgeConv，没有显式 relative position bias，也没有几何分类头或几何预训练分支。几何信息在训练 forward 中从 `pc_bridge` 在线计算，推理时从当前 velocity 步进状态在线计算。
+当前 VM 主线没有 EdgeConv，没有显式 relative position bias，也没有几何分类头或几何预训练分支。几何信息在训练 forward 中从 `pc_noisy` 在线计算，推理时从当前 score-based 更新状态在线计算。
 
 主要配置：
 
@@ -182,7 +181,7 @@ configs/system/vm.yaml
 当前训练 loss：
 
 ```yaml
-displacement_loss: 0.9  # VM 中实际对应 velocity MSE，沿用旧 key 以兼容训练配置
+displacement_loss: 0.9  # VM 中实际对应 denoising score matching loss，沿用旧 key 以兼容训练配置
 normalized_surface_loss: 0.1
 geometry_gate_match_loss: 0.02
 ```

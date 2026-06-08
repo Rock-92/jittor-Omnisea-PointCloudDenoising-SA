@@ -84,6 +84,9 @@ class AugmentAddNoise(Augment):
         assert pc is not None, "sampled_vertices is None, cannot apply AugmentAddNoise"
         noise_std = np.random.uniform(self.noise_std_min, self.noise_std_max)
         noise = np.random.laplace(0, noise_std, size=pc.shape).astype(np.float32, copy=False)
+        if asset.meta is None:
+            asset.meta = {}
+        asset.meta['noise_std'] = np.float32(noise_std)
         asset.sampled_vertices_noisy = (pc + noise).astype(np.float32, copy=False)
 
 @dataclass(frozen=True)
@@ -210,6 +213,12 @@ class AugmentPatch(Augment):
         asset.meta['pc_noisy'] = pat_A
         asset.meta['pc_clean'] = pat_B
         asset.meta['patch_seed'] = patch_seed
+        if 'noise_std' in asset.meta:
+            asset.meta['score_sigma'] = np.full(
+                (self.num_patches, 1),
+                asset.meta['noise_std'],
+                dtype=np.float32,
+            )
         if self.bridge_sample_t:
             asset.meta['pc_bridge'] = pat_t
             asset.meta['bridge_t'] = t.reshape(self.num_patches, 1).astype(

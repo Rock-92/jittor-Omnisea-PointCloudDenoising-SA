@@ -9,10 +9,6 @@ train_transform:
     - __target__: patch
       patch_size: 1000
       num_patches: 1
-      bridge_sample_t: true
-      bridge_t_min: 0.001
-      bridge_t_max: 1.0
-      bridge_noise_std: 0.0
 
 validate_transform: &validate_transform
   augments:
@@ -25,9 +21,5 @@ validate_transform: &validate_transform
     - __target__: patch
       patch_size: 1000
       num_patches: 1
-      bridge_sample_t: true
-      bridge_t_min: 0.001
-      bridge_t_max: 1.0
-      bridge_noise_std: 0.0
 
 predict_transform: {}
