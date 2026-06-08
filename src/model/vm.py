@@ -52,7 +52,7 @@ class VelocityModule(ModelSpec):
         self.predict_seed_interval = cfg.get('predict_seed_interval', 200)
         self.predict_seed_k_alpha = cfg.get('predict_seed_k_alpha', 1)
         
-        # score-matching
+        # sigma-conditioned denoising
         self.dsm_sigma = cfg['dsm_sigma']
         self.num_train_points = cfg.get('num_train_points', 0)
         
@@ -149,8 +149,7 @@ class VelocityModule(ModelSpec):
             bridge_t=score_condition,
             return_condition=True,
         )
-        sigma_view = score_sigma.reshape(score_sigma.shape[0], 1, 1)
-        target = (pc_clean - pc_noisy) / ((sigma_view ** 2.0) + 1e-8)
+        target = pc_clean - pc_noisy
         pc_noisy_for_loss = pc_noisy
         pc_clean_for_loss = pc_clean
         if point_idx is not None:
@@ -164,12 +163,10 @@ class VelocityModule(ModelSpec):
         else:
             feat_for_loss = feat
         B, N_out, F_dim = feat_for_loss.shape
-        score_pred = self.decoder(feat_for_loss.reshape(-1, F_dim)).reshape(B, N_out, 3)
-        score_weight = (sigma_view ** 2.0)
-        displacement_loss = (((score_pred - target) ** 2.0) * score_weight).sum(dim=-1).mean()
-        sigma_for_loss = score_sigma.reshape(score_sigma.shape[0], 1, 1)
+        displacement_pred = self.decoder(feat_for_loss.reshape(-1, F_dim)).reshape(B, N_out, 3)
+        displacement_loss = (((displacement_pred - target) ** 2.0) / self.dsm_sigma).sum(dim=-1).mean()
         normalized_surface_loss = self.get_normalized_surface_loss(
-            pc_pred=pc_noisy_for_loss + (sigma_for_loss ** 2.0) * score_pred,
+            pc_pred=pc_noisy_for_loss + displacement_pred,
             pc_clean=pc_clean,
             pc_anchor=pc_clean_for_loss,
         )
@@ -204,9 +201,8 @@ class VelocityModule(ModelSpec):
             for it in range(num_steps):
                 sigma_value = sigma_values[it]
                 score_condition = jt.ones((pcl_next.shape[0], 1)) * (sigma_value / self.dsm_sigma)
-                score_pred = self.predict_displacement(pcl_next, bridge_t=score_condition)
-                step = self.score_step_scale * (sigma_value ** 2.0)
-                pcl_next = pcl_next + step * score_pred
+                displacement_pred = self.predict_displacement(pcl_next, bridge_t=score_condition)
+                pcl_next = pcl_next + self.score_step_scale * displacement_pred
                 if self.score_sde_noise > 0 and it < num_steps - 1:
                     pcl_next = pcl_next + self.score_sde_noise * sigma_value * jt.randn(pcl_next.shape)
         return pcl_next, None
