@@ -11,6 +11,8 @@ attention_ffn_hidden_dim: 512
 geometry_token_knn: 32
 geometry_token_hidden_dim: 64
 bridge_hidden_dim: 64
+use_geometry_tokens: false
+use_bridge_condition: false
 
 # Decoder
 decoder_hidden_dims: [128, 64]
@@ -21,7 +23,7 @@ num_train_points: 256
 
 # Patch-based prediction
 predict_rounds: 1
-denoise_num_steps: 4
+denoise_num_steps: 1
 score_sigma_min: 0.005
 score_sigma_max: 0.020
 score_step_scale: 1.0

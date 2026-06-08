@@ -15,7 +15,7 @@ target = pc_clean - pc_noisy
 pc_pred = pc_noisy + displacement
 ```
 
-其中 VM 主线当前是 sigma-conditioned displacement 训练：模型输入 noisy patch 和噪声强度 `sigma`，直接预测 `pc_clean - pc_noisy` 位移；推理时仍可按照 sigma schedule 多步 refine。EdgeConv 和 PointNet++ baseline 也保留 displacement 预测表述。
+其中 VM 主线当前退回原版单步 displacement 训练：模型输入 noisy patch，直接预测 `pc_clean - pc_noisy` 位移；推理时单步输出 denoised patch。EdgeConv 和 PointNet++ baseline 也保留 displacement 预测表述。
 
 README 下面把三条流程分开说明，避免把 VM、EdgeConv baseline 和 PointNet++ baseline 的数据、配置、训练和推理命令混在一起。
 
@@ -139,31 +139,21 @@ noisy.npy
 ```text
 patch: (1000, 3)
   -> input projection: 3 -> 128 -> 256
-  -> 从 noisy patch 在线计算每点局部几何统计
-  -> GeometryTokenEncoder: 8 维几何统计 -> 64 -> 256
-  -> NoiseLevelEncoder: sigma -> 256
   -> 3 层 multi-scale local self-attention
        attention_knn: [8, 16, 32]
-       geometry token 调制 scale gate 和 attention temperature
-       noise-level embedding 对每层 attention/FFN 做 FiLM 调制
   -> displacement decoder: 256 -> 128 -> 64 -> 3
   -> displacement: (1000, 3)
 ```
 
-在线几何 token 默认使用 `geometry_token_knn: 32`，每个点会计算：
+几何 token 调制和 sigma 条件模块仍保留在代码里，但当前 VM 配置关闭：
 
 ```text
-curvature
-linearity
-planarity
-scattering
-normal variation
-local radius mean
-local radius std
-local radius max
+use_geometry_tokens: false
+use_bridge_condition: false
+denoise_num_steps: 1
 ```
 
-当前 VM 主线没有 EdgeConv，没有显式 relative position bias，也没有几何分类头或几何预训练分支。几何信息在训练 forward 中从 `pc_noisy` 在线计算，推理时从当前多步 refine 状态在线计算。
+当前 VM 主线没有 EdgeConv，没有显式 relative position bias，也没有几何分类头或几何预训练分支。
 
 主要配置：
 
@@ -181,9 +171,8 @@ configs/system/vm.yaml
 当前训练 loss：
 
 ```yaml
-displacement_loss: 0.9  # 预测 pc_clean - pc_noisy，sigma 作为条件输入
+displacement_loss: 0.9  # 预测 pc_clean - pc_noisy
 normalized_surface_loss: 0.1
-geometry_gate_match_loss: 0.02
 ```
 
 ### VM 训练

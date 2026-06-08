@@ -35,6 +35,8 @@ class VelocityModule(ModelSpec):
         self.geometry_token_knn = cfg.get('geometry_token_knn', 32)
         self.geometry_token_hidden_dim = cfg.get('geometry_token_hidden_dim', 64)
         self.bridge_hidden_dim = cfg.get('bridge_hidden_dim', 64)
+        self.use_geometry_tokens = cfg.get('use_geometry_tokens', False)
+        self.use_bridge_condition = cfg.get('use_bridge_condition', False)
         self.decoder_hidden_dims = cfg.get(
             'decoder_hidden_dims',
             [cfg.get('decoder_hidden_dim', 64)],
@@ -42,7 +44,7 @@ class VelocityModule(ModelSpec):
         
         # patch-based prediction
         self.predict_rounds = cfg.get('predict_rounds', 1)
-        self.denoise_num_steps = cfg.get('denoise_num_steps', 4)
+        self.denoise_num_steps = cfg.get('denoise_num_steps', 1)
         self.score_sigma_min = cfg.get('score_sigma_min', 0.005)
         self.score_sigma_max = cfg.get('score_sigma_max', 0.020)
         self.score_step_scale = cfg.get('score_step_scale', 1.0)
@@ -52,7 +54,7 @@ class VelocityModule(ModelSpec):
         self.predict_seed_interval = cfg.get('predict_seed_interval', 200)
         self.predict_seed_k_alpha = cfg.get('predict_seed_k_alpha', 1)
         
-        # sigma-conditioned denoising
+        # displacement denoising
         self.dsm_sigma = cfg['dsm_sigma']
         self.num_train_points = cfg.get('num_train_points', 0)
         
@@ -68,6 +70,8 @@ class VelocityModule(ModelSpec):
             geometry_token_knn=self.geometry_token_knn,
             geometry_token_hidden_dim=self.geometry_token_hidden_dim,
             bridge_hidden_dim=self.bridge_hidden_dim,
+            use_geometry_tokens=self.use_geometry_tokens,
+            use_bridge_condition=self.use_bridge_condition,
         )
         
         self.decoder = Decoder(
@@ -83,6 +87,8 @@ class VelocityModule(ModelSpec):
         return:   (B, N, 3) or (B, M, 3)
         """
         B, N, d = pc_noisy.shape
+        if not self.use_bridge_condition:
+            bridge_t = None
         feat = self.encoder(pc_noisy, bridge_t=bridge_t)
         if point_idx is not None:
             feat = feat[:, point_idx, :]
@@ -119,17 +125,6 @@ class VelocityModule(ModelSpec):
         plane_dist = (((pc_pred - p0) * normal).sum(dim=-1) ** 2.0)
         return (plane_dist / self.dsm_sigma).mean()
 
-    def get_geometry_gate_match_loss(self, geometry_feat, gate_embedding):
-        geom = geometry_feat.detach()
-        gate = gate_embedding
-        geom_dist = ((geom.unsqueeze(2) - geom.unsqueeze(1)) ** 2.0).sum(dim=-1)
-        gate_dist = ((gate.unsqueeze(2) - gate.unsqueeze(1)) ** 2.0).sum(dim=-1)
-        geom_mean = geom_dist.mean(dim=2, keepdims=True).mean(dim=1, keepdims=True)
-        gate_mean = gate_dist.mean(dim=2, keepdims=True).mean(dim=1, keepdims=True)
-        geom_dist = geom_dist / (geom_mean + 1e-8)
-        gate_dist = gate_dist / (gate_mean + 1e-8)
-        return ((gate_dist - geom_dist) ** 2.0).mean()
-
     def get_supervised_losses(
         self,
         pc_noisy,
@@ -140,15 +135,8 @@ class VelocityModule(ModelSpec):
         pc_noisy: (B, N, 3)
         pc_clean: (B, N, 3)
         """
-        if score_sigma is None:
-            score_sigma = jt.ones((pc_noisy.shape[0], 1)) * self.dsm_sigma
-        score_condition = score_sigma / self.dsm_sigma
         point_idx = get_random_indices(pc_noisy.shape[1], self.num_train_points)
-        feat, geometry_feat, gate_embedding = self.encoder(
-            pc_noisy,
-            bridge_t=score_condition,
-            return_condition=True,
-        )
+        feat = self.encoder(pc_noisy)
         target = pc_clean - pc_noisy
         pc_noisy_for_loss = pc_noisy
         pc_clean_for_loss = pc_clean
@@ -156,8 +144,6 @@ class VelocityModule(ModelSpec):
             target = target[:, point_idx, :]
             pc_noisy_for_loss = pc_noisy[:, point_idx, :]
             pc_clean_for_loss = pc_clean[:, point_idx, :]
-            geometry_feat = geometry_feat[:, point_idx, :]
-            gate_embedding = gate_embedding[:, point_idx, :]
         if point_idx is not None:
             feat_for_loss = feat[:, point_idx, :]
         else:
@@ -170,15 +156,10 @@ class VelocityModule(ModelSpec):
             pc_clean=pc_clean,
             pc_anchor=pc_clean_for_loss,
         )
-        geometry_gate_match_loss = self.get_geometry_gate_match_loss(
-            geometry_feat=geometry_feat,
-            gate_embedding=gate_embedding,
-        )
         
         return {
             "displacement_loss": displacement_loss,
             "normalized_surface_loss": normalized_surface_loss,
-            "geometry_gate_match_loss": geometry_gate_match_loss,
         }
 
     def denoise_langevin_dynamics(self, pcl_noisy, num_steps=None):
@@ -190,21 +171,11 @@ class VelocityModule(ModelSpec):
         with jt.no_grad():
             pcl_next = pcl_noisy.clone()
             num_steps = max(1, int(num_steps))
-            if num_steps == 1:
-                sigma_values = [float(self.score_sigma_max)]
-            else:
-                sigma_values = np.linspace(
-                    float(self.score_sigma_max),
-                    float(self.score_sigma_min),
-                    num_steps,
-                ).tolist()
             for it in range(num_steps):
-                sigma_value = sigma_values[it]
-                score_condition = jt.ones((pcl_next.shape[0], 1)) * (sigma_value / self.dsm_sigma)
-                displacement_pred = self.predict_displacement(pcl_next, bridge_t=score_condition)
+                displacement_pred = self.predict_displacement(pcl_next)
                 pcl_next = pcl_next + self.score_step_scale * displacement_pred
                 if self.score_sde_noise > 0 and it < num_steps - 1:
-                    pcl_next = pcl_next + self.score_sde_noise * sigma_value * jt.randn(pcl_next.shape)
+                    pcl_next = pcl_next + self.score_sde_noise * jt.randn(pcl_next.shape)
         return pcl_next, None
     
     def training_step(self, batch: Dict) -> Dict:

@@ -336,6 +336,8 @@ class FeatureExtraction(nn.Module):
         geometry_token_knn=32,
         geometry_token_hidden_dim=64,
         bridge_hidden_dim=64,
+        use_geometry_tokens=True,
+        use_bridge_condition=True,
     ):
         super().__init__()
 
@@ -355,6 +357,8 @@ class FeatureExtraction(nn.Module):
         self.geometry_token_knn = int(geometry_token_knn)
         self.geometry_token_hidden_dim = int(geometry_token_hidden_dim)
         self.bridge_hidden_dim = int(bridge_hidden_dim)
+        self.use_geometry_tokens = bool(use_geometry_tokens)
+        self.use_bridge_condition = bool(use_bridge_condition)
 
         self.input_proj_1 = nn.Linear(input_dim, input_expand_dim)
         self.input_proj_2 = nn.Linear(input_expand_dim, embedding_dim)
@@ -406,11 +410,16 @@ class FeatureExtraction(nn.Module):
         feat = self.act(feat)
         feat = apply_point_linear(self.input_proj_2, feat)
         feat = self.act(feat)
-        geometry_feat = self.geometry_token_encoder._pointwise_geometry(x)
-        condition_feat = self.geometry_token_encoder(feat, x)
-        gate_embedding = self.get_gate_embedding(condition_feat)
+        geometry_feat = None
+        condition_feat = None
+        gate_embedding = None
+        if self.use_geometry_tokens or return_condition:
+            geometry_feat = self.geometry_token_encoder._pointwise_geometry(x)
+        if self.use_geometry_tokens:
+            condition_feat = self.geometry_token_encoder(feat, x)
+            gate_embedding = self.get_gate_embedding(condition_feat)
         bridge_feat = None
-        if bridge_t is not None:
+        if self.use_bridge_condition and bridge_t is not None:
             bridge_feat = self.bridge_time_encoder(bridge_t)
 
         for block_idx, block in enumerate(self.blocks):

@@ -1,7 +1,6 @@
 loss:
   displacement_loss: 0.9
   normalized_surface_loss: 0.1
-  geometry_gate_match_loss: 0.02
 
 optimizer:
   __target__: adam
