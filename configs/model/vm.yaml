@@ -5,14 +5,13 @@ attention_knn: [8, 16, 32]
 input_dim: 3
 input_expand_dim: 128
 feat_embedding_dim: 256
-attention_blocks: 3
-attention_weight_init: [1.0, 1.0, 1.0]
+attention_blocks: 4
+attention_weight_init: [1.0, 0.6, 0.3, 0.2]
+relative_position_bias_hidden_dim: 64
 attention_ffn_hidden_dim: 512
-geometry_token_knn: 32
-geometry_token_hidden_dim: 64
-bridge_hidden_dim: 64
-use_geometry_tokens: false
-use_bridge_condition: false
+global_token_blocks: 4
+global_token_ffn_hidden_dim: 512
+global_attn_bias_init: 0.0
 
 # Decoder
 decoder_hidden_dims: [128, 64]
@@ -24,10 +23,6 @@ num_train_points: 256
 # Patch-based prediction
 predict_rounds: 1
 denoise_num_steps: 1
-score_sigma_min: 0.005
-score_sigma_max: 0.020
-score_step_scale: 1.0
-score_sde_noise: 0.0
 predict_patch_size: 1000
 # FPS-based inference uses predict_seed_k. predict_seed_interval is kept for compatibility.
 predict_seed_k: 6

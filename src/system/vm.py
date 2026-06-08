@@ -127,7 +127,7 @@ class VMSystem(DummySystem):
             ckpt_save_dir=ckpt_save_dir,
             ckpt_save_name=ckpt_save_name,
         )
-
+    
     def on_train_end(self):
         if self.writer is None or self.dataset_module.predict_dataset_config is None:
             return
@@ -270,3 +270,164 @@ class VMSystem(DummySystem):
         return metrics
 
 
+class VMSSLSystem(VMSystem):
+    def __init__(
+        self,
+        dataset_module,
+        model,
+        loss_config=None,
+        optimizer_config=None,
+        scheduler_config=None,
+        trainer_config=None,
+        writer: Optional[DummyWriter]=None,
+        ckpt_save_dir: str="experiments",
+        ckpt_save_name: str="checkpoint",
+        ssl_pretrained_ckpt: Optional[str]=None,
+        freeze_global_epochs: int=8,
+        global_lr_scale: float=0.2,
+    ):
+        self.ssl_pretrained_ckpt = ssl_pretrained_ckpt
+        self.freeze_global_epochs = int(freeze_global_epochs)
+        self.global_lr_scale = float(global_lr_scale)
+        self._current_epoch = 0
+        self._global_params = []
+        super().__init__(
+            dataset_module=dataset_module,
+            model=model,
+            loss_config=loss_config,
+            optimizer_config=optimizer_config,
+            scheduler_config=scheduler_config,
+            trainer_config=trainer_config,
+            writer=writer,
+            ckpt_save_dir=ckpt_save_dir,
+            ckpt_save_name=ckpt_save_name,
+        )
+        self._global_params = self._collect_global_params()
+        if self.ssl_pretrained_ckpt:
+            self._load_ssl_pretrained(self.ssl_pretrained_ckpt)
+
+    def _collect_global_params(self):
+        params = []
+        if not hasattr(self.model, "encoder"):
+            return params
+        enc = self.model.encoder
+        for module in [
+            getattr(enc, "input_proj_1", None),
+            getattr(enc, "input_proj_2", None),
+            getattr(enc, "global_token_generator", None),
+        ]:
+            if module is not None:
+                params.extend(list(module.parameters()))
+        return params
+
+    def _load_ssl_pretrained(self, path: str):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"ssl_pretrained_ckpt not found: {path}")
+        state = jt.load(path)
+        if not isinstance(state, dict):
+            raise ValueError(f"expected state_dict checkpoint, got {type(state)}: {path}")
+
+        def sub_state(prefix: str):
+            plen = len(prefix)
+            return {k[plen:]: v for k, v in state.items() if k.startswith(prefix)}
+
+        self.model.encoder.input_proj_1.load_state_dict(sub_state("encoder.input_proj_1."))
+        self.model.encoder.input_proj_2.load_state_dict(sub_state("encoder.input_proj_2."))
+        self.model.encoder.global_token_generator.load_state_dict(
+            sub_state("encoder.global_token_generator.")
+        )
+        print(f"Loaded SSL global token weights: {path}")
+
+    def _set_global_requires_grad(self, enabled: bool):
+        for p in self._global_params:
+            if enabled:
+                p.start_grad()
+            else:
+                p.stop_grad()
+
+    def on_train_epoch_start(self):
+        super().on_train_epoch_start()
+        self._set_global_requires_grad(self._current_epoch >= self.freeze_global_epochs)
+
+    def on_before_optimizer_step(self, optimizer):
+        if self._current_epoch < self.freeze_global_epochs:
+            return
+        if abs(self.global_lr_scale - 1.0) < 1e-12:
+            return
+        for p in self._global_params:
+            grad = p.opt_grad(optimizer)
+            if grad is not None:
+                grad.update(grad * self.global_lr_scale)
+
+    def train(self):
+        assert self.optimizer is not None, "optimizer is None, cannot train"
+        self.model.set_predict(False)
+        for epoch in range(self.epochs):
+            self._current_epoch = epoch
+            self.model.train()
+            self.on_train_epoch_start()
+            train_dataloader = self.dataset_module.train_dataloader()
+            assert train_dataloader is not None, "train_dataloader is None"
+            from tqdm import tqdm
+
+            pbar = tqdm(train_dataloader, total=len(train_dataloader)//train_dataloader.batch_size)
+            for batch in pbar:
+                from .spec import _get_item, _to_jittor
+
+                batch = _to_jittor(batch)
+                self.on_train_batch_start()
+                loss = self.training_step(batch)
+                self.optimizer.zero_grad()
+                self.optimizer.backward(loss)
+                pbar.set_description(f"Epoch {epoch}, Loss: {_get_item(loss)}")
+                self.on_before_optimizer_step(self.optimizer)
+                self.optimizer.step()
+                self.record_train_losses(self._last_train_loss_dict)
+                self.on_train_batch_end()
+            self.on_train_epoch_end()
+            train_loss = self.get_train_loss_sum()
+
+            self.model.eval()
+            validate_dataloader = self.dataset_module.validate_dataloader()
+            validation_loss = None
+            score_summary = None
+            if validate_dataloader is not None:
+                self.on_validation_epoch_start()
+                if isinstance(validate_dataloader, dict):
+                    for name, dataloader in validate_dataloader.items():
+                        pbar = tqdm(dataloader, total=len(dataloader)//dataloader.batch_size)
+                        for batch in pbar:
+                            from .spec import _get_item, _to_jittor
+
+                            batch = _to_jittor(batch)
+                            self.on_validation_batch_start()
+                            loss = self.validation_step(batch)
+                            self.record_validation_scores(self.validation_metric_step(batch))
+                            pbar.set_description(f"Epoch {epoch}, Validate {name}, Loss: {_get_item(loss)}")
+                            self.on_validation_batch_end()
+                else:
+                    pbar = tqdm(validate_dataloader, total=len(validate_dataloader)//validate_dataloader.batch_size)
+                    for batch in pbar:
+                        from .spec import _get_item, _to_jittor
+
+                        batch = _to_jittor(batch)
+                        self.on_validation_batch_start()
+                        loss = self.validation_step(batch)
+                        self.record_validation_scores(self.validation_metric_step(batch))
+                        pbar.set_description(f"Epoch {epoch}, Validate, Loss: {_get_item(loss)}")
+                        self.on_validation_batch_end()
+                self.on_validation_epoch_end()
+                validation_loss = self.get_validation_loss_sum()
+                score_summary = self.get_validation_score_summary()
+                self.log_validation_epoch(epoch, validation_loss, score_summary)
+                self.save_best_checkpoint(epoch, validation_loss, score_summary)
+            else:
+                self.save_best_train_checkpoint(epoch, train_loss)
+            self.log_epoch_metrics(epoch, train_loss, validation_loss, score_summary)
+            self.step_scheduler(epoch, train_loss, validation_loss, score_summary)
+
+            checkpoint_path = os.path.join(self.ckpt_save_dir, f"{self.ckpt_save_name}_{epoch}.pkl")
+            os.makedirs(self.ckpt_save_dir, exist_ok=True)
+            self.model.save(checkpoint_path)
+        self._set_global_requires_grad(True)
+        self.on_train_end()

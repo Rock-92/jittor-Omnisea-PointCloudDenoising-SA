@@ -28,15 +28,20 @@ class VelocityModule(ModelSpec):
         self.feat_embedding_dim = cfg['feat_embedding_dim']
         self.attention_blocks = cfg.get('attention_blocks', 4)
         self.attention_weight_init = cfg.get('attention_weight_init', 1.0)
+        self.relative_position_bias_hidden_dim = cfg.get(
+            'relative_position_bias_hidden_dim',
+            32,
+        )
         self.attention_ffn_hidden_dim = cfg.get(
             'attention_ffn_hidden_dim',
             self.feat_embedding_dim * 2,
         )
-        self.geometry_token_knn = cfg.get('geometry_token_knn', 32)
-        self.geometry_token_hidden_dim = cfg.get('geometry_token_hidden_dim', 64)
-        self.bridge_hidden_dim = cfg.get('bridge_hidden_dim', 64)
-        self.use_geometry_tokens = cfg.get('use_geometry_tokens', False)
-        self.use_bridge_condition = cfg.get('use_bridge_condition', False)
+        self.global_token_blocks = cfg.get('global_token_blocks', 4)
+        self.global_token_ffn_hidden_dim = cfg.get(
+            'global_token_ffn_hidden_dim',
+            self.feat_embedding_dim * 2,
+        )
+        self.global_attn_bias_init = cfg.get('global_attn_bias_init', 0.0)
         self.decoder_hidden_dims = cfg.get(
             'decoder_hidden_dims',
             [cfg.get('decoder_hidden_dim', 64)],
@@ -45,16 +50,12 @@ class VelocityModule(ModelSpec):
         # patch-based prediction
         self.predict_rounds = cfg.get('predict_rounds', 1)
         self.denoise_num_steps = cfg.get('denoise_num_steps', 1)
-        self.score_sigma_min = cfg.get('score_sigma_min', 0.005)
-        self.score_sigma_max = cfg.get('score_sigma_max', 0.020)
-        self.score_step_scale = cfg.get('score_step_scale', 1.0)
-        self.score_sde_noise = cfg.get('score_sde_noise', 0.0)
         self.predict_patch_size = cfg.get('predict_patch_size', 1000)
         self.predict_seed_k = cfg.get('predict_seed_k', 6)
         self.predict_seed_interval = cfg.get('predict_seed_interval', 200)
         self.predict_seed_k_alpha = cfg.get('predict_seed_k_alpha', 1)
         
-        # displacement denoising
+        # score-matching
         self.dsm_sigma = cfg['dsm_sigma']
         self.num_train_points = cfg.get('num_train_points', 0)
         
@@ -66,12 +67,11 @@ class VelocityModule(ModelSpec):
             embedding_dim=self.feat_embedding_dim,
             num_blocks=self.attention_blocks,
             attention_weight_init=self.attention_weight_init,
+            relative_position_bias_hidden_dim=self.relative_position_bias_hidden_dim,
             ffn_hidden_dim=self.attention_ffn_hidden_dim,
-            geometry_token_knn=self.geometry_token_knn,
-            geometry_token_hidden_dim=self.geometry_token_hidden_dim,
-            bridge_hidden_dim=self.bridge_hidden_dim,
-            use_geometry_tokens=self.use_geometry_tokens,
-            use_bridge_condition=self.use_bridge_condition,
+            global_token_blocks=self.global_token_blocks,
+            global_token_ffn_hidden_dim=self.global_token_ffn_hidden_dim,
+            global_attn_bias_init=self.global_attn_bias_init,
         )
         
         self.decoder = Decoder(
@@ -80,16 +80,14 @@ class VelocityModule(ModelSpec):
             hidden_dims=self.decoder_hidden_dims,
         )
     
-    def predict_displacement(self, pc_noisy, bridge_t=None, point_idx=None):
+    def predict_displacement(self, pc_noisy, point_idx=None):
         """
         pc_noisy: (B, N, 3)
         point_idx: optional point indices decoded after full-patch encoding
         return:   (B, N, 3) or (B, M, 3)
         """
         B, N, d = pc_noisy.shape
-        if not self.use_bridge_condition:
-            bridge_t = None
-        feat = self.encoder(pc_noisy, bridge_t=bridge_t)
+        feat = self.encoder(pc_noisy)  # (B, N, 256)
         if point_idx is not None:
             feat = feat[:, point_idx, :]
         N_out = feat.shape[1]
@@ -125,34 +123,23 @@ class VelocityModule(ModelSpec):
         plane_dist = (((pc_pred - p0) * normal).sum(dim=-1) ** 2.0)
         return (plane_dist / self.dsm_sigma).mean()
 
-    def get_supervised_losses(
-        self,
-        pc_noisy,
-        pc_clean,
-        score_sigma=None,
-    ):
+    def get_supervised_losses(self, pc_noisy, pc_clean):
         """
         pc_noisy: (B, N, 3)
         pc_clean: (B, N, 3)
         """
-        point_idx = get_random_indices(pc_noisy.shape[1], self.num_train_points)
-        feat = self.encoder(pc_noisy)
         target = pc_clean - pc_noisy
+        point_idx = get_random_indices(pc_noisy.shape[1], self.num_train_points)
         pc_noisy_for_loss = pc_noisy
         pc_clean_for_loss = pc_clean
         if point_idx is not None:
             target = target[:, point_idx, :]
             pc_noisy_for_loss = pc_noisy[:, point_idx, :]
             pc_clean_for_loss = pc_clean[:, point_idx, :]
-        if point_idx is not None:
-            feat_for_loss = feat[:, point_idx, :]
-        else:
-            feat_for_loss = feat
-        B, N_out, F_dim = feat_for_loss.shape
-        displacement_pred = self.decoder(feat_for_loss.reshape(-1, F_dim)).reshape(B, N_out, 3)
-        displacement_loss = (((displacement_pred - target) ** 2.0) / self.dsm_sigma).sum(dim=-1).mean()
+        pred_dir = self.predict_displacement(pc_noisy, point_idx=point_idx)
+        displacement_loss = (((pred_dir - target) ** 2.0) / self.dsm_sigma).sum(dim=-1).mean()
         normalized_surface_loss = self.get_normalized_surface_loss(
-            pc_pred=pc_noisy_for_loss + displacement_pred,
+            pc_pred=pc_noisy_for_loss + pred_dir,
             pc_clean=pc_clean,
             pc_anchor=pc_clean_for_loss,
         )
@@ -170,25 +157,18 @@ class VelocityModule(ModelSpec):
             num_steps = self.denoise_num_steps
         with jt.no_grad():
             pcl_next = pcl_noisy.clone()
-            num_steps = max(1, int(num_steps))
             for it in range(num_steps):
-                displacement_pred = self.predict_displacement(pcl_next)
-                pcl_next = pcl_next + self.score_step_scale * displacement_pred
-                if self.score_sde_noise > 0 and it < num_steps - 1:
-                    pcl_next = pcl_next + self.score_sde_noise * jt.randn(pcl_next.shape)
+                pred_dir = self.predict_displacement(pcl_next)
+                pcl_next = pcl_next + (1.0 / num_steps) * pred_dir
         return pcl_next, None
     
     def training_step(self, batch: Dict) -> Dict:
         patch_size = batch['pc_noisy'].shape[-2]
         pc_noisy = batch['pc_noisy'].reshape(-1, patch_size, 3)
         pc_clean = batch['pc_clean'].reshape(-1, patch_size, 3)
-        score_sigma = batch.get('score_sigma')
-        if score_sigma is not None:
-            score_sigma = score_sigma.reshape(-1, 1)
         losses = self.get_supervised_losses(
             pc_noisy=pc_noisy,
             pc_clean=pc_clean,
-            score_sigma=score_sigma,
         )
         return losses
     
@@ -225,8 +205,6 @@ class VelocityModule(ModelSpec):
                     "pc_noisy": b.meta['pc_noisy'], # (num_patches, patch_size, 3)
                     "pc_clean": b.meta['pc_clean'],
                 }
-                if 'score_sigma' in b.meta:
-                    item["score_sigma"] = b.meta['score_sigma']
                 if 'patch_seed' in b.meta:
                     item["patch_seed"] = b.meta['patch_seed']
                 res.append(item)
@@ -306,18 +284,40 @@ def patch_based_denoise(
     """
     assert len(pcl_noisy.shape) == 2
     
-    N, d = pcl_noisy.shape
-    num_patches = int(seed_k * N / patch_size)
+    N, _ = pcl_noisy.shape
+    patch_size = min(int(patch_size), N)
+    num_patches = min(N, max(1, int(seed_k * N / patch_size)))
     pcl_noisy = pcl_noisy.unsqueeze(0)  # (1, N, 3)
     
     seed_pnts, seed_idx = farthest_point_sampling(pcl_noisy, num_patches)
     patch_dists, point_idxs, patches = knn_points(seed_pnts, pcl_noisy, patch_size)
-
+    
+    covered = np.zeros((N,), dtype=np.bool_)
+    covered[point_idxs[0].numpy().reshape(-1)] = True
+    missing_idx = np.flatnonzero(~covered).astype(np.int32)
+    if missing_idx.size > 0:
+        extra_seed_idx = jt.array(missing_idx).int32()
+        extra_seed_pnts = pcl_noisy[:, extra_seed_idx, :]
+        extra_patch_dists, extra_point_idxs, extra_patches = knn_points(
+            extra_seed_pnts,
+            pcl_noisy,
+            patch_size,
+        )
+        seed_pnts = jt.concat([seed_pnts, extra_seed_pnts], dim=1)
+        patch_dists = jt.concat([patch_dists, extra_patch_dists], dim=1)
+        point_idxs = jt.concat([point_idxs, extra_point_idxs], dim=1)
+        patches = jt.concat([patches, extra_patches], dim=1)
+        num_patches += missing_idx.size
+        print(
+            f"Patch coverage: added {missing_idx.size} extra seed patches "
+            "for points missed by FPS seeds."
+        )
+    
     patches = patches[0]              # (P, M, 3)
     patch_dists = patch_dists[0]      # (P, M)
     point_idxs = point_idxs[0]        # (P, M)
     
-    seed_expand = seed_pnts.squeeze().unsqueeze(1).broadcast(patches.shape)
+    seed_expand = seed_pnts[0].unsqueeze(1).broadcast(patches.shape)
     patches = patches - seed_expand
     
     patch_dists = patch_dists / (patch_dists[:, -1:].broadcast(patch_dists.shape) + 1e-8)
@@ -347,9 +347,22 @@ def patch_based_denoise(
     patches_denoised = jt.concat(patches_denoised, dim=0)
     patches_denoised = patches_denoised + seed_expand
     pcl_out = []
+    pcl_noisy_flat = pcl_noisy[0]
+    missing_count = 0
     for pidx in range(N):
         patch_id = best_weights_idx[pidx].item()
         mask = (point_idxs[patch_id] == pidx)
-        pcl_out.append(patches_denoised[patch_id][mask])
+        selected = patches_denoised[patch_id][mask]
+        if selected.shape[0] == 0:
+            missing_count += 1
+            selected = pcl_noisy_flat[pidx:pidx+1]
+        else:
+            selected = selected[:1]
+        pcl_out.append(selected)
     pcl_out = jt.concat(pcl_out, dim=0)
+    if missing_count > 0:
+        print(
+            f"Patch fusion warning: {missing_count}/{N} points were not covered "
+            "by any denoised patch; kept their noisy coordinates."
+        )
     return pcl_out

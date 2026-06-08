@@ -3,7 +3,6 @@ from typing import List
 from jittor import nn
 
 import jittor as jt
-import numpy as np
 
 
 def get_knn_idx(x, y, k, offset=0):
@@ -33,53 +32,6 @@ def gather_neighbors(x, idx):
     return jt.stack(neighbors, dim=0)
 
 
-def gather_points(x, idx):
-    """
-    x:   (B, N, C)
-    idx: (B, M)
-    return: (B, M, C)
-    """
-    gathered: List[jt.Var] = []
-    for b in range(x.shape[0]):
-        gathered.append(x[b][idx[b]])
-    return jt.stack(gathered, dim=0)
-
-
-def farthest_point_sampling_idx(xyz, num_points):
-    """
-    xyz: (B, N, 3)
-    return: (B, num_points)
-    """
-    B, N, _ = xyz.shape
-    num_points = min(int(num_points), N)
-    indices = []
-    for b in range(B):
-        pts = xyz[b]
-        selected = []
-        dist = jt.ones((N,)) * 1e10
-        farthest = 0
-        for _ in range(num_points):
-            selected.append(farthest)
-            centroid = pts[farthest]
-            d = ((pts - centroid) ** 2).sum(dim=1)
-            dist = jt.minimum(dist, d)
-            farthest, _ = jt.argmax(dist, dim=-1)
-            farthest = farthest.item()
-        indices.append(jt.array(selected).int32()[None, :])
-    return jt.concat(indices, dim=0)
-
-
-def nearest_center_idx(xyz, centers):
-    """
-    xyz:     (B, N, 3)
-    centers: (B, M, 3)
-    return:  (B, N)
-    """
-    dist = ((xyz.unsqueeze(2) - centers.unsqueeze(1)) ** 2).sum(dim=-1)
-    _, idx = jt.argmin(dist, dim=-1)
-    return idx.int32()
-
-
 def apply_point_linear(linear, x):
     B, N, _ = x.shape
     out = linear(x.reshape(B * N, -1))
@@ -107,12 +59,106 @@ class PointLayerNorm(nn.Module):
         return x * self.weight.reshape(1, 1, self.dim) + self.bias.reshape(1, 1, self.dim)
 
 
+class RelativePositionBias(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.lin_1 = nn.Linear(4, hidden_dim)
+        self.lin_2 = nn.Linear(hidden_dim, 1)
+        self.act = nn.ReLU()
+
+    def execute(self, rel_pos):
+        """
+        rel_pos: (B, N, K, 3), neighbor_xyz - center_xyz
+        return:  (B, N, K), scalar attention bias for each local edge.
+        """
+        B, N, K, _ = rel_pos.shape
+        dist = jt.sqrt((rel_pos ** 2).sum(dim=-1, keepdims=True) + 1e-8)
+        rel_feat = jt.concat([rel_pos, dist], dim=-1)
+        bias = apply_edge_linear(self.lin_1, rel_feat)
+        bias = self.act(bias)
+        bias = apply_edge_linear(self.lin_2, bias)
+        return bias.reshape(B, N, K)
+
+
+class TokenSelfAttentionBlock(nn.Module):
+    def __init__(self, dim, ffn_hidden_dim=None):
+        super().__init__()
+        self.dim = dim
+        self.scale = dim ** -0.5
+        if ffn_hidden_dim is None:
+            ffn_hidden_dim = dim * 2
+        self.ffn_hidden_dim = int(ffn_hidden_dim)
+
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+        self.attn_norm = PointLayerNorm(dim)
+
+        self.ffn_lin_1 = nn.Linear(dim, self.ffn_hidden_dim)
+        self.ffn_lin_2 = nn.Linear(self.ffn_hidden_dim, dim)
+        self.ffn_norm = PointLayerNorm(dim)
+        self.act = nn.ReLU()
+
+    def execute(self, x):
+        """
+        x: (B, N, C), including the leading global token.
+        """
+        q = apply_point_linear(self.q_proj, x)
+        k = apply_point_linear(self.k_proj, x)
+        v = apply_point_linear(self.v_proj, x)
+        attn_logits = (q.unsqueeze(2) * k.unsqueeze(1)).sum(dim=-1) * self.scale
+        attn = nn.softmax(attn_logits, dim=-1)
+        out = (attn.unsqueeze(-1) * v.unsqueeze(1)).sum(dim=2)
+        out = apply_point_linear(self.out_proj, out)
+        x = self.attn_norm(x + out)
+
+        ffn = apply_point_linear(self.ffn_lin_1, x)
+        ffn = self.act(ffn)
+        ffn = apply_point_linear(self.ffn_lin_2, ffn)
+        return self.ffn_norm(x + ffn)
+
+
+class GlobalTokenGenerator(nn.Module):
+    def __init__(self, dim, num_blocks=4, ffn_hidden_dim=None):
+        super().__init__()
+        self.dim = dim
+        self.num_blocks = int(num_blocks)
+        if ffn_hidden_dim is None:
+            ffn_hidden_dim = dim * 2
+        self.ffn_hidden_dim = int(ffn_hidden_dim)
+        self.global_token = jt.randn((1, 1, dim)) * 0.02
+
+        self.blocks = []
+        for i in range(self.num_blocks):
+            block = TokenSelfAttentionBlock(
+                dim=dim,
+                ffn_hidden_dim=self.ffn_hidden_dim,
+            )
+            setattr(self, f"block_{i}", block)
+            self.blocks.append(block)
+
+    def execute(self, point_feat):
+        """
+        point_feat: (B, N, C)
+        return:     (B, 1, C), generated global token.
+        """
+        B, _, C = point_feat.shape
+        global_token = self.global_token.broadcast((B, 1, C))
+        tokens = jt.concat([global_token, point_feat], dim=1)
+        for block in self.blocks:
+            tokens = block(tokens)
+        return tokens[:, :1, :]
+
+
 class MultiScaleLocalSelfAttentionBlock(nn.Module):
     def __init__(
         self,
         dim,
         knn_scales,
+        relative_position_bias_hidden_dim,
         ffn_hidden_dim=None,
+        global_attn_bias_init=0.0,
     ):
         super().__init__()
         self.dim = dim
@@ -126,200 +172,67 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
         self.q_proj = nn.Linear(dim, dim)
         self.k_proj = nn.Linear(dim, dim)
         self.v_proj = nn.Linear(dim, dim)
+        self.rel_pos_bias = RelativePositionBias(relative_position_bias_hidden_dim)
         self.out_proj = nn.Linear(dim * len(knn_scales), dim)
         self.global_norm = PointLayerNorm(dim)
-        self.scale_gate_proj = nn.Linear(dim, len(self.knn_scales))
-        self.temperature_proj = nn.Linear(dim, len(self.knn_scales))
-        self.bridge_proj = nn.Linear(dim, 2 * dim)
-        self._zero_linear(self.scale_gate_proj)
-        self._zero_linear(self.temperature_proj)
-        self._zero_linear(self.bridge_proj)
+        self.global_k_proj = nn.Linear(dim, dim)
+        self.global_v_proj = nn.Linear(dim, dim)
+        self.global_attn_bias = jt.ones((1,)) * float(global_attn_bias_init)
 
         self.ffn_norm = PointLayerNorm(dim)
         self.ffn_lin_1 = nn.Linear(dim, self.ffn_hidden_dim)
         self.ffn_lin_2 = nn.Linear(self.ffn_hidden_dim, dim)
         self.act = nn.ReLU()
 
-    def _zero_linear(self, linear):
-        linear.weight.update(jt.zeros(linear.weight.shape))
-        if linear.bias is not None:
-            linear.bias.update(jt.zeros(linear.bias.shape))
-
-    def get_gate_embedding(self, condition_feat):
-        local_norm = self.global_norm(condition_feat)
-        scale_gate = nn.softmax(
-            apply_point_linear(self.scale_gate_proj, local_norm),
-            dim=-1,
-        ) * len(self.knn_scales)
-        temperature = jt.exp(0.25 * jt.tanh(
-            apply_point_linear(self.temperature_proj, local_norm)
-        ))
-        return jt.concat([scale_gate, temperature], dim=-1)
-
-    def _apply_bridge_modulation(self, x, bridge_feat):
-        if bridge_feat is None:
-            return x
-        bridge_params = self.bridge_proj(bridge_feat)
-        scale = bridge_params[:, :self.dim].reshape(bridge_feat.shape[0], 1, self.dim)
-        shift = bridge_params[:, self.dim:].reshape(bridge_feat.shape[0], 1, self.dim)
-        return x * (1.0 + scale) + shift
-
-    def execute(self, x, graph_knn_idx, condition_feat=None, bridge_feat=None):
+    def execute(self, x, xyz, graph_knn_idx, global_token=None):
         """
         x:       (B, N, C), point features.
+        xyz:     (B, N, 3), noisy point coordinates for relative position bias.
         graph_knn_idx: (B, N, max(knn_scales)), neighbor indices used for
-            attention neighbors.
-        condition_feat: optional (B, N, C), point-wise geometry tokens
-            used to modulate multi-scale attention.
+            attention neighbors and relative-position bias.
         """
         x_norm = self.attn_norm(x)
-        x_norm = self._apply_bridge_modulation(x_norm, bridge_feat)
         q = apply_point_linear(self.q_proj, x_norm)
         k = apply_point_linear(self.k_proj, x_norm)
         v = apply_point_linear(self.v_proj, x_norm)
-        B, N, _ = x.shape
-        if condition_feat is not None:
-            gate_embedding = self.get_gate_embedding(condition_feat)
-            num_scales = len(self.knn_scales)
-            scale_gate = gate_embedding[:, :, :num_scales]
-            temperature = gate_embedding[:, :, num_scales:]
+        if global_token is not None:
+            B, N, _ = x.shape
+            global_norm = self.global_norm(global_token)
+            k_global = apply_point_linear(self.global_k_proj, global_norm)
+            v_global = apply_point_linear(self.global_v_proj, global_norm)
 
         scale_outputs = []
-        for scale_idx, scale_k in enumerate(self.knn_scales):
+        for scale_k in self.knn_scales:
             idx = graph_knn_idx[:, :, :scale_k]
             k_neighbors = gather_neighbors(k, idx)
             v_neighbors = gather_neighbors(v, idx)
+            xyz_neighbors = gather_neighbors(xyz, idx)
+            rel_pos = xyz_neighbors - xyz.unsqueeze(2)
 
-            dot_logits = (q.unsqueeze(2) * k_neighbors).sum(dim=-1) * self.scale
-            if condition_feat is not None:
-                dot_logits = dot_logits / temperature[:, :, scale_idx].reshape(B, N, 1)
-            attn_logits = dot_logits
+            attn_logits = (q.unsqueeze(2) * k_neighbors).sum(dim=-1) * self.scale
+            attn_logits = attn_logits + self.rel_pos_bias(rel_pos)
+            v_all = v_neighbors
+            if global_token is not None:
+                k_global_scale = k_global.unsqueeze(1).broadcast((B, N, 1, self.dim))
+                v_global_scale = v_global.unsqueeze(1).broadcast((B, N, 1, self.dim))
+                global_logits = (
+                    (q.unsqueeze(2) * k_global_scale).sum(dim=-1) * self.scale
+                    + self.global_attn_bias.reshape(1, 1, 1).broadcast((B, N, 1))
+                )
+                attn_logits = jt.concat([attn_logits, global_logits], dim=2)
+                v_all = jt.concat([v_neighbors, v_global_scale], dim=2)
             attn = nn.softmax(attn_logits, dim=-1)
-            scale_out = (attn.unsqueeze(-1) * v_neighbors).sum(dim=2)
-            if condition_feat is not None:
-                scale_out = scale_out * scale_gate[:, :, scale_idx].reshape(B, N, 1)
-            scale_outputs.append(scale_out)
+            scale_outputs.append((attn.unsqueeze(-1) * v_all).sum(dim=2))
 
         out = jt.concat(scale_outputs, dim=-1)
         out = apply_point_linear(self.out_proj, out)
         x = x + out
 
         ffn = self.ffn_norm(x)
-        ffn = self._apply_bridge_modulation(ffn, bridge_feat)
         ffn = apply_point_linear(self.ffn_lin_1, ffn)
         ffn = self.act(ffn)
         ffn = apply_point_linear(self.ffn_lin_2, ffn)
         return x + ffn
-
-
-class BridgeTimeEncoder(nn.Module):
-    def __init__(self, out_dim, hidden_dim=64):
-        super().__init__()
-        self.out_dim = int(out_dim)
-        self.hidden_dim = int(hidden_dim)
-        self.lin_1 = nn.Linear(6, self.hidden_dim)
-        self.lin_2 = nn.Linear(self.hidden_dim, self.out_dim)
-        self.act = nn.ReLU()
-
-    def execute(self, t):
-        """
-        t: (B,), (B, 1), or (B, 1, 1). t=0 is clean, t=1 is noisy.
-        return: bridge condition vector (B, C)
-        """
-        if len(t.shape) == 3:
-            t = t.reshape(t.shape[0], -1)[:, :1]
-        elif len(t.shape) == 1:
-            t = t.reshape(-1, 1)
-        else:
-            t = t[:, :1]
-        one_minus_t = 1.0 - t
-        bridge_sigma = jt.sqrt(jt.maximum(t * one_minus_t, 0.0) + 1e-8)
-        feat = jt.concat(
-            [
-                t,
-                one_minus_t,
-                t * one_minus_t,
-                bridge_sigma,
-                jt.sin(np.pi * t),
-                jt.cos(np.pi * t),
-            ],
-            dim=-1,
-        )
-        feat = self.lin_1(feat)
-        feat = self.act(feat)
-        return self.lin_2(feat)
-
-
-class GeometryTokenEncoder(nn.Module):
-    def __init__(self, out_dim, hidden_dim=64, knn=32):
-        super().__init__()
-        self.out_dim = int(out_dim)
-        self.hidden_dim = int(hidden_dim)
-        self.knn = int(knn)
-        self.lin_1 = nn.Linear(8, self.hidden_dim)
-        self.lin_2 = nn.Linear(self.hidden_dim, self.out_dim)
-        self.norm = PointLayerNorm(self.out_dim)
-        self.act = nn.ReLU()
-
-    def _pointwise_geometry(self, xyz):
-        k = min(max(3, self.knn), xyz.shape[1] - 1)
-        knn_idx = get_knn_idx(xyz, xyz, k, offset=1)
-        xyz_neighbors = gather_neighbors(xyz, knn_idx)
-        xyz_rel = xyz_neighbors - xyz.unsqueeze(2)
-        centered = xyz_rel - xyz_rel.mean(dim=2, keepdims=True)
-        cov = centered.transpose(2, 3) @ centered
-        cov = cov / float(max(k - 1, 1))
-        eigvals, eigvecs = jt.linalg.eigh(cov)
-        eigvals = jt.maximum(eigvals, 0.0)
-
-        l0 = eigvals[:, :, 0]
-        l1 = eigvals[:, :, 1]
-        l2 = eigvals[:, :, 2]
-        eig_sum = l0 + l1 + l2 + 1e-8
-        curvature = l0 / eig_sum
-        linearity = (l2 - l1) / (l2 + 1e-8)
-        planarity = (l1 - l0) / (l2 + 1e-8)
-        scattering = l0 / (l2 + 1e-8)
-
-        normals = eigvecs[:, :, :, 0]
-        normal_neighbors = gather_neighbors(normals, knn_idx)
-        normal_dot = jt.abs((normal_neighbors * normals.unsqueeze(2)).sum(dim=-1))
-        normal_variation = 1.0 - normal_dot.mean(dim=2)
-
-        radius = jt.sqrt((xyz_rel ** 2.0).sum(dim=-1) + 1e-8)
-        radius_mean = radius.mean(dim=2)
-        radius_var = ((radius - radius_mean.unsqueeze(-1)) ** 2.0).mean(dim=2)
-        radius_std = jt.sqrt(radius_var + 1e-8)
-        radius_max = radius.max(dim=2)
-        patch_radius = jt.sqrt((xyz ** 2.0).sum(dim=-1) + 1e-8).max(dim=1).reshape(-1, 1)
-        radius_mean = radius_mean / (patch_radius + 1e-8)
-        radius_std = radius_std / (patch_radius + 1e-8)
-        radius_max = radius_max / (patch_radius + 1e-8)
-
-        return jt.stack(
-            [
-                curvature,
-                linearity,
-                planarity,
-                scattering,
-                normal_variation,
-                radius_mean,
-                radius_std,
-                radius_max,
-            ],
-            dim=-1,
-        )
-
-    def execute(self, feat, xyz):
-        """
-        xyz:  (B, N, 3), noisy patch coordinates.
-        return point-wise geometry modulation tokens: (B, N, C)
-        """
-        geom = self._pointwise_geometry(xyz)
-        token = apply_point_linear(self.lin_1, geom)
-        token = self.act(token)
-        token = apply_point_linear(self.lin_2, token)
-        return self.norm(token)
 
 
 class FeatureExtraction(nn.Module):
@@ -332,12 +245,11 @@ class FeatureExtraction(nn.Module):
         num_blocks=4,
         attention_weight_init=1.0,
         knn_scales=None,
+        relative_position_bias_hidden_dim=32,
         ffn_hidden_dim=None,
-        geometry_token_knn=32,
-        geometry_token_hidden_dim=64,
-        bridge_hidden_dim=64,
-        use_geometry_tokens=True,
-        use_bridge_condition=True,
+        global_token_blocks=4,
+        global_token_ffn_hidden_dim=None,
+        global_attn_bias_init=0.0,
     ):
         super().__init__()
 
@@ -354,23 +266,19 @@ class FeatureExtraction(nn.Module):
         if ffn_hidden_dim is None:
             ffn_hidden_dim = embedding_dim * 2
         self.ffn_hidden_dim = int(ffn_hidden_dim)
-        self.geometry_token_knn = int(geometry_token_knn)
-        self.geometry_token_hidden_dim = int(geometry_token_hidden_dim)
-        self.bridge_hidden_dim = int(bridge_hidden_dim)
-        self.use_geometry_tokens = bool(use_geometry_tokens)
-        self.use_bridge_condition = bool(use_bridge_condition)
+        if global_token_ffn_hidden_dim is None:
+            global_token_ffn_hidden_dim = embedding_dim * 2
+        self.global_token_blocks = int(global_token_blocks)
+        self.global_token_ffn_hidden_dim = int(global_token_ffn_hidden_dim)
+        self.global_attn_bias_init = float(global_attn_bias_init)
 
         self.input_proj_1 = nn.Linear(input_dim, input_expand_dim)
         self.input_proj_2 = nn.Linear(input_expand_dim, embedding_dim)
         self.act = nn.ReLU()
-        self.geometry_token_encoder = GeometryTokenEncoder(
-            out_dim=embedding_dim,
-            hidden_dim=self.geometry_token_hidden_dim,
-            knn=self.geometry_token_knn,
-        )
-        self.bridge_time_encoder = BridgeTimeEncoder(
-            out_dim=embedding_dim,
-            hidden_dim=self.bridge_hidden_dim,
+        self.global_token_generator = GlobalTokenGenerator(
+            dim=embedding_dim,
+            num_blocks=self.global_token_blocks,
+            ffn_hidden_dim=self.global_token_ffn_hidden_dim,
         )
 
         if isinstance(attention_weight_init, (list, tuple)):
@@ -387,7 +295,9 @@ class FeatureExtraction(nn.Module):
             block = MultiScaleLocalSelfAttentionBlock(
                 dim=embedding_dim,
                 knn_scales=self.knn_scales,
+                relative_position_bias_hidden_dim=relative_position_bias_hidden_dim,
                 ffn_hidden_dim=self.ffn_hidden_dim,
+                global_attn_bias_init=self.global_attn_bias_init,
             )
             weight = jt.ones((1,)) * float(block_weight_values[i])
             setattr(self, f"block_{i}", block)
@@ -395,48 +305,37 @@ class FeatureExtraction(nn.Module):
             self.blocks.append(block)
             self.block_weights.append(weight)
 
-    def get_gate_embedding(self, condition_feat):
-        gate_parts = []
-        for block in self.blocks:
-            gate_parts.append(block.get_gate_embedding(condition_feat))
-        return jt.concat(gate_parts, dim=-1)
+        self.fuse = nn.Linear(embedding_dim * num_blocks, embedding_dim)
 
-    def execute(self, x, bridge_t=None, return_condition=False):
+    def execute(self, x):
         """
         x: (B, N, 3)
         return: (B, N, 256)
         """
+        graph_knn_idx = get_knn_idx(x, x, self.max_knn, offset=1)
+        reuse_knn_idx = None
+
         feat = apply_point_linear(self.input_proj_1, x)
         feat = self.act(feat)
         feat = apply_point_linear(self.input_proj_2, feat)
         feat = self.act(feat)
-        geometry_feat = None
-        condition_feat = None
-        gate_embedding = None
-        if self.use_geometry_tokens or return_condition:
-            geometry_feat = self.geometry_token_encoder._pointwise_geometry(x)
-        if self.use_geometry_tokens:
-            condition_feat = self.geometry_token_encoder(feat, x)
-            gate_embedding = self.get_gate_embedding(condition_feat)
-        bridge_feat = None
-        if self.use_bridge_condition and bridge_t is not None:
-            bridge_feat = self.bridge_time_encoder(bridge_t)
+        global_token = self.global_token_generator(feat)
 
-        for block_idx, block in enumerate(self.blocks):
+        block_outputs = []
+        for block_idx, (block, weight) in enumerate(zip(self.blocks, self.block_weights)):
             if block_idx == 0:
-                block_knn_idx = get_knn_idx(x, x, self.max_knn, offset=1)
+                block_knn_idx = graph_knn_idx
+            elif block_idx == 1:
+                reuse_knn_idx = get_knn_idx(feat, feat, self.max_knn, offset=1)
+                block_knn_idx = reuse_knn_idx
             else:
-                block_knn_idx = get_knn_idx(feat, feat, self.max_knn, offset=1)
-            feat = block(
-                feat,
-                block_knn_idx,
-                condition_feat=condition_feat,
-                bridge_feat=bridge_feat,
-            )
+                block_knn_idx = reuse_knn_idx
+            feat = block(feat, x, block_knn_idx, global_token=global_token)
+            block_outputs.append(feat * weight)
 
-        if return_condition:
-            return feat, geometry_feat, gate_embedding
-        return feat
+        feat = jt.concat(block_outputs, dim=-1)
+        return apply_point_linear(self.fuse, feat)
+
 
 class Decoder(nn.Module):
     def __init__(self, z_dim, out_dim, hidden_dims):

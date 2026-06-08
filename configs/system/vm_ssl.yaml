@@ -1,0 +1,7 @@
+__target__: vm_ssl
+
+ckpt_save_dir: outputs/checkpoints/vm_ssl
+ckpt_save_name: checkpoint
+ssl_pretrained_ckpt: outputs/checkpoints/global_token_ssl/checkpoint_best.pkl
+freeze_global_epochs: 8
+global_lr_scale: 0.2
