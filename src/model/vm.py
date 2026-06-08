@@ -44,7 +44,6 @@ class VelocityModule(ModelSpec):
         self.predict_rounds = cfg.get('predict_rounds', 1)
         self.denoise_num_steps = cfg.get('denoise_num_steps', 4)
         self.bridge_sde_noise = cfg.get('bridge_sde_noise', 0.0)
-        self.bridge_sigma_min = cfg.get('bridge_sigma_min', 1e-3)
         self.predict_patch_size = cfg.get('predict_patch_size', 1000)
         self.predict_seed_k = cfg.get('predict_seed_k', 6)
         self.predict_seed_interval = cfg.get('predict_seed_interval', 200)
@@ -128,16 +127,12 @@ class VelocityModule(ModelSpec):
         gate_dist = gate_dist / (gate_mean + 1e-8)
         return ((gate_dist - geom_dist) ** 2.0).mean()
 
-    def bridge_sigma(self, bridge_t):
-        return jt.maximum(bridge_t, self.bridge_sigma_min)
-
     def get_supervised_losses(
         self,
         pc_noisy,
         pc_clean,
         pc_bridge=None,
         bridge_t=None,
-        bridge_sigma=None,
     ):
         """
         pc_noisy: (B, N, 3)
@@ -147,16 +142,13 @@ class VelocityModule(ModelSpec):
             pc_bridge = pc_noisy
         if bridge_t is None:
             bridge_t = jt.ones((pc_noisy.shape[0], 1))
-        if bridge_sigma is None:
-            bridge_sigma = self.bridge_sigma(bridge_t)
         point_idx = get_random_indices(pc_noisy.shape[1], self.num_train_points)
         feat, geometry_feat, gate_embedding = self.encoder(
             pc_bridge,
             bridge_t=bridge_t,
             return_condition=True,
         )
-        sigma_view = bridge_sigma.reshape(bridge_sigma.shape[0], 1, 1)
-        target = (pc_bridge - pc_clean) / (sigma_view + 1e-8)
+        target = pc_noisy - pc_clean
         pc_bridge_for_loss = pc_bridge
         pc_clean_for_loss = pc_clean
         if point_idx is not None:
@@ -170,11 +162,11 @@ class VelocityModule(ModelSpec):
         else:
             feat_for_loss = feat
         B, N_out, F_dim = feat_for_loss.shape
-        eps_pred = self.decoder(feat_for_loss.reshape(-1, F_dim)).reshape(B, N_out, 3)
-        displacement_loss = (((eps_pred - target) ** 2.0) / self.dsm_sigma).sum(dim=-1).mean()
-        sigma_for_loss = bridge_sigma.reshape(bridge_sigma.shape[0], 1, 1)
+        velocity_pred = self.decoder(feat_for_loss.reshape(-1, F_dim)).reshape(B, N_out, 3)
+        displacement_loss = (((velocity_pred - target) ** 2.0) / self.dsm_sigma).sum(dim=-1).mean()
+        t_for_loss = bridge_t.reshape(bridge_t.shape[0], 1, 1)
         normalized_surface_loss = self.get_normalized_surface_loss(
-            pc_pred=pc_bridge_for_loss - sigma_for_loss * eps_pred,
+            pc_pred=pc_bridge_for_loss - t_for_loss * velocity_pred,
             pc_clean=pc_clean,
             pc_anchor=pc_clean_for_loss,
         )
@@ -201,13 +193,9 @@ class VelocityModule(ModelSpec):
             dt = 1.0 / num_steps
             for it in range(num_steps):
                 t_value = 1.0 - it * dt
-                t_next = max(1.0 - (it + 1) * dt, 0.0)
                 bridge_t = jt.ones((pcl_next.shape[0], 1)) * t_value
-                eps_pred = self.predict_displacement(pcl_next, bridge_t=bridge_t)
-                sigma_t = max(t_value, self.bridge_sigma_min)
-                sigma_next = max(t_next, self.bridge_sigma_min if t_next > 0 else 0.0)
-                x0_hat = pcl_next - sigma_t * eps_pred
-                pcl_next = x0_hat + sigma_next * eps_pred
+                velocity_pred = self.predict_displacement(pcl_next, bridge_t=bridge_t)
+                pcl_next = pcl_next - dt * velocity_pred
                 if self.bridge_sde_noise > 0 and it < num_steps - 1:
                     sigma = self.bridge_sde_noise * (t_value * max(1.0 - t_value, 0.0)) ** 0.5
                     pcl_next = pcl_next + (dt ** 0.5) * sigma * jt.randn(pcl_next.shape)
@@ -221,15 +209,11 @@ class VelocityModule(ModelSpec):
         bridge_t = batch.get('bridge_t')
         if bridge_t is not None:
             bridge_t = bridge_t.reshape(-1, 1)
-        bridge_sigma = batch.get('bridge_sigma')
-        if bridge_sigma is not None:
-            bridge_sigma = bridge_sigma.reshape(-1, 1)
         losses = self.get_supervised_losses(
             pc_noisy=pc_noisy,
             pc_clean=pc_clean,
             pc_bridge=pc_bridge,
             bridge_t=bridge_t,
-            bridge_sigma=bridge_sigma,
         )
         return losses
     
@@ -270,8 +254,6 @@ class VelocityModule(ModelSpec):
                     item["pc_bridge"] = b.meta['pc_bridge']
                 if 'bridge_t' in b.meta:
                     item["bridge_t"] = b.meta['bridge_t']
-                if 'bridge_sigma' in b.meta:
-                    item["bridge_sigma"] = b.meta['bridge_sigma']
                 if 'patch_seed' in b.meta:
                     item["patch_seed"] = b.meta['patch_seed']
                 res.append(item)

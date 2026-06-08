@@ -171,7 +171,6 @@ class AugmentPatch(Augment):
                 self.bridge_t_max,
                 size=(self.num_patches, 1, 1),
             ).astype(np.float32, copy=False)
-            sigma = np.maximum(t, 1e-6).astype(np.float32, copy=False)
             pat_t = (t * pat_A + (1.0 - t) * pat_B).astype(np.float32, copy=False)
             if self.bridge_noise_std > 0:
                 bridge_noise_scale = (
@@ -214,10 +213,6 @@ class AugmentPatch(Augment):
         if self.bridge_sample_t:
             asset.meta['pc_bridge'] = pat_t
             asset.meta['bridge_t'] = t.reshape(self.num_patches, 1).astype(
-                np.float32,
-                copy=False,
-            )
-            asset.meta['bridge_sigma'] = sigma.reshape(self.num_patches, 1).astype(
                 np.float32,
                 copy=False,
             )

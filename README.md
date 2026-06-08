@@ -15,7 +15,7 @@ target = pc_clean - pc_noisy
 pc_pred = pc_noisy + displacement
 ```
 
-其中 VM 主线已经改成 bridge/eps 训练：模型输入 `x_t` 和 `t`，预测 `eps = (x_t - x0) / sigma_t`，推理时用 `x0_hat = x_t - sigma_t * eps` 逐步从 `t=1` 走到 `t=0`。EdgeConv 和 PointNet++ baseline 仍保留 displacement 预测表述。
+其中 VM 主线已经改成 bridge/velocity 训练：模型输入 `x_t` 和 `t`，预测 `v = x1 - x0`，推理时从 `t=1` 的 noisy patch 出发，按 `x_{t-dt} = x_t - dt * v` 逐步走到 `t=0`。EdgeConv 和 PointNet++ baseline 仍保留 displacement 预测表述。
 
 README 下面把三条流程分开说明，避免把 VM、EdgeConv baseline 和 PointNet++ baseline 的数据、配置、训练和推理命令混在一起。
 
@@ -120,7 +120,7 @@ clean.npy
   -> 随机选 seed point
   -> 在 noisy 点云中取 seed 周围 KNN 1000 个点
   -> 构造 x_t = (1 - t) * pc_clean + t * pc_noisy
-  -> patch 坐标减 bridge seed
+  -> patch 坐标减 noisy seed
   -> 输入 VM
 ```
 
@@ -147,8 +147,8 @@ patch: (1000, 3)
        attention_knn: [8, 16, 32]
        geometry token 调制 scale gate 和 attention temperature
        bridge time embedding 对每层 attention/FFN 做 FiLM 调制
-  -> displacement decoder: 256 -> 128 -> 64 -> 3
-  -> eps: (1000, 3)
+  -> velocity decoder: 256 -> 128 -> 64 -> 3
+  -> velocity: (1000, 3)
 ```
 
 在线几何 token 默认使用 `geometry_token_knn: 32`，每个点会计算：
@@ -164,7 +164,7 @@ local radius std
 local radius max
 ```
 
-当前 VM 主线没有 EdgeConv，没有显式 relative position bias，也没有几何分类头或几何预训练分支。几何信息在训练 forward 中从 `pc_bridge` 在线计算，推理时从当前 SDE 步进状态在线计算。
+当前 VM 主线没有 EdgeConv，没有显式 relative position bias，也没有几何分类头或几何预训练分支。几何信息在训练 forward 中从 `pc_bridge` 在线计算，推理时从当前 velocity 步进状态在线计算。
 
 主要配置：
 
@@ -182,7 +182,7 @@ configs/system/vm.yaml
 当前训练 loss：
 
 ```yaml
-displacement_loss: 0.9  # VM 中实际对应 eps MSE，沿用旧 key 以兼容训练配置
+displacement_loss: 0.9  # VM 中实际对应 velocity MSE，沿用旧 key 以兼容训练配置
 normalized_surface_loss: 0.1
 geometry_gate_match_loss: 0.02
 ```
