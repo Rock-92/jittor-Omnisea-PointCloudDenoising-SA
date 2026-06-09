@@ -3,18 +3,18 @@
 这是一个基于 Jittor 的 patch 点云去噪项目。仓库里目前保留两条模型流程：
 
 ```text
-1. VM 主线：3 层 SA + 在线几何 token 调制的 self-attention 去噪模型
+1. VM 主线：global token SSL + EDM 条件化 self-attention 去噪模型
 2. EdgeConv Baseline：迁入官方 starter code 风格的 EdgeConv 基线
 ```
 
-三个模型最终都预测每个点的三维位移：
+EdgeConv baseline 仍预测每个点的三维位移：
 
 ```text
 target = pc_clean - pc_noisy
 pc_pred = pc_noisy + displacement
 ```
 
-其中 VM 主线当前退回原版单步 displacement 训练：模型输入 noisy patch，直接预测 `pc_clean - pc_noisy` 位移；推理时单步输出 denoised patch。EdgeConv baseline 也保留 displacement 预测表述。
+VM 主线当前以 global token 预训练模型为基线，并切到 EDM 路线 C：模型输入 noisy patch 和噪声强度 `sigma`，经 EDM preconditioning 后预测 clean estimate；`sigma` 通过 FiLM 注入每层 local self-attention block，但暂不注入 global token generator。当前 VM 不使用显式 relative position bias。
 
 README 下面把两条流程分开说明，避免把 VM 和 EdgeConv baseline 的数据、配置、训练和推理命令混在一起。
 
@@ -39,7 +39,7 @@ python -m pip install -r requirements.txt
 Windows 示例命令中的 Python 解释器可以替换成自己的环境路径，例如：
 
 ```powershell
-C:\Users\Lenovo\anaconda3\envs\jittor\python.exe run.py --task configs\task\train_vm.yaml --seed 123
+C:\Users\Lenovo\anaconda3\envs\jittor\python.exe run.py --task configs\task\train_vm_ssl.yaml --seed 123
 ```
 
 ## 数据目录
@@ -105,7 +105,7 @@ cache_clean_points/
 
 ## VM 主线流程
 
-VM 是当前自己设计的主线模型，对应配置名为 `vm`。它使用 3 层 multi-scale local self-attention，并采用噪声强度条件调制每层 attention/FFN；几何 token 从当前 noisy patch 在线计算。
+VM 是当前自己设计的主线模型，对应配置名为 `vm`。它使用 4 层 multi-scale local self-attention，每层 local attention 都额外读取一个由 SSL 预训练模块生成的 global token。当前主线采用 EDM preconditioning，并把噪声强度 `sigma` 通过零初始化 FiLM 注入每层 attention/FFN；global token generator 暂不接收 `sigma`。
 
 ### VM 数据流
 
@@ -128,7 +128,7 @@ clean.npy
 noisy.npy
   -> FPS 选 seed
   -> KNN 切 patch
-  -> patch 内预测 displacement
+  -> EDM 少步 refinement 预测 clean estimate
   -> 融合回整云
   -> denoised.npy
 ```
@@ -138,26 +138,32 @@ noisy.npy
 ```text
 patch: (1000, 3)
   -> input projection: 3 -> 128 -> 256
-  -> 3 层 multi-scale local self-attention
+  -> global token generator
+  -> 4 层 multi-scale local self-attention + sigma FiLM
        attention_knn: [8, 16, 32]
-  -> displacement decoder: 256 -> 128 -> 64 -> 3
-  -> displacement: (1000, 3)
+       第 1 层使用坐标 KNN，后续层使用当前特征动态 KNN
+  -> decoder: 256 -> 128 -> 64 -> 3
+  -> EDM clean estimate: (1000, 3)
 ```
 
-几何 token 调制和 sigma 条件模块仍保留在代码里，但当前 VM 配置关闭：
+当前 EDM 形式：
 
 ```text
-use_geometry_tokens: false
-use_bridge_condition: false
-denoise_num_steps: 1
+D(x, sigma) = c_skip * x + c_out * F(c_in * x, c_noise)
+c_noise = log(sigma) / 4
+
+sigma_data: 0.10
+edm_inference_sigmas: [0.020, 0.010, 0.005]
+edm_inference_alphas: [0.7, 0.5, 0.3]
 ```
 
-当前 VM 主线没有 EdgeConv，没有显式 relative position bias，也没有几何分类头或几何预训练分支。
+当前 VM 主线没有 EdgeConv，没有显式 relative position bias，也没有几何分类头。global token generator 使用 SSL 预训练权重初始化，主训练前 8 个 epoch 冻结 `input_proj_1`、`input_proj_2` 和 `global_token_generator`；从 epoch 8 开始解冻，并以 `global_lr_scale: 0.2` 缩小这部分梯度。
 
 主要配置：
 
 ```text
 configs/task/train_vm.yaml
+configs/task/train_vm_ssl.yaml
 configs/task/predict_vm.yaml
 configs/data/train.yaml
 configs/data/predict.yaml
@@ -165,33 +171,42 @@ configs/transform/vm.yaml
 configs/model/vm.yaml
 configs/train/vm.yaml
 configs/system/vm.yaml
+configs/system/vm_ssl.yaml
 ```
 
 当前训练 loss：
 
 ```yaml
-displacement_loss: 0.9  # 预测 pc_clean - pc_noisy
+displacement_loss: 0.9  # EDM 模式下实际为 weighted clean-estimate MSE
 normalized_surface_loss: 0.1
 ```
 
 ### VM 训练
 
+训练前需要确认 global token SSL 预训练权重存在：
+
+```text
+outputs/checkpoints/global_token_ssl/checkpoint_best.pkl
+```
+
+如果权重在别的位置，修改 `configs/system/vm_ssl.yaml` 里的 `ssl_pretrained_ckpt`。
+
 ```bash
-python run.py --task configs/task/train_vm.yaml --seed 123
+python run.py --task configs/task/train_vm_ssl.yaml --seed 123
 ```
 
 Windows 示例：
 
 ```powershell
 C:\Users\Lenovo\anaconda3\envs\jittor\python.exe run.py `
-  --task configs\task\train_vm.yaml `
+  --task configs\task\train_vm_ssl.yaml `
   --seed 123
 ```
 
 训练输出：
 
 ```text
-outputs/vm/checkpoints/checkpoint_best.pkl
+outputs/checkpoints/vm_ssl/checkpoint_best.pkl
 outputs/vm/runs/
 ```
 
@@ -200,7 +215,7 @@ outputs/vm/runs/
 先确认 `configs/task/predict_vm.yaml` 里的 `load_ckpt` 指向要使用的 checkpoint：
 
 ```yaml
-load_ckpt: outputs/vm/checkpoints/checkpoint_best.pkl
+load_ckpt: outputs/checkpoints/vm_ssl/checkpoint_best.pkl
 ```
 
 然后运行：
