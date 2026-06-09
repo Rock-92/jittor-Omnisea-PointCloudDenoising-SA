@@ -8,6 +8,8 @@ feat_embedding_dim: 256
 attention_blocks: 4
 attention_weight_init: [1.0, 0.6, 0.3, 0.2]
 attention_ffn_hidden_dim: 512
+global_token_blocks: 4
+global_token_ffn_hidden_dim: 512
 
 # Decoder
 decoder_hidden_dims: [128, 64]

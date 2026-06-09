@@ -1,4 +1,0 @@
-__target__: vm
-
-ckpt_save_dir: outputs/point_net2/checkpoints
-ckpt_save_name: checkpoint

@@ -40,7 +40,6 @@ def get_output_root(components: Dict) -> str:
     model_name = components.get("model", "")
     model_output_names = {
         "vm": "vm",
-        "pointnet2": "point_net2",
         "edgeconv_baseline": "EdgeConv",
     }
     if model_name in model_output_names:
