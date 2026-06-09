@@ -203,8 +203,7 @@ class VelocityModule(ModelSpec):
         B = pc_noisy.shape[0]
         if not self.use_sigma_head:
             return jt.ones((B, 1)) * self.edm_default_sigma
-        feat = self.encode_features(pc_noisy, sigma=self.edm_default_sigma)
-        pooled = feat.mean(dim=1)
+        pooled = self.encoder.get_global_token(pc_noisy).reshape(B, -1)
         hidden = self.noise_act(self.sigma_head_1(pooled))
         raw = self.sigma_head_2(hidden)
         sigma = self.edm_sigma_min + (

@@ -14,7 +14,7 @@ target = pc_clean - pc_noisy
 pc_pred = pc_noisy + displacement
 ```
 
-VM 主线当前以 global token 预训练模型为基线，并切到 EDM 路线 C：模型输入 noisy patch 和噪声强度 `sigma`，经 EDM preconditioning 后预测 clean estimate；`sigma` 通过 FiLM 注入每层 local self-attention block，但暂不注入 global token generator。global token 仍由原始 noisy patch 生成，不使用 `c_in` 缩放输入。当前额外启用 confidence head 门控去噪幅度，并启用 sigma head 预测推理起始噪声。当前 VM 不使用显式 relative position bias。
+VM 主线当前以 global token 预训练模型为基线，并切到 EDM 路线 C：模型输入 noisy patch 和噪声强度 `sigma`，经 EDM preconditioning 后预测 clean estimate；`sigma` 通过 FiLM 注入每层 local self-attention block，但暂不注入 global token generator。global token 仍由原始 noisy patch 生成，不使用 `c_in` 缩放输入。当前额外启用 confidence head 门控去噪幅度，并从原始 noisy patch 的 global token 预测推理起始噪声。当前 VM 不使用显式 relative position bias。
 
 README 下面把两条流程分开说明，避免把 VM 和 EdgeConv baseline 的数据、配置、训练和推理命令混在一起。
 
@@ -144,7 +144,7 @@ patch: (1000, 3)
        第 1 层使用坐标 KNN，后续层使用当前特征动态 KNN
   -> decoder: 256 -> 128 -> 64 -> 3
   -> confidence head: sigmoid 门控每点去噪幅度
-  -> sigma head: 预测 patch 级推理起始 sigma
+  -> sigma head: 从原始 noisy patch 的 global token 预测 patch 级推理起始 sigma
   -> EDM clean estimate: (1000, 3)
 ```
 

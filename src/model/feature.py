@@ -330,24 +330,27 @@ class FeatureExtraction(nn.Module):
 
         self.fuse = nn.Linear(embedding_dim * num_blocks, embedding_dim)
 
+    def project_input(self, x):
+        feat = apply_point_linear(self.input_proj_1, x)
+        feat = self.act(feat)
+        feat = apply_point_linear(self.input_proj_2, feat)
+        return self.act(feat)
+
+    def get_global_token(self, x):
+        return self.global_token_generator(self.project_input(x))
+
     def execute(self, x, noise_emb=None, global_x=None):
         """
         x: (B, N, 3)
         global_x: optional unscaled input used only to generate the global token.
         return: (B, N, 256)
         """
-        feat = apply_point_linear(self.input_proj_1, x)
-        feat = self.act(feat)
-        feat = apply_point_linear(self.input_proj_2, feat)
-        feat = self.act(feat)
+        feat = self.project_input(x)
 
         if global_x is None:
             global_feat = feat
         else:
-            global_feat = apply_point_linear(self.input_proj_1, global_x)
-            global_feat = self.act(global_feat)
-            global_feat = apply_point_linear(self.input_proj_2, global_feat)
-            global_feat = self.act(global_feat)
+            global_feat = self.project_input(global_x)
         global_token = self.global_token_generator(global_feat)
 
         block_outputs = []
