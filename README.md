@@ -154,7 +154,7 @@ c_noise = log(sigma) / 4
 
 sigma_data: 训练开始前从 train patch 的 clean 坐标标准差自动估计
 edm_sampler: heun
-edm_inference_sigmas: [0.025, 0.0125, 0.00625, 0.0]
+edm_inference_sigmas: [0.020, 0.010, 0.005, 0.0]
 ```
 
 当前 VM 主线没有 EdgeConv，没有显式 relative position bias，也没有几何分类头。global token generator 使用 SSL 预训练权重初始化，主训练前 8 个 epoch 冻结 `input_proj_1`、`input_proj_2` 和 `global_token_generator`；从 epoch 8 开始解冻，并以 `global_lr_scale: 0.2` 缩小这部分梯度。
