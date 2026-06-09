@@ -10,6 +10,9 @@ attention_weight_init: [1.0, 0.6, 0.3, 0.2]
 attention_ffn_hidden_dim: 512
 global_token_blocks: 4
 global_token_ffn_hidden_dim: 512
+use_edgeconv_branch: true
+edgeconv_branch_k: 16
+edgeconv_branch_dim: 128
 
 # Decoder
 decoder_hidden_dims: [128, 64]
@@ -24,7 +27,7 @@ edm_loss_weighting: true
 noise_embedding_dim: 256
 use_patch_scale_condition: true
 patch_scale_eps: 0.0001
-use_sigma_head: true
+use_sigma_head: false
 sigma_head_hidden_dim: 128
 edm_sampler: heun
 edm_sigma_min: 0.0001

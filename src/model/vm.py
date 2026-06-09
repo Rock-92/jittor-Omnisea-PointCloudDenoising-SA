@@ -5,6 +5,7 @@ import jittor as jt
 import numpy as np
 from jittor import nn
 
+from .edgeconv_baseline import EdgeConvFeatureExtraction
 from .feature import FeatureExtraction, Decoder
 from .spec import ModelSpec
 
@@ -42,6 +43,9 @@ class VelocityModule(ModelSpec):
             'decoder_hidden_dims',
             [cfg.get('decoder_hidden_dim', 64)],
         )
+        self.use_edgeconv_branch = cfg.get('use_edgeconv_branch', False)
+        self.edgeconv_branch_k = int(cfg.get('edgeconv_branch_k', 16))
+        self.edgeconv_branch_dim = int(cfg.get('edgeconv_branch_dim', 128))
         
         # patch-based prediction
         self.predict_rounds = cfg.get('predict_rounds', 1)
@@ -103,9 +107,18 @@ class VelocityModule(ModelSpec):
             global_token_ffn_hidden_dim=self.global_token_ffn_hidden_dim,
             noise_embedding_dim=self.noise_embedding_dim if self.use_edm else None,
         )
+        if self.use_edgeconv_branch:
+            self.edgeconv_branch = EdgeConvFeatureExtraction(
+                k=self.edgeconv_branch_k,
+                input_dim=self.input_dim,
+                embedding_dim=self.edgeconv_branch_dim,
+            )
         
+        decoder_input_dim = self.encoder.embedding_dim
+        if self.use_edgeconv_branch:
+            decoder_input_dim += self.edgeconv_branch_dim
         self.decoder = Decoder(
-            z_dim=self.encoder.embedding_dim,
+            z_dim=decoder_input_dim,
             out_dim=3,
             hidden_dims=self.decoder_hidden_dims,
         )
@@ -168,6 +181,7 @@ class VelocityModule(ModelSpec):
         return:   (B, N, 3) or (B, M, 3)
         """
         B, N, d = pc_noisy.shape
+        edgeconv_x = pc_noisy
         noise_emb = None
         global_x = None
         if self.use_edm:
@@ -182,6 +196,9 @@ class VelocityModule(ModelSpec):
             noise_emb=noise_emb,
             global_x=global_x,
         )  # (B, N, 256)
+        if self.use_edgeconv_branch:
+            edge_feat = self.edgeconv_branch(edgeconv_x)
+            feat = jt.concat([feat, edge_feat], dim=-1)
         if point_idx is not None:
             feat = feat[:, point_idx, :]
         N_out = feat.shape[1]
