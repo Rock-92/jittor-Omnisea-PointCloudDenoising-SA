@@ -127,6 +127,40 @@ class VMSystem(DummySystem):
             ckpt_save_dir=ckpt_save_dir,
             ckpt_save_name=ckpt_save_name,
         )
+
+    def estimate_edm_sigma_data(self):
+        if not getattr(self.model, "use_edm", False):
+            return
+        train_dataloader = self.dataset_module.train_dataloader()
+        if train_dataloader is None:
+            return
+
+        total = 0
+        total_sum = 0.0
+        total_sq_sum = 0.0
+        from tqdm import tqdm
+
+        pbar = tqdm(
+            train_dataloader,
+            total=len(train_dataloader) // train_dataloader.batch_size,
+        )
+        for batch in pbar:
+            pc_clean = batch["pc_clean"]
+            if isinstance(pc_clean, jt.Var):
+                pc_clean = pc_clean.detach().numpy()
+            pc_clean = np.asarray(pc_clean, dtype=np.float64)
+            total += pc_clean.size
+            total_sum += float(pc_clean.sum())
+            total_sq_sum += float((pc_clean ** 2.0).sum())
+            pbar.set_description("Estimating EDM sigma_data")
+
+        if total == 0:
+            return
+        mean = total_sum / total
+        variance = max(total_sq_sum / total - mean * mean, 1e-12)
+        sigma_data = float(np.sqrt(variance))
+        self.model.sigma_data = sigma_data
+        print(f"Estimated EDM sigma_data from train patches: {sigma_data:.8f}")
     
     def on_train_end(self):
         if self.writer is None or self.dataset_module.predict_dataset_config is None:
@@ -366,6 +400,7 @@ class VMSSLSystem(VMSystem):
     def train(self):
         assert self.optimizer is not None, "optimizer is None, cannot train"
         self.model.set_predict(False)
+        self.estimate_edm_sigma_data()
         for epoch in range(self.epochs):
             self._current_epoch = epoch
             self.model.train()

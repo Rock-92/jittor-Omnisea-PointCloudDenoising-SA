@@ -59,6 +59,8 @@ class VelocityModule(ModelSpec):
         self.edm_default_sigma = float(cfg.get('edm_default_sigma', self.dsm_sigma))
         self.edm_loss_weighting = cfg.get('edm_loss_weighting', True)
         self.noise_embedding_dim = cfg.get('noise_embedding_dim', None)
+        self.edm_sampler = cfg.get('edm_sampler', 'alpha_refine')
+        self.edm_sigma_min = float(cfg.get('edm_sigma_min', 1e-4))
         self.edm_inference_sigmas = cfg.get(
             'edm_inference_sigmas',
             [self.edm_default_sigma],
@@ -67,7 +69,10 @@ class VelocityModule(ModelSpec):
             'edm_inference_alphas',
             [1.0] * len(self.edm_inference_sigmas),
         )
-        if len(self.edm_inference_alphas) != len(self.edm_inference_sigmas):
+        if (
+            self.edm_sampler == 'alpha_refine'
+            and len(self.edm_inference_alphas) != len(self.edm_inference_sigmas)
+        ):
             raise ValueError("edm_inference_alphas length must match edm_inference_sigmas")
         
         # networks
@@ -108,15 +113,20 @@ class VelocityModule(ModelSpec):
             sigma = sigma.reshape(-1, 1)
         return sigma
 
+    def clamp_edm_sigma(self, sigma):
+        return jt.maximum(sigma, self.edm_sigma_min)
+
     def get_noise_embedding(self, sigma):
         if not self.use_edm:
             return None
+        sigma = self.clamp_edm_sigma(sigma)
         c_noise = jt.log(sigma) / 4.0
         emb = self.noise_embed_1(c_noise)
         emb = self.noise_act(emb)
         return self.noise_embed_2(emb)
 
     def get_edm_coefficients(self, sigma):
+        sigma = self.clamp_edm_sigma(sigma)
         sigma2 = sigma ** 2.0
         sigma_data2 = self.sigma_data ** 2.0
         denom = sigma2 + sigma_data2
@@ -134,12 +144,18 @@ class VelocityModule(ModelSpec):
         """
         B, N, d = pc_noisy.shape
         noise_emb = None
+        global_x = None
         if self.use_edm:
             sigma = self._expand_sigma(sigma, B)
             _, _, c_in = self.get_edm_coefficients(sigma)
+            global_x = pc_noisy
             pc_noisy = pc_noisy * c_in.reshape(B, 1, 1)
             noise_emb = self.get_noise_embedding(sigma)
-        feat = self.encoder(pc_noisy, noise_emb=noise_emb)  # (B, N, 256)
+        feat = self.encoder(
+            pc_noisy,
+            noise_emb=noise_emb,
+            global_x=global_x,
+        )  # (B, N, 256)
         if point_idx is not None:
             feat = feat[:, point_idx, :]
         N_out = feat.shape[1]
@@ -220,12 +236,15 @@ class VelocityModule(ModelSpec):
             )
             mse = ((pc_pred - pc_clean_for_loss) ** 2.0).sum(dim=-1)
             if self.edm_loss_weighting:
-                sigma2 = score_sigma ** 2.0
+                sigma_for_weight = self.clamp_edm_sigma(score_sigma)
+                sigma2 = sigma_for_weight ** 2.0
                 sigma_data2 = self.sigma_data ** 2.0
                 weight = (sigma2 + sigma_data2) / (sigma2 * sigma_data2)
                 mse = mse * weight.reshape(B, 1)
             displacement_loss = mse.mean()
-            pred_dir = pc_pred - pc_noisy_for_loss
+            return {
+                "displacement_loss": displacement_loss,
+            }
         else:
             pred_dir = self.predict_displacement(pc_noisy, point_idx=point_idx)
             displacement_loss = (((pred_dir - target) ** 2.0) / self.dsm_sigma).sum(dim=-1).mean()
@@ -249,14 +268,50 @@ class VelocityModule(ModelSpec):
         with jt.no_grad():
             pcl_next = pcl_noisy.clone()
             if self.use_edm:
-                for sigma, alpha in zip(self.edm_inference_sigmas, self.edm_inference_alphas):
-                    pc_clean = self.predict_clean(pcl_next, sigma=float(sigma))
-                    pcl_next = pcl_next + float(alpha) * (pc_clean - pcl_next)
+                if self.edm_sampler == 'heun':
+                    pcl_next = self.edm_heun_sampler(pcl_next)
+                elif self.edm_sampler == 'euler':
+                    pcl_next = self.edm_euler_sampler(pcl_next)
+                elif self.edm_sampler == 'alpha_refine':
+                    for sigma, alpha in zip(self.edm_inference_sigmas, self.edm_inference_alphas):
+                        pc_clean = self.predict_clean(pcl_next, sigma=float(sigma))
+                        pcl_next = pcl_next + float(alpha) * (pc_clean - pcl_next)
+                else:
+                    raise ValueError(f"unsupported edm_sampler: {self.edm_sampler}")
             else:
                 for it in range(num_steps):
                     pred_dir = self.predict_displacement(pcl_next)
                     pcl_next = pcl_next + (1.0 / num_steps) * pred_dir
         return pcl_next, None
+
+    def edm_derivative(self, x, sigma):
+        sigma_eval = max(float(sigma), self.edm_sigma_min)
+        sigma_var = jt.ones((x.shape[0], 1)) * sigma_eval
+        denoised = self.predict_clean(x, sigma=sigma_var)
+        return (x - denoised) / sigma_eval
+
+    def edm_euler_sampler(self, x):
+        sigmas = [float(v) for v in self.edm_inference_sigmas]
+        if len(sigmas) < 2:
+            return self.predict_clean(x, sigma=sigmas[0] if sigmas else self.edm_default_sigma)
+        for sigma, sigma_next in zip(sigmas[:-1], sigmas[1:]):
+            d = self.edm_derivative(x, sigma)
+            x = x + (sigma_next - sigma) * d
+        return x
+
+    def edm_heun_sampler(self, x):
+        sigmas = [float(v) for v in self.edm_inference_sigmas]
+        if len(sigmas) < 2:
+            return self.predict_clean(x, sigma=sigmas[0] if sigmas else self.edm_default_sigma)
+        for sigma, sigma_next in zip(sigmas[:-1], sigmas[1:]):
+            d = self.edm_derivative(x, sigma)
+            x_euler = x + (sigma_next - sigma) * d
+            if sigma_next <= 0:
+                x = x_euler
+                continue
+            d_next = self.edm_derivative(x_euler, sigma_next)
+            x = x + (sigma_next - sigma) * 0.5 * (d + d_next)
+        return x
     
     def training_step(self, batch: Dict) -> Dict:
         patch_size = batch['pc_noisy'].shape[-2]

@@ -3,8 +3,12 @@ train_transform:
     - __target__: normalize_pc
     
     - __target__: add_noise
-      noise_std_min: 0.005
-      noise_std_max: 0.020
+      noise_std_min: 0.0
+      noise_std_max: 0.025
+      noise_std_distribution: log_normal
+      noise_log_std: 0.35
+      noise_std_floor: 0.0001
+      noise_type: gaussian
     
     - __target__: patch
       patch_size: 1000
@@ -15,8 +19,9 @@ validate_transform: &validate_transform
     - __target__: normalize_pc
     
     - __target__: add_noise
-      noise_std_min: 0.005
-      noise_std_max: 0.020
+      noise_std_min: 0.0
+      noise_std_max: 0.025
+      noise_type: gaussian
     
     - __target__: patch
       patch_size: 1000

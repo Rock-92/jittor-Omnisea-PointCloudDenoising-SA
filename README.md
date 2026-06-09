@@ -14,7 +14,7 @@ target = pc_clean - pc_noisy
 pc_pred = pc_noisy + displacement
 ```
 
-VM 主线当前以 global token 预训练模型为基线，并切到 EDM 路线 C：模型输入 noisy patch 和噪声强度 `sigma`，经 EDM preconditioning 后预测 clean estimate；`sigma` 通过 FiLM 注入每层 local self-attention block，但暂不注入 global token generator。当前 VM 不使用显式 relative position bias。
+VM 主线当前以 global token 预训练模型为基线，并切到 EDM 路线 C：模型输入 noisy patch 和噪声强度 `sigma`，经 EDM preconditioning 后预测 clean estimate；`sigma` 通过 FiLM 注入每层 local self-attention block，但暂不注入 global token generator。global token 仍由原始 noisy patch 生成，不使用 `c_in` 缩放输入。当前 VM 不使用显式 relative position bias。
 
 README 下面把两条流程分开说明，避免把 VM 和 EdgeConv baseline 的数据、配置、训练和推理命令混在一起。
 
@@ -105,7 +105,7 @@ cache_clean_points/
 
 ## VM 主线流程
 
-VM 是当前自己设计的主线模型，对应配置名为 `vm`。它使用 4 层 multi-scale local self-attention，每层 local attention 都额外读取一个由 SSL 预训练模块生成的 global token。当前主线采用 EDM preconditioning，并把噪声强度 `sigma` 通过零初始化 FiLM 注入每层 attention/FFN；global token generator 暂不接收 `sigma`。
+VM 是当前自己设计的主线模型，对应配置名为 `vm`。它使用 4 层 multi-scale local self-attention，每层 local attention 都额外读取一个由 SSL 预训练模块生成的 global token。当前主线采用 EDM preconditioning，并把噪声强度 `sigma` 通过零初始化 FiLM 注入每层 attention/FFN；global token generator 暂不接收 `sigma`，也不使用 `c_in` 缩放后的输入。
 
 ### VM 数据流
 
@@ -114,7 +114,7 @@ VM 是当前自己设计的主线模型，对应配置名为 `vm`。它使用 4 
 ```text
 clean.npy
   -> normalize
-  -> add_noise
+  -> add_noise: Gaussian 噪声，train 使用 [0, 0.025] 截断 log-normal sigma
   -> 随机选 seed point
   -> 在 noisy 点云中取 seed 周围 KNN 1000 个点
   -> 保存本次加噪强度 sigma
@@ -137,8 +137,8 @@ noisy.npy
 
 ```text
 patch: (1000, 3)
-  -> input projection: 3 -> 128 -> 256
-  -> global token generator
+  -> 原始 noisy patch 生成 global token
+  -> c_in * noisy patch 进入去噪 SA 主干
   -> 4 层 multi-scale local self-attention + sigma FiLM
        attention_knn: [8, 16, 32]
        第 1 层使用坐标 KNN，后续层使用当前特征动态 KNN
@@ -152,9 +152,9 @@ patch: (1000, 3)
 D(x, sigma) = c_skip * x + c_out * F(c_in * x, c_noise)
 c_noise = log(sigma) / 4
 
-sigma_data: 0.10
-edm_inference_sigmas: [0.020, 0.010, 0.005]
-edm_inference_alphas: [0.7, 0.5, 0.3]
+sigma_data: 训练开始前从 train patch 的 clean 坐标标准差自动估计
+edm_sampler: heun
+edm_inference_sigmas: [0.025, 0.0125, 0.00625, 0.0]
 ```
 
 当前 VM 主线没有 EdgeConv，没有显式 relative position bias，也没有几何分类头。global token generator 使用 SSL 预训练权重初始化，主训练前 8 个 epoch 冻结 `input_proj_1`、`input_proj_2` 和 `global_token_generator`；从 epoch 8 开始解冻，并以 `global_lr_scale: 0.2` 缩小这部分梯度。
@@ -177,8 +177,7 @@ configs/system/vm_ssl.yaml
 当前训练 loss：
 
 ```yaml
-displacement_loss: 0.9  # EDM 模式下实际为 weighted clean-estimate MSE
-normalized_surface_loss: 0.1
+displacement_loss: 1.0  # EDM 模式下实际为 weighted clean-estimate MSE
 ```
 
 ### VM 训练

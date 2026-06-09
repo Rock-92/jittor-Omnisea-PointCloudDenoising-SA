@@ -73,17 +73,53 @@ class AugmentAddNoise(Augment):
     noise_std_min: float
     
     noise_std_max: float
+
+    noise_std_distribution: str="uniform"
+
+    noise_log_std: float=0.35
+
+    noise_type: str="laplace"
+
+    noise_std_floor: float=1e-5
     
     @classmethod
     def parse(cls, **kwargs) -> 'AugmentAddNoise':
         cls.check_keys(kwargs)
         return AugmentAddNoise(**kwargs)
+
+    def sample_noise_std(self):
+        if self.noise_std_distribution == "uniform":
+            return np.random.uniform(self.noise_std_min, self.noise_std_max)
+        if self.noise_std_distribution == "log_normal":
+            sample_min = max(float(self.noise_std_min), float(self.noise_std_floor))
+            log_min = np.log(sample_min)
+            log_max = np.log(self.noise_std_max)
+            if self.noise_std_min <= 0:
+                log_mean = np.log(0.5 * self.noise_std_max)
+            else:
+                log_mean = 0.5 * (log_min + log_max)
+            log_sigma = float(self.noise_log_std)
+            for _ in range(32):
+                log_noise_std = np.random.normal(log_mean, log_sigma)
+                if log_min <= log_noise_std <= log_max:
+                    return float(np.exp(log_noise_std))
+            log_noise_std = np.clip(log_noise_std, log_min, log_max)
+            return float(np.exp(log_noise_std))
+        raise ValueError(
+            f"unsupported noise_std_distribution: {self.noise_std_distribution}"
+        )
     
     def apply(self, asset: Asset, **kwargs):
         pc = asset.sampled_vertices
         assert pc is not None, "sampled_vertices is None, cannot apply AugmentAddNoise"
-        noise_std = np.random.uniform(self.noise_std_min, self.noise_std_max)
-        noise = np.random.laplace(0, noise_std, size=pc.shape).astype(np.float32, copy=False)
+        noise_std = self.sample_noise_std()
+        if self.noise_type == "laplace":
+            noise = np.random.laplace(0, noise_std, size=pc.shape)
+        elif self.noise_type == "gaussian":
+            noise = np.random.randn(*pc.shape) * noise_std
+        else:
+            raise ValueError(f"unsupported noise_type: {self.noise_type}")
+        noise = noise.astype(np.float32, copy=False)
         if asset.meta is None:
             asset.meta = {}
         asset.meta['noise_std'] = np.float32(noise_std)
