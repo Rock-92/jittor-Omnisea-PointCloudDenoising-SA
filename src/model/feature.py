@@ -172,6 +172,7 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
         dim,
         knn_scales,
         ffn_hidden_dim=None,
+        noise_embedding_dim=None,
     ):
         super().__init__()
         self.dim = dim
@@ -196,13 +197,29 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
         self.ffn_lin_2 = nn.Linear(self.ffn_hidden_dim, dim)
         self.act = nn.ReLU()
 
-    def execute(self, x, graph_knn_idx, global_token=None):
+        self.noise_embedding_dim = noise_embedding_dim
+        if noise_embedding_dim is not None:
+            self.noise_scale = nn.Linear(noise_embedding_dim, dim)
+            self.noise_shift = nn.Linear(noise_embedding_dim, dim)
+            self.noise_scale.weight.assign(jt.zeros_like(self.noise_scale.weight))
+            self.noise_scale.bias.assign(jt.zeros_like(self.noise_scale.bias))
+            self.noise_shift.weight.assign(jt.zeros_like(self.noise_shift.weight))
+            self.noise_shift.bias.assign(jt.zeros_like(self.noise_shift.bias))
+
+    def apply_noise_film(self, x, noise_emb):
+        if noise_emb is None or self.noise_embedding_dim is None:
+            return x
+        scale = self.noise_scale(noise_emb).unsqueeze(1)
+        shift = self.noise_shift(noise_emb).unsqueeze(1)
+        return x * (1.0 + scale) + shift
+
+    def execute(self, x, graph_knn_idx, global_token=None, noise_emb=None):
         """
         x:       (B, N, C), point features.
         graph_knn_idx: (B, N, max(knn_scales)), neighbor indices used for
             attention neighbors.
         """
-        x_norm = self.attn_norm(x)
+        x_norm = self.apply_noise_film(self.attn_norm(x), noise_emb)
         q = apply_point_linear(self.q_proj, x_norm)
         k = apply_point_linear(self.k_proj, x_norm)
         v = apply_point_linear(self.v_proj, x_norm)
@@ -236,7 +253,7 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
         out = apply_point_linear(self.out_proj, out)
         x = x + out
 
-        ffn = self.ffn_norm(x)
+        ffn = self.apply_noise_film(self.ffn_norm(x), noise_emb)
         ffn = apply_point_linear(self.ffn_lin_1, ffn)
         ffn = self.act(ffn)
         ffn = apply_point_linear(self.ffn_lin_2, ffn)
@@ -256,6 +273,7 @@ class FeatureExtraction(nn.Module):
         ffn_hidden_dim=None,
         global_token_blocks=4,
         global_token_ffn_hidden_dim=None,
+        noise_embedding_dim=None,
     ):
         super().__init__()
 
@@ -276,6 +294,7 @@ class FeatureExtraction(nn.Module):
             global_token_ffn_hidden_dim = embedding_dim * 2
         self.global_token_blocks = int(global_token_blocks)
         self.global_token_ffn_hidden_dim = int(global_token_ffn_hidden_dim)
+        self.noise_embedding_dim = noise_embedding_dim
 
         self.input_proj_1 = nn.Linear(input_dim, input_expand_dim)
         self.input_proj_2 = nn.Linear(input_expand_dim, embedding_dim)
@@ -301,6 +320,7 @@ class FeatureExtraction(nn.Module):
                 dim=embedding_dim,
                 knn_scales=self.knn_scales,
                 ffn_hidden_dim=self.ffn_hidden_dim,
+                noise_embedding_dim=self.noise_embedding_dim,
             )
             weight = jt.ones((1,)) * float(block_weight_values[i])
             setattr(self, f"block_{i}", block)
@@ -310,7 +330,7 @@ class FeatureExtraction(nn.Module):
 
         self.fuse = nn.Linear(embedding_dim * num_blocks, embedding_dim)
 
-    def execute(self, x):
+    def execute(self, x, noise_emb=None):
         """
         x: (B, N, 3)
         return: (B, N, 256)
@@ -327,7 +347,12 @@ class FeatureExtraction(nn.Module):
                 block_knn_idx = get_knn_idx(x, x, self.max_knn, offset=1)
             else:
                 block_knn_idx = get_knn_idx(feat, feat, self.max_knn, offset=1)
-            feat = block(feat, block_knn_idx, global_token=global_token)
+            feat = block(
+                feat,
+                block_knn_idx,
+                global_token=global_token,
+                noise_emb=noise_emb,
+            )
             block_outputs.append(feat * weight)
 
         feat = jt.concat(block_outputs, dim=-1)

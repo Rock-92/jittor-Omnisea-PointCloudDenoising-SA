@@ -3,6 +3,7 @@ from typing import Dict, List
 
 import jittor as jt
 import numpy as np
+from jittor import nn
 
 from .feature import FeatureExtraction, Decoder
 from .spec import ModelSpec
@@ -53,8 +54,30 @@ class VelocityModule(ModelSpec):
         # score-matching
         self.dsm_sigma = cfg['dsm_sigma']
         self.num_train_points = cfg.get('num_train_points', 0)
+        self.use_edm = cfg.get('use_edm', False)
+        self.sigma_data = float(cfg.get('sigma_data', 0.10))
+        self.edm_default_sigma = float(cfg.get('edm_default_sigma', self.dsm_sigma))
+        self.edm_loss_weighting = cfg.get('edm_loss_weighting', True)
+        self.noise_embedding_dim = cfg.get('noise_embedding_dim', None)
+        self.edm_inference_sigmas = cfg.get(
+            'edm_inference_sigmas',
+            [self.edm_default_sigma],
+        )
+        self.edm_inference_alphas = cfg.get(
+            'edm_inference_alphas',
+            [1.0] * len(self.edm_inference_sigmas),
+        )
+        if len(self.edm_inference_alphas) != len(self.edm_inference_sigmas):
+            raise ValueError("edm_inference_alphas length must match edm_inference_sigmas")
         
         # networks
+        if self.use_edm and self.noise_embedding_dim is None:
+            self.noise_embedding_dim = self.feat_embedding_dim
+        if self.use_edm:
+            self.noise_embed_1 = nn.Linear(1, self.noise_embedding_dim)
+            self.noise_embed_2 = nn.Linear(self.noise_embedding_dim, self.noise_embedding_dim)
+            self.noise_act = nn.ReLU()
+
         self.encoder = FeatureExtraction(
             knn_scales=self.attention_knn,
             input_dim=self.input_dim,
@@ -65,6 +88,7 @@ class VelocityModule(ModelSpec):
             ffn_hidden_dim=self.attention_ffn_hidden_dim,
             global_token_blocks=self.global_token_blocks,
             global_token_ffn_hidden_dim=self.global_token_ffn_hidden_dim,
+            noise_embedding_dim=self.noise_embedding_dim if self.use_edm else None,
         )
         
         self.decoder = Decoder(
@@ -73,19 +97,76 @@ class VelocityModule(ModelSpec):
             hidden_dims=self.decoder_hidden_dims,
         )
     
-    def predict_displacement(self, pc_noisy, point_idx=None):
+    def _expand_sigma(self, sigma, batch_size):
+        if sigma is None:
+            sigma = self.edm_default_sigma
+        if not isinstance(sigma, jt.Var):
+            sigma = jt.ones((batch_size, 1)) * float(sigma)
+        elif len(sigma.shape) == 0:
+            sigma = jt.ones((batch_size, 1)) * sigma
+        elif len(sigma.shape) == 1:
+            sigma = sigma.reshape(-1, 1)
+        return sigma
+
+    def get_noise_embedding(self, sigma):
+        if not self.use_edm:
+            return None
+        c_noise = jt.log(sigma) / 4.0
+        emb = self.noise_embed_1(c_noise)
+        emb = self.noise_act(emb)
+        return self.noise_embed_2(emb)
+
+    def get_edm_coefficients(self, sigma):
+        sigma2 = sigma ** 2.0
+        sigma_data2 = self.sigma_data ** 2.0
+        denom = sigma2 + sigma_data2
+        c_skip = sigma_data2 / denom
+        c_out = sigma * self.sigma_data / jt.sqrt(denom)
+        c_in = 1.0 / jt.sqrt(denom)
+        return c_skip, c_out, c_in
+
+    def predict_raw(self, pc_noisy, sigma=None, point_idx=None):
         """
         pc_noisy: (B, N, 3)
+        sigma: optional (B, 1) noise level for EDM FiLM
         point_idx: optional point indices decoded after full-patch encoding
         return:   (B, N, 3) or (B, M, 3)
         """
         B, N, d = pc_noisy.shape
-        feat = self.encoder(pc_noisy)  # (B, N, 256)
+        noise_emb = None
+        if self.use_edm:
+            sigma = self._expand_sigma(sigma, B)
+            _, _, c_in = self.get_edm_coefficients(sigma)
+            pc_noisy = pc_noisy * c_in.reshape(B, 1, 1)
+            noise_emb = self.get_noise_embedding(sigma)
+        feat = self.encoder(pc_noisy, noise_emb=noise_emb)  # (B, N, 256)
         if point_idx is not None:
             feat = feat[:, point_idx, :]
         N_out = feat.shape[1]
         F_dim = feat.shape[2]
         return self.decoder(feat.reshape(-1, F_dim)).reshape(B, N_out, d)
+
+    def predict_clean(self, pc_noisy, sigma=None, point_idx=None):
+        if not self.use_edm:
+            return pc_noisy + self.predict_raw(pc_noisy, point_idx=point_idx)
+        B = pc_noisy.shape[0]
+        sigma = self._expand_sigma(sigma, B)
+        raw = self.predict_raw(pc_noisy, sigma=sigma, point_idx=point_idx)
+        pc_base = pc_noisy
+        if point_idx is not None:
+            pc_base = pc_noisy[:, point_idx, :]
+        c_skip, c_out, _ = self.get_edm_coefficients(sigma)
+        return (
+            c_skip.reshape(B, 1, 1) * pc_base
+            + c_out.reshape(B, 1, 1) * raw
+        )
+
+    def predict_displacement(self, pc_noisy, sigma=None, point_idx=None):
+        clean = self.predict_clean(pc_noisy, sigma=sigma, point_idx=point_idx)
+        pc_base = pc_noisy
+        if point_idx is not None:
+            pc_base = pc_noisy[:, point_idx, :]
+        return clean - pc_base
     
     def get_normalized_surface_loss(self, pc_pred, pc_clean, pc_anchor):
         """
@@ -116,11 +197,13 @@ class VelocityModule(ModelSpec):
         plane_dist = (((pc_pred - p0) * normal).sum(dim=-1) ** 2.0)
         return (plane_dist / self.dsm_sigma).mean()
 
-    def get_supervised_losses(self, pc_noisy, pc_clean):
+    def get_supervised_losses(self, pc_noisy, pc_clean, score_sigma=None):
         """
         pc_noisy: (B, N, 3)
         pc_clean: (B, N, 3)
         """
+        B = pc_noisy.shape[0]
+        score_sigma = self._expand_sigma(score_sigma, B)
         target = pc_clean - pc_noisy
         point_idx = get_random_indices(pc_noisy.shape[1], self.num_train_points)
         pc_noisy_for_loss = pc_noisy
@@ -129,8 +212,23 @@ class VelocityModule(ModelSpec):
             target = target[:, point_idx, :]
             pc_noisy_for_loss = pc_noisy[:, point_idx, :]
             pc_clean_for_loss = pc_clean[:, point_idx, :]
-        pred_dir = self.predict_displacement(pc_noisy, point_idx=point_idx)
-        displacement_loss = (((pred_dir - target) ** 2.0) / self.dsm_sigma).sum(dim=-1).mean()
+        if self.use_edm:
+            pc_pred = self.predict_clean(
+                pc_noisy,
+                sigma=score_sigma,
+                point_idx=point_idx,
+            )
+            mse = ((pc_pred - pc_clean_for_loss) ** 2.0).sum(dim=-1)
+            if self.edm_loss_weighting:
+                sigma2 = score_sigma ** 2.0
+                sigma_data2 = self.sigma_data ** 2.0
+                weight = (sigma2 + sigma_data2) / (sigma2 * sigma_data2)
+                mse = mse * weight.reshape(B, 1)
+            displacement_loss = mse.mean()
+            pred_dir = pc_pred - pc_noisy_for_loss
+        else:
+            pred_dir = self.predict_displacement(pc_noisy, point_idx=point_idx)
+            displacement_loss = (((pred_dir - target) ** 2.0) / self.dsm_sigma).sum(dim=-1).mean()
         normalized_surface_loss = self.get_normalized_surface_loss(
             pc_pred=pc_noisy_for_loss + pred_dir,
             pc_clean=pc_clean,
@@ -150,18 +248,27 @@ class VelocityModule(ModelSpec):
             num_steps = self.denoise_num_steps
         with jt.no_grad():
             pcl_next = pcl_noisy.clone()
-            for it in range(num_steps):
-                pred_dir = self.predict_displacement(pcl_next)
-                pcl_next = pcl_next + (1.0 / num_steps) * pred_dir
+            if self.use_edm:
+                for sigma, alpha in zip(self.edm_inference_sigmas, self.edm_inference_alphas):
+                    pc_clean = self.predict_clean(pcl_next, sigma=float(sigma))
+                    pcl_next = pcl_next + float(alpha) * (pc_clean - pcl_next)
+            else:
+                for it in range(num_steps):
+                    pred_dir = self.predict_displacement(pcl_next)
+                    pcl_next = pcl_next + (1.0 / num_steps) * pred_dir
         return pcl_next, None
     
     def training_step(self, batch: Dict) -> Dict:
         patch_size = batch['pc_noisy'].shape[-2]
         pc_noisy = batch['pc_noisy'].reshape(-1, patch_size, 3)
         pc_clean = batch['pc_clean'].reshape(-1, patch_size, 3)
+        score_sigma = batch.get('score_sigma')
+        if score_sigma is not None:
+            score_sigma = score_sigma.reshape(-1, 1)
         losses = self.get_supervised_losses(
             pc_noisy=pc_noisy,
             pc_clean=pc_clean,
+            score_sigma=score_sigma,
         )
         return losses
     
@@ -200,6 +307,8 @@ class VelocityModule(ModelSpec):
                 }
                 if 'patch_seed' in b.meta:
                     item["patch_seed"] = b.meta['patch_seed']
+                if 'score_sigma' in b.meta:
+                    item["score_sigma"] = b.meta['score_sigma']
                 res.append(item)
             else:
                 d = {

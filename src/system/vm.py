@@ -220,7 +220,11 @@ class VMSystem(DummySystem):
             pc_noisy_abs = pc_noisy
             pc_clean_abs = pc_clean
         
-        pc_pred, _ = self.model.denoise_langevin_dynamics(pc_noisy)
+        if getattr(self.model, "use_edm", False) and "score_sigma" in batch:
+            score_sigma = batch["score_sigma"].reshape(pc_noisy.shape[0], 1)
+            pc_pred = self.model.predict_clean(pc_noisy, sigma=score_sigma)
+        else:
+            pc_pred, _ = self.model.denoise_langevin_dynamics(pc_noisy)
         if patch_seed is not None:
             pc_pred_abs = pc_pred + patch_seed
         else:

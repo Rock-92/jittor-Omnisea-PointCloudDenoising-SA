@@ -17,6 +17,13 @@ decoder_hidden_dims: [128, 64]
 # Loss
 dsm_sigma: 0.01
 num_train_points: 256
+use_edm: true
+sigma_data: 0.10
+edm_default_sigma: 0.01
+edm_loss_weighting: true
+noise_embedding_dim: 256
+edm_inference_sigmas: [0.020, 0.010, 0.005]
+edm_inference_alphas: [0.7, 0.5, 0.3]
 
 # Patch-based prediction
 predict_rounds: 1
