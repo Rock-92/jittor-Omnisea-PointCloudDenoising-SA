@@ -22,8 +22,8 @@ sigma_data: 0.10
 edm_default_sigma: 0.01
 edm_loss_weighting: true
 noise_embedding_dim: 256
-use_confidence_head: true
-confidence_bias_init: 4.0
+use_patch_scale_condition: true
+patch_scale_eps: 0.0001
 use_sigma_head: true
 sigma_head_hidden_dim: 128
 edm_sampler: heun

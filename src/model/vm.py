@@ -59,8 +59,8 @@ class VelocityModule(ModelSpec):
         self.edm_default_sigma = float(cfg.get('edm_default_sigma', self.dsm_sigma))
         self.edm_loss_weighting = cfg.get('edm_loss_weighting', True)
         self.noise_embedding_dim = cfg.get('noise_embedding_dim', None)
-        self.use_confidence_head = cfg.get('use_confidence_head', False)
-        self.confidence_bias_init = float(cfg.get('confidence_bias_init', 4.0))
+        self.use_patch_scale_condition = cfg.get('use_patch_scale_condition', False)
+        self.patch_scale_eps = float(cfg.get('patch_scale_eps', 1e-4))
         self.use_sigma_head = cfg.get('use_sigma_head', False)
         self.sigma_head_hidden_dim = cfg.get(
             'sigma_head_hidden_dim',
@@ -109,12 +109,6 @@ class VelocityModule(ModelSpec):
             out_dim=3,
             hidden_dims=self.decoder_hidden_dims,
         )
-        if self.use_confidence_head:
-            self.confidence_decoder = Decoder(
-                z_dim=self.encoder.embedding_dim,
-                out_dim=1,
-                hidden_dims=self.decoder_hidden_dims,
-            )
         if self.use_sigma_head:
             self.sigma_head_1 = nn.Linear(
                 self.encoder.embedding_dim,
@@ -136,11 +130,22 @@ class VelocityModule(ModelSpec):
     def clamp_edm_sigma(self, sigma):
         return jt.maximum(sigma, self.edm_sigma_min)
 
-    def get_noise_embedding(self, sigma):
+    def get_patch_scale(self, pc_noisy):
+        center = pc_noisy.mean(dim=1).unsqueeze(1)
+        centered = pc_noisy - center
+        scale2 = (centered ** 2.0).sum(dim=-1).mean(dim=1)
+        scale = jt.sqrt(scale2 + self.patch_scale_eps ** 2.0).reshape(pc_noisy.shape[0], 1)
+        return jt.maximum(scale, self.patch_scale_eps)
+
+    def get_noise_embedding(self, sigma, patch_scale=None):
         if not self.use_edm:
             return None
         sigma = self.clamp_edm_sigma(sigma)
-        c_noise = jt.log(sigma) / 4.0
+        sigma_for_condition = sigma
+        if self.use_patch_scale_condition and patch_scale is not None:
+            sigma_for_condition = sigma / jt.maximum(patch_scale, self.patch_scale_eps)
+            sigma_for_condition = self.clamp_edm_sigma(sigma_for_condition)
+        c_noise = jt.log(sigma_for_condition) / 4.0
         emb = self.noise_embed_1(c_noise)
         emb = self.noise_act(emb)
         return self.noise_embed_2(emb)
@@ -169,8 +174,9 @@ class VelocityModule(ModelSpec):
             sigma = self._expand_sigma(sigma, B)
             _, _, c_in = self.get_edm_coefficients(sigma)
             global_x = pc_noisy
+            patch_scale = self.get_patch_scale(pc_noisy)
             pc_noisy = pc_noisy * c_in.reshape(B, 1, 1)
-            noise_emb = self.get_noise_embedding(sigma)
+            noise_emb = self.get_noise_embedding(sigma, patch_scale=patch_scale)
         feat = self.encoder(
             pc_noisy,
             noise_emb=noise_emb,
@@ -191,14 +197,8 @@ class VelocityModule(ModelSpec):
 
     def predict_confidence(self, pc_noisy, sigma=None, point_idx=None):
         B = pc_noisy.shape[0]
-        if not self.use_confidence_head:
-            feat = self.encode_features(pc_noisy, sigma=sigma, point_idx=point_idx)
-            return jt.ones((B, feat.shape[1], 1))
         feat = self.encode_features(pc_noisy, sigma=sigma, point_idx=point_idx)
-        N_out = feat.shape[1]
-        F_dim = feat.shape[2]
-        logits = self.confidence_decoder(feat.reshape(-1, F_dim)).reshape(B, N_out, 1)
-        return jt.sigmoid(logits + self.confidence_bias_init)
+        return jt.ones((B, feat.shape[1], 1))
 
     def predict_sigma(self, pc_noisy):
         B = pc_noisy.shape[0]
@@ -229,12 +229,6 @@ class VelocityModule(ModelSpec):
             c_skip.reshape(B, 1, 1) * pc_base
             + c_out.reshape(B, 1, 1) * raw
         )
-        if self.use_confidence_head:
-            conf_logits = self.confidence_decoder(
-                feat.reshape(-1, F_dim)
-            ).reshape(B, N_out, 1)
-            conf = jt.sigmoid(conf_logits + self.confidence_bias_init)
-            pc_pred = pc_base + conf * (pc_pred - pc_base)
         return pc_pred
 
     def predict_displacement(self, pc_noisy, sigma=None, point_idx=None):
