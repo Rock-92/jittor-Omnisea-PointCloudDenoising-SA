@@ -59,8 +59,15 @@ class VelocityModule(ModelSpec):
         self.edm_default_sigma = float(cfg.get('edm_default_sigma', self.dsm_sigma))
         self.edm_loss_weighting = cfg.get('edm_loss_weighting', True)
         self.noise_embedding_dim = cfg.get('noise_embedding_dim', None)
+        self.use_confidence_head = cfg.get('use_confidence_head', False)
+        self.use_sigma_head = cfg.get('use_sigma_head', False)
+        self.sigma_head_hidden_dim = cfg.get(
+            'sigma_head_hidden_dim',
+            self.feat_embedding_dim // 2,
+        )
         self.edm_sampler = cfg.get('edm_sampler', 'alpha_refine')
         self.edm_sigma_min = float(cfg.get('edm_sigma_min', 1e-4))
+        self.edm_sigma_max = float(cfg.get('edm_sigma_max', 0.025))
         self.edm_inference_sigmas = cfg.get(
             'edm_inference_sigmas',
             [self.edm_default_sigma],
@@ -101,6 +108,18 @@ class VelocityModule(ModelSpec):
             out_dim=3,
             hidden_dims=self.decoder_hidden_dims,
         )
+        if self.use_confidence_head:
+            self.confidence_decoder = Decoder(
+                z_dim=self.encoder.embedding_dim,
+                out_dim=1,
+                hidden_dims=self.decoder_hidden_dims,
+            )
+        if self.use_sigma_head:
+            self.sigma_head_1 = nn.Linear(
+                self.encoder.embedding_dim,
+                self.sigma_head_hidden_dim,
+            )
+            self.sigma_head_2 = nn.Linear(self.sigma_head_hidden_dim, 1)
     
     def _expand_sigma(self, sigma, batch_size):
         if sigma is None:
@@ -135,7 +154,7 @@ class VelocityModule(ModelSpec):
         c_in = 1.0 / jt.sqrt(denom)
         return c_skip, c_out, c_in
 
-    def predict_raw(self, pc_noisy, sigma=None, point_idx=None):
+    def encode_features(self, pc_noisy, sigma=None, point_idx=None):
         """
         pc_noisy: (B, N, 3)
         sigma: optional (B, 1) noise level for EDM FiLM
@@ -160,22 +179,63 @@ class VelocityModule(ModelSpec):
             feat = feat[:, point_idx, :]
         N_out = feat.shape[1]
         F_dim = feat.shape[2]
+        return feat
+
+    def predict_raw(self, pc_noisy, sigma=None, point_idx=None):
+        B, _, d = pc_noisy.shape
+        feat = self.encode_features(pc_noisy, sigma=sigma, point_idx=point_idx)
+        N_out = feat.shape[1]
+        F_dim = feat.shape[2]
         return self.decoder(feat.reshape(-1, F_dim)).reshape(B, N_out, d)
+
+    def predict_confidence(self, pc_noisy, sigma=None, point_idx=None):
+        B = pc_noisy.shape[0]
+        if not self.use_confidence_head:
+            feat = self.encode_features(pc_noisy, sigma=sigma, point_idx=point_idx)
+            return jt.ones((B, feat.shape[1], 1))
+        feat = self.encode_features(pc_noisy, sigma=sigma, point_idx=point_idx)
+        N_out = feat.shape[1]
+        F_dim = feat.shape[2]
+        logits = self.confidence_decoder(feat.reshape(-1, F_dim)).reshape(B, N_out, 1)
+        return jt.sigmoid(logits)
+
+    def predict_sigma(self, pc_noisy):
+        B = pc_noisy.shape[0]
+        if not self.use_sigma_head:
+            return jt.ones((B, 1)) * self.edm_default_sigma
+        feat = self.encode_features(pc_noisy, sigma=self.edm_default_sigma)
+        pooled = feat.mean(dim=1)
+        hidden = self.noise_act(self.sigma_head_1(pooled))
+        raw = self.sigma_head_2(hidden)
+        sigma = self.edm_sigma_min + (
+            self.edm_sigma_max - self.edm_sigma_min
+        ) * jt.sigmoid(raw)
+        return sigma
 
     def predict_clean(self, pc_noisy, sigma=None, point_idx=None):
         if not self.use_edm:
             return pc_noisy + self.predict_raw(pc_noisy, point_idx=point_idx)
         B = pc_noisy.shape[0]
         sigma = self._expand_sigma(sigma, B)
-        raw = self.predict_raw(pc_noisy, sigma=sigma, point_idx=point_idx)
+        feat = self.encode_features(pc_noisy, sigma=sigma, point_idx=point_idx)
+        N_out = feat.shape[1]
+        F_dim = feat.shape[2]
+        raw = self.decoder(feat.reshape(-1, F_dim)).reshape(B, N_out, pc_noisy.shape[2])
         pc_base = pc_noisy
         if point_idx is not None:
             pc_base = pc_noisy[:, point_idx, :]
         c_skip, c_out, _ = self.get_edm_coefficients(sigma)
-        return (
+        pc_pred = (
             c_skip.reshape(B, 1, 1) * pc_base
             + c_out.reshape(B, 1, 1) * raw
         )
+        if self.use_confidence_head:
+            conf_logits = self.confidence_decoder(
+                feat.reshape(-1, F_dim)
+            ).reshape(B, N_out, 1)
+            conf = jt.sigmoid(conf_logits)
+            pc_pred = pc_base + conf * (pc_pred - pc_base)
+        return pc_pred
 
     def predict_displacement(self, pc_noisy, sigma=None, point_idx=None):
         clean = self.predict_clean(pc_noisy, sigma=sigma, point_idx=point_idx)
@@ -229,6 +289,7 @@ class VelocityModule(ModelSpec):
             pc_noisy_for_loss = pc_noisy[:, point_idx, :]
             pc_clean_for_loss = pc_clean[:, point_idx, :]
         if self.use_edm:
+            sigma_pred = self.predict_sigma(pc_noisy)
             pc_pred = self.predict_clean(
                 pc_noisy,
                 sigma=score_sigma,
@@ -242,9 +303,16 @@ class VelocityModule(ModelSpec):
                 weight = (sigma2 + sigma_data2) / (sigma2 * sigma_data2)
                 mse = mse * weight.reshape(B, 1)
             displacement_loss = mse.mean()
-            return {
+            losses = {
                 "displacement_loss": displacement_loss,
             }
+            if self.use_sigma_head:
+                sigma_target = self.clamp_edm_sigma(score_sigma)
+                sigma_loss = (
+                    (jt.log(self.clamp_edm_sigma(sigma_pred)) - jt.log(sigma_target)) ** 2.0
+                ).mean()
+                losses["sigma_loss"] = sigma_loss
+            return losses
         else:
             pred_dir = self.predict_displacement(pc_noisy, point_idx=point_idx)
             displacement_loss = (((pred_dir - target) ** 2.0) / self.dsm_sigma).sum(dim=-1).mean()
@@ -284,33 +352,49 @@ class VelocityModule(ModelSpec):
                     pcl_next = pcl_next + (1.0 / num_steps) * pred_dir
         return pcl_next, None
 
-    def edm_derivative(self, x, sigma):
+    def _sigma_to_var(self, sigma, batch_size):
+        if isinstance(sigma, jt.Var):
+            return self.clamp_edm_sigma(sigma.reshape(batch_size, 1))
         sigma_eval = max(float(sigma), self.edm_sigma_min)
-        sigma_var = jt.ones((x.shape[0], 1)) * sigma_eval
+        return jt.ones((batch_size, 1)) * sigma_eval
+
+    def edm_derivative(self, x, sigma):
+        sigma_var = self._sigma_to_var(sigma, x.shape[0])
         denoised = self.predict_clean(x, sigma=sigma_var)
-        return (x - denoised) / sigma_eval
+        return (x - denoised) / sigma_var.reshape(x.shape[0], 1, 1)
+
+    def get_inference_sigmas(self, x):
+        if self.use_sigma_head:
+            sigma_start = self.predict_sigma(x)
+            return [sigma_start, sigma_start * 0.5, sigma_start * 0.25, 0.0]
+        return [float(v) for v in self.edm_inference_sigmas]
 
     def edm_euler_sampler(self, x):
-        sigmas = [float(v) for v in self.edm_inference_sigmas]
+        sigmas = self.get_inference_sigmas(x)
         if len(sigmas) < 2:
             return self.predict_clean(x, sigma=sigmas[0] if sigmas else self.edm_default_sigma)
         for sigma, sigma_next in zip(sigmas[:-1], sigmas[1:]):
             d = self.edm_derivative(x, sigma)
-            x = x + (sigma_next - sigma) * d
+            step = sigma_next - sigma
+            if isinstance(step, jt.Var):
+                step = step.reshape(x.shape[0], 1, 1)
+            x = x + step * d
         return x
 
     def edm_heun_sampler(self, x):
-        sigmas = [float(v) for v in self.edm_inference_sigmas]
+        sigmas = self.get_inference_sigmas(x)
         if len(sigmas) < 2:
             return self.predict_clean(x, sigma=sigmas[0] if sigmas else self.edm_default_sigma)
         for sigma, sigma_next in zip(sigmas[:-1], sigmas[1:]):
             d = self.edm_derivative(x, sigma)
-            x_euler = x + (sigma_next - sigma) * d
-            if sigma_next <= 0:
+            step = sigma_next - sigma
+            step_apply = step.reshape(x.shape[0], 1, 1) if isinstance(step, jt.Var) else step
+            x_euler = x + step_apply * d
+            if not isinstance(sigma_next, jt.Var) and sigma_next <= 0:
                 x = x_euler
                 continue
             d_next = self.edm_derivative(x_euler, sigma_next)
-            x = x + (sigma_next - sigma) * 0.5 * (d + d_next)
+            x = x + step_apply * 0.5 * (d + d_next)
         return x
     
     def training_step(self, batch: Dict) -> Dict:

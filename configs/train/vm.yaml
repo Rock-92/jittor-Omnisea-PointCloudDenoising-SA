@@ -1,5 +1,6 @@
 loss:
   displacement_loss: 1.0
+  sigma_loss: 0.01
 
 optimizer:
   __target__: adam
