@@ -32,6 +32,42 @@ def gather_neighbors(x, idx):
     return jt.stack(neighbors, dim=0)
 
 
+def gather_points(x, idx):
+    """
+    x:   (B, N, C)
+    idx: (B, M)
+    return: (B, M, C)
+    """
+    gathered: List[jt.Var] = []
+    for b in range(x.shape[0]):
+        gathered.append(x[b][idx[b]])
+    return jt.stack(gathered, dim=0)
+
+
+def farthest_point_sampling_idx(xyz, num_points):
+    """
+    xyz: (B, N, 3)
+    return: (B, num_points)
+    """
+    B, N, _ = xyz.shape
+    num_points = min(int(num_points), N)
+    indices = []
+    for b in range(B):
+        pts = xyz[b]
+        selected = []
+        dist = jt.ones((N,)) * 1e10
+        farthest = 0
+        for _ in range(num_points):
+            selected.append(farthest)
+            centroid = pts[farthest]
+            d = ((pts - centroid) ** 2).sum(dim=1)
+            dist = jt.minimum(dist, d)
+            farthest, _ = jt.argmax(dist, dim=-1)
+            farthest = farthest.item()
+        indices.append(jt.array(selected).int32()[None, :])
+    return jt.concat(indices, dim=0)
+
+
 def apply_point_linear(linear, x):
     B, N, _ = x.shape
     out = linear(x.reshape(B * N, -1))
