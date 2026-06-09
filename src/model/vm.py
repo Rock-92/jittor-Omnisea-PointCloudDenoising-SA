@@ -60,6 +60,7 @@ class VelocityModule(ModelSpec):
         self.edm_loss_weighting = cfg.get('edm_loss_weighting', True)
         self.noise_embedding_dim = cfg.get('noise_embedding_dim', None)
         self.use_confidence_head = cfg.get('use_confidence_head', False)
+        self.confidence_bias_init = float(cfg.get('confidence_bias_init', 4.0))
         self.use_sigma_head = cfg.get('use_sigma_head', False)
         self.sigma_head_hidden_dim = cfg.get(
             'sigma_head_hidden_dim',
@@ -197,7 +198,7 @@ class VelocityModule(ModelSpec):
         N_out = feat.shape[1]
         F_dim = feat.shape[2]
         logits = self.confidence_decoder(feat.reshape(-1, F_dim)).reshape(B, N_out, 1)
-        return jt.sigmoid(logits)
+        return jt.sigmoid(logits + self.confidence_bias_init)
 
     def predict_sigma(self, pc_noisy):
         B = pc_noisy.shape[0]
@@ -232,7 +233,7 @@ class VelocityModule(ModelSpec):
             conf_logits = self.confidence_decoder(
                 feat.reshape(-1, F_dim)
             ).reshape(B, N_out, 1)
-            conf = jt.sigmoid(conf_logits)
+            conf = jt.sigmoid(conf_logits + self.confidence_bias_init)
             pc_pred = pc_base + conf * (pc_pred - pc_base)
         return pc_pred
 

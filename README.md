@@ -143,7 +143,7 @@ patch: (1000, 3)
        attention_knn: [8, 16, 32]
        第 1 层使用坐标 KNN，后续层使用当前特征动态 KNN
   -> decoder: 256 -> 128 -> 64 -> 3
-  -> confidence head: sigmoid 门控每点去噪幅度
+  -> confidence head: sigmoid 门控每点去噪幅度，默认加 confidence_bias_init=4.0，使初始 gate 约为 0.98
   -> sigma head: 从原始 noisy patch 的 global token 预测 patch 级推理起始 sigma
   -> EDM clean estimate: (1000, 3)
 ```
