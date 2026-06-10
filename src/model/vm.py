@@ -46,6 +46,12 @@ class VelocityModule(ModelSpec):
         self.use_edgeconv_branch = cfg.get('use_edgeconv_branch', False)
         self.edgeconv_branch_k = int(cfg.get('edgeconv_branch_k', 16))
         self.edgeconv_branch_dim = int(cfg.get('edgeconv_branch_dim', 128))
+        self.use_hard_aware_loss = cfg.get('use_hard_aware_loss', False)
+        self.hard_relative_sigma_ref = float(cfg.get('hard_relative_sigma_ref', 0.18))
+        self.hard_weight_scale = float(cfg.get('hard_weight_scale', 1.5))
+        self.hard_weight_max = float(cfg.get('hard_weight_max', 3.0))
+        self.hard_chamfer_weight = float(cfg.get('hard_chamfer_weight', 0.05))
+        self.hard_normal_weight = float(cfg.get('hard_normal_weight', 0.02))
         
         # patch-based prediction
         self.predict_rounds = cfg.get('predict_rounds', 1)
@@ -172,6 +178,28 @@ class VelocityModule(ModelSpec):
         c_out = sigma * self.sigma_data / jt.sqrt(denom)
         c_in = 1.0 / jt.sqrt(denom)
         return c_skip, c_out, c_in
+
+    def get_hard_patch_weight(self, pc_noisy, sigma):
+        if not self.use_hard_aware_loss:
+            return None
+        patch_scale = self.get_patch_scale(pc_noisy)
+        relative_sigma = self.clamp_edm_sigma(sigma) / jt.maximum(
+            patch_scale,
+            self.patch_scale_eps,
+        )
+        hard = jt.maximum(relative_sigma / self.hard_relative_sigma_ref - 1.0, 0.0)
+        weight = 1.0 + self.hard_weight_scale * hard
+        return jt.minimum(weight, self.hard_weight_max)
+
+    def get_patch_chamfer_loss(self, pc_pred, pc_clean, sigma, hard_weight=None):
+        dist = ((pc_pred.unsqueeze(2) - pc_clean.unsqueeze(1)) ** 2.0).sum(dim=-1)
+        pred_to_clean = dist.min(dim=2)
+        clean_to_pred = dist.min(dim=1)
+        sigma2 = self.clamp_edm_sigma(sigma).reshape(pc_pred.shape[0]) ** 2.0
+        loss = (pred_to_clean.mean(dim=1) + clean_to_pred.mean(dim=1)) / sigma2
+        if hard_weight is not None:
+            loss = loss * hard_weight.reshape(pc_pred.shape[0])
+        return loss.mean()
 
     def encode_features(self, pc_noisy, sigma=None, point_idx=None):
         """
@@ -307,16 +335,35 @@ class VelocityModule(ModelSpec):
                 point_idx=point_idx,
             )
             mse = ((pc_pred - pc_clean_for_loss) ** 2.0).sum(dim=-1)
+            hard_weight = self.get_hard_patch_weight(pc_noisy, score_sigma)
             if self.edm_loss_weighting:
                 sigma_for_weight = self.clamp_edm_sigma(score_sigma)
                 sigma2 = sigma_for_weight ** 2.0
                 sigma_data2 = self.sigma_data ** 2.0
                 weight = (sigma2 + sigma_data2) / (sigma2 * sigma_data2)
                 mse = mse * weight.reshape(B, 1)
+            if hard_weight is not None:
+                mse = mse * hard_weight.reshape(B, 1)
             displacement_loss = mse.mean()
             losses = {
                 "displacement_loss": displacement_loss,
             }
+            if self.use_hard_aware_loss and self.hard_chamfer_weight > 0:
+                losses["patch_chamfer_loss"] = self.get_patch_chamfer_loss(
+                    pc_pred=pc_pred,
+                    pc_clean=pc_clean_for_loss,
+                    sigma=score_sigma,
+                    hard_weight=hard_weight,
+                )
+            if self.use_hard_aware_loss and self.hard_normal_weight > 0:
+                normal_loss = self.get_normalized_surface_loss(
+                    pc_pred=pc_pred,
+                    pc_clean=pc_clean,
+                    pc_anchor=pc_clean_for_loss,
+                )
+                if hard_weight is not None:
+                    normal_loss = normal_loss * hard_weight.mean()
+                losses["hard_normal_loss"] = normal_loss
             if self.use_sigma_head:
                 sigma_target = self.clamp_edm_sigma(score_sigma)
                 sigma_loss = (

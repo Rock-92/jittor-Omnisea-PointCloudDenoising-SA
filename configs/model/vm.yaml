@@ -10,7 +10,7 @@ attention_weight_init: [1.0, 0.6, 0.3, 0.2]
 attention_ffn_hidden_dim: 512
 global_token_blocks: 4
 global_token_ffn_hidden_dim: 512
-use_edgeconv_branch: true
+use_edgeconv_branch: false
 edgeconv_branch_k: 16
 edgeconv_branch_dim: 128
 
@@ -29,6 +29,12 @@ use_patch_scale_condition: true
 patch_scale_eps: 0.0001
 use_sigma_head: false
 sigma_head_hidden_dim: 128
+use_hard_aware_loss: true
+hard_relative_sigma_ref: 0.18
+hard_weight_scale: 2.0
+hard_weight_max: 3.0
+hard_chamfer_weight: 0.08
+hard_normal_weight: 0.02
 edm_sampler: heun
 edm_sigma_min: 0.0001
 edm_sigma_max: 0.025
