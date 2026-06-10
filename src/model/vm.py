@@ -50,6 +50,22 @@ class VelocityModule(ModelSpec):
         self.hard_relative_sigma_ref = float(cfg.get('hard_relative_sigma_ref', 0.18))
         self.hard_weight_scale = float(cfg.get('hard_weight_scale', 1.5))
         self.hard_weight_max = float(cfg.get('hard_weight_max', 3.0))
+        self.use_geometry_hard_weight = cfg.get('use_geometry_hard_weight', True)
+        self.hard_geometry_k = int(cfg.get('hard_geometry_k', 24))
+        self.hard_geometry_top_fraction = float(
+            cfg.get('hard_geometry_top_fraction', 0.25)
+        )
+        self.hard_geometry_ref = float(cfg.get('hard_geometry_ref', 0.45))
+        self.hard_geometry_weight_scale = float(
+            cfg.get('hard_geometry_weight_scale', 1.5)
+        )
+        self.use_length_projection_loss = cfg.get(
+            'use_length_projection_loss',
+            True,
+        )
+        self.length_projection_over_weight = float(
+            cfg.get('length_projection_over_weight', 0.25)
+        )
         self.hard_chamfer_weight = float(cfg.get('hard_chamfer_weight', 0.05))
         self.hard_normal_weight = float(cfg.get('hard_normal_weight', 0.02))
         
@@ -179,7 +195,63 @@ class VelocityModule(ModelSpec):
         c_in = 1.0 / jt.sqrt(denom)
         return c_skip, c_out, c_in
 
-    def get_hard_patch_weight(self, pc_noisy, sigma):
+    def get_patch_geometry_difficulty(self, pc_clean, pc_anchor=None):
+        """
+        Estimate local non-planarity from clean supervision. The normalized
+        covariance determinant is near zero for locally planar neighborhoods
+        and grows for curved or volumetric geometry.
+        """
+        if pc_anchor is None:
+            pc_anchor = pc_clean
+        k = min(self.hard_geometry_k, pc_clean.shape[1])
+        if k < 4:
+            return jt.zeros((pc_clean.shape[0], 1))
+
+        dist = ((pc_anchor.unsqueeze(2) - pc_clean.unsqueeze(1)) ** 2.0).sum(dim=-1)
+        _, idx = jt.topk(dist, k=k, dim=-1, largest=False)
+        neighbors = []
+        for b in range(pc_clean.shape[0]):
+            neighbors.append(pc_clean[b][idx[b]])
+        neighbors = jt.stack(neighbors, dim=0)
+        centered = neighbors - neighbors.mean(dim=2).unsqueeze(2)
+
+        x = centered[:, :, :, 0]
+        y = centered[:, :, :, 1]
+        z = centered[:, :, :, 2]
+        cxx = (x * x).mean(dim=2)
+        cyy = (y * y).mean(dim=2)
+        czz = (z * z).mean(dim=2)
+        cxy = (x * y).mean(dim=2)
+        cxz = (x * z).mean(dim=2)
+        cyz = (y * z).mean(dim=2)
+        det = (
+            cxx * cyy * czz
+            + 2.0 * cxy * cxz * cyz
+            - cxx * cyz * cyz
+            - cyy * cxz * cxz
+            - czz * cxy * cxy
+        )
+        trace = cxx + cyy + czz
+        nonplanarity = 27.0 * jt.maximum(det, 0.0) / jt.maximum(
+            trace ** 3.0,
+            self.patch_scale_eps ** 6.0,
+        )
+        nonplanarity = jt.minimum(jt.maximum(nonplanarity, 0.0), 1.0)
+
+        top_count = max(
+            1,
+            int(round(pc_anchor.shape[1] * self.hard_geometry_top_fraction)),
+        )
+        top_count = min(top_count, pc_anchor.shape[1])
+        top_values, _ = jt.topk(
+            nonplanarity,
+            k=top_count,
+            dim=1,
+            largest=True,
+        )
+        return top_values.mean(dim=1).reshape(pc_clean.shape[0], 1)
+
+    def get_hard_patch_weight(self, pc_noisy, sigma, pc_clean=None, pc_anchor=None):
         if not self.use_hard_aware_loss:
             return None
         patch_scale = self.get_patch_scale(pc_noisy)
@@ -188,7 +260,19 @@ class VelocityModule(ModelSpec):
             self.patch_scale_eps,
         )
         hard = jt.maximum(relative_sigma / self.hard_relative_sigma_ref - 1.0, 0.0)
-        weight = 1.0 + self.hard_weight_scale * hard
+        scale_weight = 1.0 + self.hard_weight_scale * hard
+        weight = scale_weight
+        if self.use_geometry_hard_weight and pc_clean is not None:
+            geometry = self.get_patch_geometry_difficulty(
+                pc_clean=pc_clean,
+                pc_anchor=pc_anchor,
+            )
+            geometry_hard = jt.maximum(
+                geometry / self.hard_geometry_ref - 1.0,
+                0.0,
+            )
+            geometry_weight = 1.0 + self.hard_geometry_weight_scale * geometry_hard
+            weight = jt.maximum(scale_weight, geometry_weight)
         return jt.minimum(weight, self.hard_weight_max)
 
     def get_patch_chamfer_loss(self, pc_pred, pc_clean, sigma, hard_weight=None):
@@ -200,6 +284,35 @@ class VelocityModule(ModelSpec):
         if hard_weight is not None:
             loss = loss * hard_weight.reshape(pc_pred.shape[0])
         return loss.mean()
+
+    def get_length_projection_loss(
+        self,
+        pc_pred,
+        pc_noisy,
+        pc_clean,
+        sigma,
+        hard_weight=None,
+    ):
+        target_disp = pc_clean - pc_noisy
+        pred_disp = pc_pred - pc_noisy
+        target_length = jt.sqrt(
+            (target_disp ** 2.0).sum(dim=-1) + self.patch_scale_eps ** 2.0
+        )
+        target_direction = target_disp / target_length.unsqueeze(-1)
+        projected_length = (pred_disp * target_direction).sum(dim=-1)
+
+        length_error = target_length - projected_length
+        under_error = jt.maximum(length_error, 0.0)
+        over_error = jt.maximum(-length_error, 0.0)
+        point_loss = (
+            under_error ** 2.0
+            + self.length_projection_over_weight * over_error ** 2.0
+        )
+        sigma2 = self.clamp_edm_sigma(sigma).reshape(pc_pred.shape[0]) ** 2.0
+        patch_loss = point_loss.mean(dim=1) / sigma2
+        if hard_weight is not None:
+            patch_loss = patch_loss * hard_weight.reshape(pc_pred.shape[0])
+        return patch_loss.mean()
 
     def encode_features(self, pc_noisy, sigma=None, point_idx=None):
         """
@@ -283,7 +396,13 @@ class VelocityModule(ModelSpec):
             pc_base = pc_noisy[:, point_idx, :]
         return clean - pc_base
     
-    def get_normalized_surface_loss(self, pc_pred, pc_clean, pc_anchor):
+    def get_normalized_surface_loss(
+        self,
+        pc_pred,
+        pc_clean,
+        pc_anchor,
+        reduction="mean",
+    ):
         """
         Penalize point-to-local-plane distance. Each plane is estimated around
         the paired clean supervision point.
@@ -310,7 +429,12 @@ class VelocityModule(ModelSpec):
         )
         normal = normal / (((normal ** 2.0).sum(dim=-1) + 1e-8) ** 0.5).unsqueeze(-1)
         plane_dist = (((pc_pred - p0) * normal).sum(dim=-1) ** 2.0)
-        return (plane_dist / self.dsm_sigma).mean()
+        loss = (plane_dist / self.dsm_sigma).mean(dim=1)
+        if reduction == "none":
+            return loss
+        if reduction != "mean":
+            raise ValueError(f"unsupported surface loss reduction: {reduction}")
+        return loss.mean()
 
     def get_supervised_losses(self, pc_noisy, pc_clean, score_sigma=None):
         """
@@ -335,7 +459,12 @@ class VelocityModule(ModelSpec):
                 point_idx=point_idx,
             )
             mse = ((pc_pred - pc_clean_for_loss) ** 2.0).sum(dim=-1)
-            hard_weight = self.get_hard_patch_weight(pc_noisy, score_sigma)
+            hard_weight = self.get_hard_patch_weight(
+                pc_noisy=pc_noisy,
+                sigma=score_sigma,
+                pc_clean=pc_clean,
+                pc_anchor=pc_clean_for_loss,
+            )
             if self.edm_loss_weighting:
                 sigma_for_weight = self.clamp_edm_sigma(score_sigma)
                 sigma2 = sigma_for_weight ** 2.0
@@ -360,10 +489,19 @@ class VelocityModule(ModelSpec):
                     pc_pred=pc_pred,
                     pc_clean=pc_clean,
                     pc_anchor=pc_clean_for_loss,
+                    reduction="none",
                 )
                 if hard_weight is not None:
-                    normal_loss = normal_loss * hard_weight.mean()
-                losses["hard_normal_loss"] = normal_loss
+                    normal_loss = normal_loss * hard_weight.reshape(B)
+                losses["hard_normal_loss"] = normal_loss.mean()
+            if self.use_length_projection_loss:
+                losses["length_projection_loss"] = self.get_length_projection_loss(
+                    pc_pred=pc_pred,
+                    pc_noisy=pc_noisy_for_loss,
+                    pc_clean=pc_clean_for_loss,
+                    sigma=score_sigma,
+                    hard_weight=hard_weight,
+                )
             if self.use_sigma_head:
                 sigma_target = self.clamp_edm_sigma(score_sigma)
                 sigma_loss = (

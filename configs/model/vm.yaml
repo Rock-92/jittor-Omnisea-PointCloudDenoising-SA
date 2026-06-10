@@ -33,6 +33,13 @@ use_hard_aware_loss: true
 hard_relative_sigma_ref: 0.18
 hard_weight_scale: 2.0
 hard_weight_max: 3.0
+use_geometry_hard_weight: true
+hard_geometry_k: 24
+hard_geometry_top_fraction: 0.25
+hard_geometry_ref: 0.45
+hard_geometry_weight_scale: 1.5
+use_length_projection_loss: true
+length_projection_over_weight: 0.25
 hard_chamfer_weight: 0.08
 hard_normal_weight: 0.02
 edm_sampler: heun
