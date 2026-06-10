@@ -1,5 +1,5 @@
 mode: train
-load_ckpt: null
+load_ckpt: outputs/checkpoints/vm_ssl/checkpoint_best.pkl
 debug: false
 
 components:
