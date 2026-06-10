@@ -15,6 +15,10 @@ tools/*
 !tools/check_patch_score_distribution_outputs62.py
 !tools/analyze_low_patch_modulation_outputs62.py
 !tools/expanded_patch_lowpoint_outputs62.py
+!tools/hard_patch_common.py
+!tools/build_hard_patch_dataset.py
+!tools/train_hard_patch_overfit.py
+!tools/diagnose_hard_patch_overfit.py
 
 # Datasets and ground truth
 dataset_train/
