@@ -71,7 +71,85 @@ def collect_train_parameters(model, scope):
     raise ValueError(f"unsupported train scope: {scope}")
 
 
-def edm_weighted_mse(model, pc_noisy, pc_clean, sigma, loss_mode="mse", under_length_weight=0.0):
+def gather_points(x, idx):
+    gathered = []
+    for b in range(x.shape[0]):
+        gathered.append(x[b][idx[b]])
+    return jt.stack(gathered, dim=0)
+
+
+def pairwise_sqdist(a, b):
+    return ((a.unsqueeze(2) - b.unsqueeze(1)) ** 2.0).sum(dim=-1)
+
+
+def patch_chamfer_loss(pc_pred, pc_clean, sigma, max_points=256):
+    n_points = pc_pred.shape[1]
+    if max_points > 0 and n_points > max_points:
+        idx = np.random.permutation(n_points)[:max_points].astype(np.int32)
+        idx = jt.array(idx)
+        pred = pc_pred[:, idx, :]
+        clean = pc_clean[:, idx, :]
+    else:
+        pred = pc_pred
+        clean = pc_clean
+    dist = pairwise_sqdist(pred, clean)
+    pred_to_clean = dist.min(dim=2)
+    clean_to_pred = dist.min(dim=1)
+    sigma2 = model_sigma2(sigma, pc_pred.shape[0])
+    return ((pred_to_clean.mean(dim=1) + clean_to_pred.mean(dim=1)) / sigma2.reshape(-1)).mean()
+
+
+def local_normal_projection_loss(pc_pred, pc_clean, sigma, k=16, max_points=256):
+    n_points = pc_pred.shape[1]
+    if max_points > 0 and n_points > max_points:
+        idx_np = np.random.permutation(n_points)[:max_points].astype(np.int32)
+        idx = jt.array(idx_np)
+        pred_anchor = pc_pred[:, idx, :]
+        clean_anchor = pc_clean[:, idx, :]
+    else:
+        pred_anchor = pc_pred
+        clean_anchor = pc_clean
+    dist = pairwise_sqdist(clean_anchor, pc_clean)
+    _, nn_idx = jt.topk(dist, k=min(k, pc_clean.shape[1]), dim=-1, largest=False)
+    neighbors = []
+    for b in range(pc_clean.shape[0]):
+        neighbors.append(pc_clean[b][nn_idx[b]])
+    neighbors = jt.stack(neighbors, dim=0)
+    centered = neighbors - neighbors.mean(dim=2).unsqueeze(2)
+    cov = centered.transpose(0, 1, 3, 2) @ centered
+    cov_np = cov.detach().numpy()
+    normals = []
+    for b in range(cov_np.shape[0]):
+        batch_normals = []
+        for i in range(cov_np.shape[1]):
+            eigvals, eigvecs = np.linalg.eigh(cov_np[b, i])
+            batch_normals.append(eigvecs[:, int(np.argmin(eigvals))])
+        normals.append(batch_normals)
+    normals = jt.array(np.asarray(normals, dtype=np.float32))
+    normals = normals / jt.sqrt((normals ** 2.0).sum(dim=-1, keepdims=True) + 1e-8)
+    signed = ((pred_anchor - clean_anchor) * normals).sum(dim=-1)
+    sigma2 = model_sigma2(sigma, pc_pred.shape[0])
+    return ((signed ** 2.0).mean(dim=1) / sigma2.reshape(-1)).mean()
+
+
+def model_sigma2(sigma, batch_size):
+    sigma = sigma.reshape(batch_size, 1)
+    return jt.maximum(sigma, 1e-4) ** 2.0
+
+
+def edm_weighted_mse(
+    model,
+    pc_noisy,
+    pc_clean,
+    sigma,
+    loss_mode="mse",
+    under_length_weight=0.0,
+    chamfer_weight=0.0,
+    normal_weight=0.0,
+    chamfer_points=256,
+    normal_points=256,
+    normal_k=16,
+):
     pc_pred = model.predict_clean(pc_noisy, sigma=sigma)
     mse = ((pc_pred - pc_clean) ** 2.0).sum(dim=-1)
     sigma_for_weight = model.clamp_edm_sigma(sigma)
@@ -79,7 +157,22 @@ def edm_weighted_mse(model, pc_noisy, pc_clean, sigma, loss_mode="mse", under_le
     sigma_data2 = model.sigma_data ** 2.0
     weight = (sigma2 + sigma_data2) / (sigma2 * sigma_data2)
     loss = (mse * weight.reshape(pc_noisy.shape[0], 1)).mean()
-    if loss_mode == "mse":
+    if loss_mode in {"mse", "mse_chamfer", "mse_chamfer_normal"}:
+        if loss_mode in {"mse_chamfer", "mse_chamfer_normal"}:
+            loss = loss + float(chamfer_weight) * patch_chamfer_loss(
+                pc_pred,
+                pc_clean,
+                sigma,
+                max_points=chamfer_points,
+            )
+        if loss_mode == "mse_chamfer_normal":
+            loss = loss + float(normal_weight) * local_normal_projection_loss(
+                pc_pred,
+                pc_clean,
+                sigma,
+                k=normal_k,
+                max_points=normal_points,
+            )
         return loss, pc_pred
     target_len = jt.sqrt(((pc_clean - pc_noisy) ** 2.0).sum(dim=-1) + 1e-8)
     pred_len = jt.sqrt(((pc_pred - pc_noisy) ** 2.0).sum(dim=-1) + 1e-8)
@@ -144,8 +237,17 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--seed", type=int, default=20260610)
     parser.add_argument("--train-scope", choices=["decoder", "decoder_edge", "all"], default="decoder_edge")
-    parser.add_argument("--loss-mode", choices=["mse", "mse_underlen"], default="mse")
+    parser.add_argument(
+        "--loss-mode",
+        choices=["mse", "mse_underlen", "mse_chamfer", "mse_chamfer_normal"],
+        default="mse",
+    )
     parser.add_argument("--under-length-weight", type=float, default=0.05)
+    parser.add_argument("--chamfer-weight", type=float, default=0.05)
+    parser.add_argument("--normal-weight", type=float, default=0.02)
+    parser.add_argument("--chamfer-points", type=int, default=256)
+    parser.add_argument("--normal-points", type=int, default=256)
+    parser.add_argument("--normal-k", type=int, default=16)
     parser.add_argument("--eval-mode", choices=["fixed", "heun"], default="fixed")
     parser.add_argument("--use-cuda", action="store_true")
     args = parser.parse_args()
@@ -199,6 +301,11 @@ def main():
                 sigma,
                 loss_mode=args.loss_mode,
                 under_length_weight=args.under_length_weight,
+                chamfer_weight=args.chamfer_weight,
+                normal_weight=args.normal_weight,
+                chamfer_points=args.chamfer_points,
+                normal_points=args.normal_points,
+                normal_k=args.normal_k,
             )
             optimizer.zero_grad()
             optimizer.backward(loss)
