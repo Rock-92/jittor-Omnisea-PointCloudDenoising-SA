@@ -59,7 +59,7 @@ def classifier_outputs(model, noisy, coarse, point_indices, batch_size):
     return np.concatenate(logits_all), np.concatenate(sigma_all)
 
 
-def load_refiner(path, args):
+def load_refiner(path, args, adaptive_v2):
     model = MultiStageGeometryRefiner(
         num_stages=args.stages,
         stage_max_residuals=(
@@ -69,7 +69,7 @@ def load_refiner(path, args):
         k=args.k,
         local_dim=args.local_dim,
         hidden_dim=args.hidden_dim,
-        adaptive_v2=True,
+        adaptive_v2=adaptive_v2,
         min_residual_ratio=args.min_residual_ratio,
     )
     model.load(path)
@@ -138,6 +138,9 @@ def main():
     parser.add_argument("--low-refiner", required=True)
     parser.add_argument("--medium-refiner", required=True)
     parser.add_argument("--high-refiner", required=True)
+    parser.add_argument("--low-refiner-v1", action="store_true")
+    parser.add_argument("--medium-refiner-v1", action="store_true")
+    parser.add_argument("--high-refiner-v1", action="store_true")
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--coarse-cache", required=True)
     parser.add_argument("--out-dir", required=True)
@@ -171,9 +174,21 @@ def main():
         args.coarse_mode,
     )
     refiners = [
-        load_refiner(args.low_refiner, args),
-        load_refiner(args.medium_refiner, args),
-        load_refiner(args.high_refiner, args),
+        load_refiner(
+            args.low_refiner,
+            args,
+            adaptive_v2=not args.low_refiner_v1,
+        ),
+        load_refiner(
+            args.medium_refiner,
+            args,
+            adaptive_v2=not args.medium_refiner_v1,
+        ),
+        load_refiner(
+            args.high_refiner,
+            args,
+            adaptive_v2=not args.high_refiner_v1,
+        ),
     ]
     expert_predictions = [
         predict(
