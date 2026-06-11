@@ -58,7 +58,7 @@ def excluded_paths(dataset_paths):
 
 def predict_patch_batches(vm, classifier, refiners, patches, args):
     coarse_all = []
-    oracle_all = []
+    expert_all = [[], [], []]
     soft_all = []
     probabilities_all = []
     point_indices = np.linspace(
@@ -87,19 +87,27 @@ def predict_patch_batches(vm, classifier, refiners, patches, args):
                 refiner(coarse, noisy)[0].numpy()
                 for refiner in refiners
             ]
-            oracle = expert_predictions[args.noise_band_index]
             soft = sum(
                 expert_predictions[index]
                 * probabilities[:, index, None, None]
                 for index in range(3)
             )
             coarse_all.append(coarse.numpy().astype(np.float32, copy=False))
-            oracle_all.append(oracle.astype(np.float32, copy=False))
+            for expert_index in range(3):
+                expert_all[expert_index].append(
+                    expert_predictions[expert_index].astype(
+                        np.float32,
+                        copy=False,
+                    )
+                )
             soft_all.append(soft.astype(np.float32, copy=False))
             probabilities_all.append(probabilities)
     return (
         np.concatenate(coarse_all),
-        np.concatenate(oracle_all),
+        [
+            np.concatenate(expert_predictions)
+            for expert_predictions in expert_all
+        ],
         np.concatenate(soft_all),
         np.concatenate(probabilities_all),
     )
@@ -286,7 +294,7 @@ def main():
         )
         (
             coarse_patches,
-            oracle_patches,
+            expert_patches,
             soft_patches,
             probabilities,
         ) = predict_patch_batches(vm, classifier, refiners, patches, args)
@@ -295,14 +303,6 @@ def main():
             "coarse": fuse_patches(
                 noisy,
                 coarse_patches,
-                seeds_np,
-                point_indices,
-                patch_distances,
-                args.fusion_tau,
-            ),
-            "oracle": fuse_patches(
-                noisy,
-                oracle_patches,
                 seeds_np,
                 point_indices,
                 patch_distances,
@@ -317,6 +317,16 @@ def main():
                 args.fusion_tau,
             ),
         }
+        for expert_index, expert_name in enumerate(BAND_NAMES):
+            outputs[f"expert_{expert_name}"] = fuse_patches(
+                noisy,
+                expert_patches[expert_index],
+                seeds_np,
+                point_indices,
+                patch_distances,
+                args.fusion_tau,
+            )
+        outputs["oracle"] = outputs[f"expert_{BAND_NAMES[band_index]}"]
         scores = {
             name: score_prediction(
                 noisy,
@@ -340,7 +350,28 @@ def main():
         for name, method_scores in scores.items():
             for key, value in method_scores.items():
                 row[f"{name}_{key}"] = value
-        for name in ["oracle", "soft"]:
+        expert_scores = [
+            scores[f"expert_{expert_name}"]["final_score"]
+            for expert_name in BAND_NAMES
+        ]
+        best_expert_index = int(np.argmax(expert_scores))
+        outputs["best_expert"] = outputs[
+            f"expert_{BAND_NAMES[best_expert_index]}"
+        ]
+        scores["best_expert"] = scores[
+            f"expert_{BAND_NAMES[best_expert_index]}"
+        ]
+        row["best_expert"] = BAND_NAMES[best_expert_index]
+        for key, value in scores["best_expert"].items():
+            row[f"best_expert_{key}"] = value
+        for name in [
+            "oracle",
+            "soft",
+            "best_expert",
+            "expert_low",
+            "expert_medium",
+            "expert_high",
+        ]:
             row[f"{name}_cd_gain"] = (
                 row[f"{name}_cd_score"] - row["coarse_cd_score"]
             )
@@ -370,6 +401,25 @@ def main():
         },
         "oracle": grouped_summary(rows, "oracle"),
         "soft": grouped_summary(rows, "soft"),
+        "best_expert": grouped_summary(rows, "best_expert"),
+        "expert_matrix": {
+            expert_name: grouped_summary(
+                rows,
+                f"expert_{expert_name}",
+            )
+            for expert_name in BAND_NAMES
+        },
+        "best_expert_counts": {
+            true_band: {
+                expert_name: sum(
+                    row["noise_band"] == true_band
+                    and row["best_expert"] == expert_name
+                    for row in rows
+                )
+                for expert_name in BAND_NAMES
+            }
+            for true_band in BAND_NAMES
+        },
         "routing_loss": {
             "overall": (
                 grouped_summary(rows, "oracle")["overall"]["final_gain"]["mean"]
@@ -380,6 +430,27 @@ def main():
                     grouped_summary(rows, "oracle")["by_noise_band"][band][
                         "final_gain"
                     ]["mean"]
+                    - grouped_summary(rows, "soft")["by_noise_band"][band][
+                        "final_gain"
+                    ]["mean"]
+                )
+                for band in BAND_NAMES
+            },
+        },
+        "soft_to_best_loss": {
+            "overall": (
+                grouped_summary(rows, "best_expert")["overall"][
+                    "final_gain"
+                ]["mean"]
+                - grouped_summary(rows, "soft")["overall"][
+                    "final_gain"
+                ]["mean"]
+            ),
+            "by_noise_band": {
+                band: (
+                    grouped_summary(rows, "best_expert")["by_noise_band"][
+                        band
+                    ]["final_gain"]["mean"]
                     - grouped_summary(rows, "soft")["by_noise_band"][band][
                         "final_gain"
                     ]["mean"]
