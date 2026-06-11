@@ -25,6 +25,7 @@ tools/*
 !tools/train_multistage_refinement_probe.py
 !tools/evaluate_multistage_refinement_probe.py
 !tools/evaluate_full_cloud_refinement.py
+!tools/infer_full_cloud_refinement.py
 
 # Datasets and ground truth
 dataset_train/
