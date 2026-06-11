@@ -19,7 +19,7 @@ from tools.evaluate_full_cloud_refinement import (  # noqa: E402
     build_patches,
     fuse_patches,
 )
-from tools.evaluate_three_expert_refinement import softmax  # noqa: E402
+from tools.evaluate_three_expert_refinement import routing_weights  # noqa: E402
 from tools.hard_patch_common import load_model, read_datalist  # noqa: E402
 
 
@@ -75,11 +75,23 @@ def predict_patch_batches(vm, classifier, refiners, patches, args):
                 coarse = vm.predict_clean(noisy, sigma=sigma)
             else:
                 coarse, _ = vm.denoise_langevin_dynamics(noisy)
-            logits, _ = classifier(
+            logits, classifier_output = classifier(
                 noisy[:, point_indices, :],
                 coarse[:, point_indices, :],
             )
-            probabilities = softmax(logits.numpy(), args.temperature)
+            predicted_sigma = (
+                0.005
+                + 0.015
+                * classifier_output["sigma_normalized"].numpy().reshape(-1)
+            )
+            probabilities = routing_weights(
+                logits.numpy(),
+                predicted_sigma,
+                args.temperature,
+                mode=args.routing_mode,
+                high_threshold=args.high_route_threshold,
+                adjacent_boundary=args.adjacent_boundary,
+            )
             expert_predictions = [
                 refiner(coarse, noisy)[0].numpy()
                 for refiner in refiners
@@ -125,6 +137,13 @@ def main():
     parser.add_argument("--coarse-mode", choices=["fixed", "heun"], default="heun")
     parser.add_argument("--sigma", type=float, default=0.020)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--routing-mode",
+        choices=["soft", "sparse"],
+        default="soft",
+    )
+    parser.add_argument("--high-route-threshold", type=float, default=0.45)
+    parser.add_argument("--adjacent-boundary", type=float, default=0.0125)
     parser.add_argument("--classifier-points", type=int, default=256)
     parser.add_argument("--classifier-k", type=int, default=24)
     parser.add_argument("--classifier-local-dim", type=int, default=96)

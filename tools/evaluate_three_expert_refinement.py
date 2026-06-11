@@ -39,6 +39,41 @@ def softmax(logits, temperature):
     return probabilities / probabilities.sum(axis=1, keepdims=True)
 
 
+def routing_weights(
+    logits,
+    predicted_sigma,
+    temperature,
+    mode="soft",
+    high_threshold=0.45,
+    adjacent_boundary=0.0125,
+):
+    probabilities = softmax(logits, temperature)
+    if mode == "soft":
+        return probabilities
+    if mode != "sparse":
+        raise ValueError(f"unsupported routing mode: {mode}")
+
+    predicted_sigma = np.asarray(predicted_sigma).reshape(-1)
+    if predicted_sigma.shape[0] != probabilities.shape[0]:
+        raise ValueError("predicted sigma count does not match classifier logits")
+
+    weights = np.zeros_like(probabilities)
+    predicted_band = probabilities.argmax(axis=1)
+    high_confidence = (
+        (predicted_band == 2)
+        & (probabilities[:, 2] >= float(high_threshold))
+    )
+    weights[high_confidence, 2] = 1.0
+
+    remaining = ~high_confidence
+    lower = remaining & (predicted_sigma < float(adjacent_boundary))
+    upper = remaining & ~lower
+    weights[lower, :2] = probabilities[lower, :2]
+    weights[upper, 1:] = probabilities[upper, 1:]
+    weights /= np.maximum(weights.sum(axis=1, keepdims=True), 1e-12)
+    return weights
+
+
 def classifier_outputs(model, noisy, coarse, point_indices, batch_size):
     model.eval()
     logits_all = []
@@ -147,6 +182,13 @@ def main():
     parser.add_argument("--mesh-root", default="dataset_clean")
     parser.add_argument("--coarse-mode", choices=["fixed", "heun"], default="heun")
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--routing-mode",
+        choices=["soft", "sparse"],
+        default="soft",
+    )
+    parser.add_argument("--high-route-threshold", type=float, default=0.45)
+    parser.add_argument("--adjacent-boundary", type=float, default=0.0125)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--classifier-points", type=int, default=256)
     parser.add_argument("--classifier-k", type=int, default=24)
@@ -218,7 +260,14 @@ def main():
         point_indices,
         args.batch_size,
     )
-    probabilities = softmax(logits, args.temperature)
+    probabilities = routing_weights(
+        logits,
+        predicted_sigma,
+        args.temperature,
+        mode=args.routing_mode,
+        high_threshold=args.high_route_threshold,
+        adjacent_boundary=args.adjacent_boundary,
+    )
     soft_prediction = sum(
         expert_predictions[index] * probabilities[:, index, None, None]
         for index in range(3)
