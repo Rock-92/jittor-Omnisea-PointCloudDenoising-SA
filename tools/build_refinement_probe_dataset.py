@@ -1,4 +1,5 @@
 import argparse
+from collections import Counter
 import json
 import sys
 from pathlib import Path
@@ -14,6 +15,57 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.data.utils import sample_vertex_groups  # noqa: E402
 from tools.hard_patch_common import normalize_pc, read_datalist  # noqa: E402
+
+
+def category_of(rel_path):
+    parts = Path(str(rel_path)).parts
+    return parts[1] if len(parts) > 1 else parts[0]
+
+
+def choose_paths(rel_paths, num_shapes, rng, category_reference=None):
+    rel_paths = list(rel_paths)
+    sample_count = min(int(num_shapes), len(rel_paths))
+    if sample_count == 0:
+        return []
+    if not category_reference:
+        return rng.choice(
+            np.asarray(rel_paths),
+            size=sample_count,
+            replace=False,
+        ).tolist()
+
+    available_counts = Counter(category_of(path) for path in rel_paths)
+    reference_counts = Counter(
+        category_of(path) for path in category_reference
+    )
+    category_mass = {
+        category: reference_counts[category]
+        for category in available_counts
+        if reference_counts[category] > 0
+    }
+    if not category_mass:
+        raise ValueError(
+            "category reference has no categories available in the split"
+        )
+    weights = np.asarray(
+        [
+            category_mass.get(category_of(path), 0.0)
+            / available_counts[category_of(path)]
+            for path in rel_paths
+        ],
+        dtype=np.float64,
+    )
+    positive = np.flatnonzero(weights > 0.0)
+    if positive.size < sample_count:
+        sample_count = int(positive.size)
+    weights /= weights.sum()
+    indices = rng.choice(
+        np.arange(len(rel_paths)),
+        size=sample_count,
+        replace=False,
+        p=weights,
+    )
+    return [rel_paths[int(index)] for index in indices]
 
 
 def sample_shape(mesh_path):
@@ -46,12 +98,16 @@ def build_split(
     patches_per_shape,
     patch_size,
     noise_std,
+    noise_std_min,
+    noise_std_max,
     rng,
+    category_reference=None,
 ):
-    chosen = rng.choice(
-        np.asarray(rel_paths),
-        size=min(int(num_shapes), len(rel_paths)),
-        replace=False,
+    chosen = choose_paths(
+        rel_paths,
+        num_shapes,
+        rng,
+        category_reference=category_reference,
     )
     noisy_patches = []
     clean_patches = []
@@ -60,6 +116,7 @@ def build_split(
     patch_centers = []
     normalize_centers = []
     normalize_scales = []
+    patch_sigmas = []
     for shape_index, rel_path in enumerate(chosen):
         print(
             f"[{shape_index + 1}/{len(chosen)}] {rel_path}",
@@ -68,8 +125,24 @@ def build_split(
         clean, normalize_center, normalize_scale = sample_shape(
             Path(mesh_root) / rel_path / "models/model_normalized.obj"
         )
+        if noise_std_min is not None or noise_std_max is not None:
+            lower = (
+                float(noise_std)
+                if noise_std_min is None
+                else float(noise_std_min)
+            )
+            upper = (
+                float(noise_std)
+                if noise_std_max is None
+                else float(noise_std_max)
+            )
+            if lower > upper:
+                raise ValueError("noise-std-min must be <= noise-std-max")
+            shape_noise_std = float(rng.uniform(lower, upper))
+        else:
+            shape_noise_std = float(noise_std)
         noisy = clean + (
-            rng.standard_normal(clean.shape) * float(noise_std)
+            rng.standard_normal(clean.shape) * shape_noise_std
         ).astype(np.float32)
         seeds = rng.choice(
             np.arange(noisy.shape[0]),
@@ -100,14 +173,14 @@ def build_split(
             patch_centers.append(center.astype(np.float32, copy=False))
             normalize_centers.append(normalize_center)
             normalize_scales.append(normalize_scale)
+            patch_sigmas.append(shape_noise_std)
     return {
         "pc_noisy": np.stack(noisy_patches),
         "pc_clean": np.stack(clean_patches),
-        "score_sigma": np.full(
-            (len(noisy_patches), 1),
-            float(noise_std),
+        "score_sigma": np.asarray(
+            patch_sigmas,
             dtype=np.float32,
-        ),
+        ).reshape(-1, 1),
         "rel_path": np.asarray(patch_paths),
         "seed_idx": np.asarray(seed_indices, dtype=np.int64),
         "patch_center": np.stack(patch_centers).astype(
@@ -143,8 +216,23 @@ def main():
     parser.add_argument("--val-patches-per-shape", type=int, default=4)
     parser.add_argument("--patch-size", type=int, default=1000)
     parser.add_argument("--noise-std", type=float, default=0.020)
+    parser.add_argument("--noise-std-min", type=float, default=None)
+    parser.add_argument("--noise-std-max", type=float, default=None)
     parser.add_argument("--seed", type=int, default=20260612)
     parser.add_argument("--only-val", action="store_true")
+    parser.add_argument(
+        "--train-category-reference-datalist",
+        default=None,
+    )
+    parser.add_argument(
+        "--val-category-reference-datalist",
+        default=None,
+    )
+    parser.add_argument(
+        "--exclude-train-dataset",
+        action="append",
+        default=[],
+    )
     parser.add_argument(
         "--exclude-val-dataset",
         action="append",
@@ -162,6 +250,22 @@ def main():
         rel for rel in read_datalist(args.val_datalist)
         if (mesh_root / rel / "models/model_normalized.obj").exists()
     ]
+    train_category_reference = (
+        read_datalist(args.train_category_reference_datalist)
+        if args.train_category_reference_datalist
+        else None
+    )
+    val_category_reference = (
+        read_datalist(args.val_category_reference_datalist)
+        if args.val_category_reference_datalist
+        else None
+    )
+    if args.exclude_train_dataset:
+        excluded_paths = set()
+        for excluded_dataset in args.exclude_train_dataset:
+            excluded = np.load(excluded_dataset, allow_pickle=True)
+            excluded_paths.update(excluded["rel_path"].tolist())
+        train_paths = [rel for rel in train_paths if rel not in excluded_paths]
     if args.exclude_val_dataset:
         excluded_paths = set()
         for excluded_dataset in args.exclude_val_dataset:
@@ -169,7 +273,7 @@ def main():
             excluded_paths.update(excluded["rel_path"].tolist())
         val_paths = [rel for rel in val_paths if rel not in excluded_paths]
     overlap = set(train_paths) & set(val_paths)
-    if overlap:
+    if overlap and not args.only_val:
         raise ValueError(f"train/val shape overlap: {len(overlap)}")
 
     out_dir = Path(args.out_dir)
@@ -183,7 +287,10 @@ def main():
             args.train_patches_per_shape,
             args.patch_size,
             args.noise_std,
+            args.noise_std_min,
+            args.noise_std_max,
             rng,
+            category_reference=train_category_reference,
         )
     val = build_split(
         val_paths,
@@ -192,7 +299,10 @@ def main():
         args.val_patches_per_shape,
         args.patch_size,
         args.noise_std,
+        args.noise_std_min,
+        args.noise_std_max,
         rng,
+        category_reference=val_category_reference,
     )
     if train is not None:
         np.savez_compressed(out_dir / "train_patches.npz", **train)
@@ -210,6 +320,21 @@ def main():
         "shape_overlap": 0,
         "patch_size": int(args.patch_size),
         "noise_std": float(args.noise_std),
+        "noise_std_min": args.noise_std_min,
+        "noise_std_max": args.noise_std_max,
+        "train_category_counts": (
+            dict(Counter(
+                category_of(path)
+                for path in set(train["rel_path"].tolist())
+            ))
+            if train is not None else {}
+        ),
+        "val_category_counts": dict(
+            Counter(
+                category_of(path)
+                for path in set(val["rel_path"].tolist())
+            )
+        ),
         "seed": int(args.seed),
     }
     (out_dir / "summary.json").write_text(
