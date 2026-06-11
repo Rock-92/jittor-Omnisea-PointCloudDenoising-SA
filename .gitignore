@@ -29,6 +29,9 @@ tools/*
 !tools/evaluate_refinement_noise_estimator.py
 !tools/train_patch_noise_classifier.py
 !tools/evaluate_patch_noise_classifier.py
+!tools/build_refinement_expert_datasets.py
+!tools/evaluate_three_expert_refinement.py
+!tools/infer_three_expert_refinement.py
 
 # Datasets and ground truth
 dataset_train/
