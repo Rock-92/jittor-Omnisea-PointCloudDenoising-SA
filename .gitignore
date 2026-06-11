@@ -19,6 +19,11 @@ tools/*
 !tools/build_hard_patch_dataset.py
 !tools/train_hard_patch_overfit.py
 !tools/diagnose_hard_patch_overfit.py
+!tools/train_refinement_probe.py
+!tools/evaluate_refinement_probe.py
+!tools/build_refinement_probe_dataset.py
+!tools/train_multistage_refinement_probe.py
+!tools/evaluate_multistage_refinement_probe.py
 
 # Datasets and ground truth
 dataset_train/

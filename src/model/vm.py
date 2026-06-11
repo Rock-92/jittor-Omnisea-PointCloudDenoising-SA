@@ -76,6 +76,8 @@ class VelocityModule(ModelSpec):
         self.predict_seed_k = cfg.get('predict_seed_k', 6)
         self.predict_seed_interval = cfg.get('predict_seed_interval', 200)
         self.predict_seed_k_alpha = cfg.get('predict_seed_k_alpha', 1)
+        self.patch_fusion_mode = cfg.get('patch_fusion_mode', 'distance_weighted')
+        self.patch_fusion_tau = float(cfg.get('patch_fusion_tau', 2.0))
         
         # score-matching
         self.dsm_sigma = cfg['dsm_sigma']
@@ -626,6 +628,8 @@ class VelocityModule(ModelSpec):
                     seed_k=self.predict_seed_k,
                     seed_interval=self.predict_seed_interval,
                     seed_k_alpha=self.predict_seed_k_alpha,
+                    fusion_mode=self.patch_fusion_mode,
+                    fusion_tau=self.patch_fusion_tau,
                 )
             pc_denoised = pc_next.detach().numpy()
             res.append({"pc_denoised": pc_denoised})
@@ -715,6 +719,8 @@ def patch_based_denoise(
     seed_k=6,
     seed_interval=200,
     seed_k_alpha=1,
+    fusion_mode="distance_weighted",
+    fusion_tau=2.0,
 ) -> jt.Var:
     """
     pcl_noisy: (N, 3)
@@ -759,13 +765,6 @@ def patch_based_denoise(
     
     patch_dists = patch_dists / (patch_dists[:, -1:].broadcast(patch_dists.shape) + 1e-8)
     
-    all_dists = jt.ones((num_patches, N)) * 1e10
-    
-    for i in range(num_patches):
-        all_dists[i][point_idxs[i]] = patch_dists[i]
-        
-    weights = jt.exp(-all_dists)
-    best_weights_idx, _ = jt.argmax(weights, dim=0)
     patches_denoised = []
     
     i = 0
@@ -783,23 +782,60 @@ def patch_based_denoise(
     
     patches_denoised = jt.concat(patches_denoised, dim=0)
     patches_denoised = patches_denoised + seed_expand
-    pcl_out = []
-    pcl_noisy_flat = pcl_noisy[0]
+    patches_denoised_np = patches_denoised.numpy()
+    pcl_noisy_np = pcl_noisy[0].numpy()
+    point_idxs_np = point_idxs.numpy()
+    patch_dists_np = patch_dists.numpy()
+    memberships = [[] for _ in range(N)]
+    for patch_id in range(num_patches):
+        for local_id, point_id in enumerate(point_idxs_np[patch_id]):
+            memberships[int(point_id)].append(
+                (patch_id, local_id, float(patch_dists_np[patch_id, local_id]))
+            )
+
+    pcl_out = pcl_noisy_np.copy()
     missing_count = 0
     for pidx in range(N):
-        patch_id = best_weights_idx[pidx].item()
-        mask = (point_idxs[patch_id] == pidx)
-        selected = patches_denoised[patch_id][mask]
-        if selected.shape[0] == 0:
-            missing_count += 1
-            selected = pcl_noisy_flat[pidx:pidx+1]
+        point_memberships = memberships[pidx]
+        if fusion_mode == "nearest":
+            if point_memberships:
+                patch_id, local_id, _ = min(
+                    point_memberships,
+                    key=lambda item: item[2],
+                )
+                selected = patches_denoised_np[patch_id, local_id]
+            else:
+                selected = None
+        elif fusion_mode == "distance_weighted":
+            if point_memberships:
+                pred_stack = np.stack(
+                    [
+                        patches_denoised_np[patch_id, local_id]
+                        for patch_id, local_id, _ in point_memberships
+                    ],
+                    axis=0,
+                )
+                weight_stack = np.asarray(
+                    [
+                        np.exp(-float(fusion_tau) * dist)
+                        for _, _, dist in point_memberships
+                    ],
+                    dtype=np.float32,
+                )
+                weight_stack /= max(float(weight_stack.sum()), 1e-8)
+                selected = (pred_stack * weight_stack[:, None]).sum(axis=0)
+            else:
+                selected = None
         else:
-            selected = selected[:1]
-        pcl_out.append(selected)
-    pcl_out = jt.concat(pcl_out, dim=0)
+            raise ValueError(f"unsupported patch fusion mode: {fusion_mode}")
+
+        if selected is None:
+            missing_count += 1
+            continue
+        pcl_out[pidx] = selected
     if missing_count > 0:
         print(
             f"Patch fusion warning: {missing_count}/{N} points were not covered "
             "by any denoised patch; kept their noisy coordinates."
         )
-    return pcl_out
+    return jt.array(pcl_out)
