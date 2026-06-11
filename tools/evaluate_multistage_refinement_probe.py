@@ -30,6 +30,43 @@ from tools.train_multistage_refinement_probe import (  # noqa: E402
 from tools.hard_patch_common import quantile_summary  # noqa: E402
 
 
+def category_of(rel_path):
+    parts = Path(str(rel_path)).parts
+    return parts[1] if len(parts) > 1 else parts[0]
+
+
+def grouped_formal_summary(rows, key):
+    result = {}
+    for value in sorted(set(row[key] for row in rows)):
+        selected = [row for row in rows if row[key] == value]
+        gains = [row["final_gain"] for row in selected]
+        oracle_scores = [
+            max(row["coarse_final_score"], row["refined_final_score"])
+            for row in selected
+        ]
+        result[str(value)] = {
+            "count": len(selected),
+            "coarse_final_score": float(np.mean(
+                [row["coarse_final_score"] for row in selected]
+            )),
+            "refined_final_score": float(np.mean(
+                [row["refined_final_score"] for row in selected]
+            )),
+            "final_gain": quantile_summary(gains),
+            "improved_rate": float(np.mean(
+                [gain > 0.0 for gain in gains]
+            )),
+            "oracle_gate_final_score": float(np.mean(oracle_scores)),
+            "oracle_gate_gain": float(
+                np.mean(oracle_scores)
+                - np.mean(
+                    [row["coarse_final_score"] for row in selected]
+                )
+            ),
+        }
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -90,6 +127,15 @@ def main():
         prediction,
         data["rel_path"],
     )
+    for index, row in enumerate(rows):
+        sigma = float(data["score_sigma"][index].reshape(-1)[0])
+        row["noise_sigma"] = sigma
+        row["noise_band"] = (
+            "low" if sigma < 0.0125
+            else "medium" if sigma < 0.0185
+            else "high"
+        )
+        row["category"] = category_of(row["rel_path"])
     thresholds = add_score_bands(rows)
     summary = full_summary(rows)
     formal_rows = []
@@ -137,6 +183,10 @@ def main():
             formal_row = {
                 "index": index,
                 "rel_path": rel_path,
+                "category": category_of(rel_path),
+                "noise_sigma": float(
+                    data["score_sigma"][index].reshape(-1)[0]
+                ),
                 "coarse_cd_score": metric_to_score(
                     chamfer_distance(
                         coarse_abs,
@@ -184,7 +234,20 @@ def main():
                 formal_row["refined_final_score"]
                 - formal_row["coarse_final_score"]
             )
+            formal_row["noise_band"] = (
+                "low" if formal_row["noise_sigma"] < 0.0125
+                else "medium"
+                if formal_row["noise_sigma"] < 0.0185
+                else "high"
+            )
             formal_rows.append(formal_row)
+        oracle_scores = [
+            max(row["coarse_final_score"], row["refined_final_score"])
+            for row in formal_rows
+        ]
+        coarse_final_score = float(
+            np.mean([row["coarse_final_score"] for row in formal_rows])
+        )
         summary["formal"] = {
             "count": len(formal_rows),
             "coarse_cd_score": float(
@@ -199,9 +262,7 @@ def main():
             "refined_p2s_score": float(
                 np.mean([row["refined_p2s_score"] for row in formal_rows])
             ),
-            "coarse_final_score": float(
-                np.mean([row["coarse_final_score"] for row in formal_rows])
-            ),
+            "coarse_final_score": coarse_final_score,
             "refined_final_score": float(
                 np.mean([row["refined_final_score"] for row in formal_rows])
             ),
@@ -211,7 +272,19 @@ def main():
             "improved_rate": float(
                 np.mean([row["final_gain"] > 0.0 for row in formal_rows])
             ),
+            "oracle_gate_final_score": float(np.mean(oracle_scores)),
+            "oracle_gate_gain": float(
+                np.mean(oracle_scores) - coarse_final_score
+            ),
         }
+        summary["formal_by_noise_band"] = grouped_formal_summary(
+            formal_rows,
+            "noise_band",
+        )
+        summary["formal_by_category"] = grouped_formal_summary(
+            formal_rows,
+            "category",
+        )
     summary["shape_count"] = len(set(data["rel_path"].tolist()))
     summary["score_band_thresholds"] = thresholds.tolist()
     summary["args"] = vars(args)
