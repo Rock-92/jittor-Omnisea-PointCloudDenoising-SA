@@ -91,6 +91,7 @@ def predict_patch_batches(vm, classifier, refiners, patches, args):
                 mode=args.routing_mode,
                 high_threshold=args.high_route_threshold,
                 adjacent_boundary=args.adjacent_boundary,
+                high_sigma_boundary=args.high_sigma_boundary,
             )
             expert_predictions = [
                 refiner(coarse, noisy)[0].numpy()
@@ -144,6 +145,7 @@ def main():
     )
     parser.add_argument("--high-route-threshold", type=float, default=0.45)
     parser.add_argument("--adjacent-boundary", type=float, default=0.0125)
+    parser.add_argument("--high-sigma-boundary", type=float, default=0.0145)
     parser.add_argument("--classifier-points", type=int, default=256)
     parser.add_argument("--classifier-k", type=int, default=24)
     parser.add_argument("--classifier-local-dim", type=int, default=96)

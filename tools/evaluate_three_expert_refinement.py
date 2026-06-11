@@ -46,6 +46,7 @@ def routing_weights(
     mode="soft",
     high_threshold=0.45,
     adjacent_boundary=0.0125,
+    high_sigma_boundary=0.0145,
 ):
     probabilities = softmax(logits, temperature)
     if mode == "soft":
@@ -59,13 +60,16 @@ def routing_weights(
 
     weights = np.zeros_like(probabilities)
     predicted_band = probabilities.argmax(axis=1)
-    high_confidence = (
-        (predicted_band == 2)
-        & (probabilities[:, 2] >= float(high_threshold))
+    high_only = (
+        (
+            (predicted_band == 2)
+            & (probabilities[:, 2] >= float(high_threshold))
+        )
+        | (predicted_sigma >= float(high_sigma_boundary))
     )
-    weights[high_confidence, 2] = 1.0
+    weights[high_only, 2] = 1.0
 
-    remaining = ~high_confidence
+    remaining = ~high_only
     lower = remaining & (predicted_sigma < float(adjacent_boundary))
     upper = remaining & ~lower
     weights[lower, :2] = probabilities[lower, :2]
@@ -189,6 +193,7 @@ def main():
     )
     parser.add_argument("--high-route-threshold", type=float, default=0.45)
     parser.add_argument("--adjacent-boundary", type=float, default=0.0125)
+    parser.add_argument("--high-sigma-boundary", type=float, default=0.0145)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--classifier-points", type=int, default=256)
     parser.add_argument("--classifier-k", type=int, default=24)
@@ -267,6 +272,7 @@ def main():
         mode=args.routing_mode,
         high_threshold=args.high_route_threshold,
         adjacent_boundary=args.adjacent_boundary,
+        high_sigma_boundary=args.high_sigma_boundary,
     )
     soft_prediction = sum(
         expert_predictions[index] * probabilities[:, index, None, None]
