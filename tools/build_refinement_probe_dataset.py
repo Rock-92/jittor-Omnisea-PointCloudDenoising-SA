@@ -102,6 +102,7 @@ def build_split(
     noise_std_max,
     rng,
     category_reference=None,
+    balanced_noise_bands=None,
 ):
     chosen = choose_paths(
         rel_paths,
@@ -117,6 +118,11 @@ def build_split(
     normalize_centers = []
     normalize_scales = []
     patch_sigmas = []
+    if balanced_noise_bands:
+        band_indices = np.arange(len(chosen)) % len(balanced_noise_bands)
+        rng.shuffle(band_indices)
+    else:
+        band_indices = None
     for shape_index, rel_path in enumerate(chosen):
         print(
             f"[{shape_index + 1}/{len(chosen)}] {rel_path}",
@@ -125,7 +131,10 @@ def build_split(
         clean, normalize_center, normalize_scale = sample_shape(
             Path(mesh_root) / rel_path / "models/model_normalized.obj"
         )
-        if noise_std_min is not None or noise_std_max is not None:
+        if balanced_noise_bands:
+            lower, upper = balanced_noise_bands[int(band_indices[shape_index])]
+            shape_noise_std = float(rng.uniform(lower, upper))
+        elif noise_std_min is not None or noise_std_max is not None:
             lower = (
                 float(noise_std)
                 if noise_std_min is None
@@ -218,6 +227,14 @@ def main():
     parser.add_argument("--noise-std", type=float, default=0.020)
     parser.add_argument("--noise-std-min", type=float, default=None)
     parser.add_argument("--noise-std-max", type=float, default=None)
+    parser.add_argument(
+        "--balanced-noise-bands",
+        default=None,
+        help=(
+            "Comma-separated low:high ranges, e.g. "
+            "0.005:0.010,0.010:0.015,0.015:0.020"
+        ),
+    )
     parser.add_argument("--seed", type=int, default=20260612)
     parser.add_argument("--only-val", action="store_true")
     parser.add_argument(
@@ -241,6 +258,20 @@ def main():
     args = parser.parse_args()
 
     rng = np.random.default_rng(args.seed)
+    balanced_noise_bands = None
+    if args.balanced_noise_bands:
+        balanced_noise_bands = []
+        for item in args.balanced_noise_bands.split(","):
+            lower, upper = item.split(":", maxsplit=1)
+            lower = float(lower)
+            upper = float(upper)
+            if lower > upper:
+                raise ValueError(
+                    "balanced noise band lower bound must be <= upper bound"
+                )
+            balanced_noise_bands.append((lower, upper))
+        if not balanced_noise_bands:
+            raise ValueError("balanced-noise-bands cannot be empty")
     mesh_root = Path(args.mesh_root)
     train_paths = [
         rel for rel in read_datalist(args.train_datalist)
@@ -272,10 +303,6 @@ def main():
             excluded = np.load(excluded_dataset, allow_pickle=True)
             excluded_paths.update(excluded["rel_path"].tolist())
         val_paths = [rel for rel in val_paths if rel not in excluded_paths]
-    overlap = set(train_paths) & set(val_paths)
-    if overlap and not args.only_val:
-        raise ValueError(f"train/val shape overlap: {len(overlap)}")
-
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     train = None
@@ -291,7 +318,13 @@ def main():
             args.noise_std_max,
             rng,
             category_reference=train_category_reference,
+            balanced_noise_bands=balanced_noise_bands,
         )
+        train_shape_paths = set(train["rel_path"].tolist())
+        val_paths = [
+            rel for rel in val_paths
+            if rel not in train_shape_paths
+        ]
     val = build_split(
         val_paths,
         mesh_root,
@@ -303,6 +336,7 @@ def main():
         args.noise_std_max,
         rng,
         category_reference=val_category_reference,
+        balanced_noise_bands=balanced_noise_bands,
     )
     if train is not None:
         np.savez_compressed(out_dir / "train_patches.npz", **train)
@@ -322,6 +356,7 @@ def main():
         "noise_std": float(args.noise_std),
         "noise_std_min": args.noise_std_min,
         "noise_std_max": args.noise_std_max,
+        "balanced_noise_bands": balanced_noise_bands,
         "train_category_counts": (
             dict(Counter(
                 category_of(path)

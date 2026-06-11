@@ -85,6 +85,11 @@ def stage_loss(
     length_weight,
     keep_weight,
     keep_threshold,
+    score_sigma,
+    gate_weight,
+    noise_strength_weight,
+    noise_sigma_min,
+    noise_sigma_max,
 ):
     scale = max(float(loss_scale), 1e-6)
     scale2 = scale ** 2.0
@@ -122,6 +127,42 @@ def stage_loss(
     keep = (
         keep_map * (residual_length / scale) ** 2.0
     ).sum() / (keep_map.sum() + 1e-6)
+    gate = jt.zeros(())
+    noise_strength = jt.zeros(())
+    if "raw_residual" in aux:
+        raw_residual = aux["raw_residual"]
+        gate_target = (
+            (target * raw_residual).sum(dim=-1, keepdims=True)
+            / ((raw_residual ** 2.0).sum(dim=-1, keepdims=True) + 1e-8)
+        )
+        gate_target = jt.minimum(
+            jt.maximum(gate_target, 0.0),
+            1.0,
+        )
+        gate_target.stop_grad()
+        confidence = jt.minimum(
+            jt.maximum(aux["confidence"], 1e-5),
+            1.0 - 1e-5,
+        )
+        gate = -(
+            gate_target * jt.log(confidence)
+            + (1.0 - gate_target) * jt.log(1.0 - confidence)
+        ).mean()
+    if "noise_strength" in aux:
+        sigma_range = max(
+            float(noise_sigma_max) - float(noise_sigma_min),
+            1e-6,
+        )
+        sigma_target = jt.minimum(
+            jt.maximum(
+                (score_sigma - float(noise_sigma_min)) / sigma_range,
+                0.0,
+            ),
+            1.0,
+        ).reshape((-1, 1, 1))
+        noise_strength = (
+            (aux["noise_strength"] - sigma_target) ** 2.0
+        ).mean()
 
     total = (
         paired
@@ -129,6 +170,8 @@ def stage_loss(
         + float(direction_weight) * direction
         + float(length_weight) * length
         + float(keep_weight) * keep
+        + float(gate_weight) * gate
+        + float(noise_strength_weight) * noise_strength
     )
     return total, {
         "paired": paired,
@@ -136,10 +179,12 @@ def stage_loss(
         "direction": direction,
         "length": length,
         "keep": keep,
+        "gate": gate,
+        "noise_strength": noise_strength,
     }
 
 
-def refinement_loss(model, coarse, noisy, clean, args):
+def refinement_loss(model, coarse, noisy, clean, score_sigma, args):
     prediction, output = model(coarse, noisy)
     previous = coarse
     total = jt.zeros(())
@@ -158,6 +203,11 @@ def refinement_loss(model, coarse, noisy, clean, args):
             length_weight=args.length_weight,
             keep_weight=args.keep_weight,
             keep_threshold=args.keep_threshold,
+            score_sigma=score_sigma,
+            gate_weight=args.gate_weight,
+            noise_strength_weight=args.noise_strength_weight,
+            noise_sigma_min=args.noise_sigma_min,
+            noise_sigma_max=args.noise_sigma_max,
         )
         deep_weight = 1.0 if stage_index == stage_count - 1 else 0.5
         total = total + deep_weight * stage_total
@@ -169,6 +219,12 @@ def refinement_loss(model, coarse, noisy, clean, args):
         metrics[f"stage{stage_index + 1}_residual"] = jt.sqrt(
             (stage["residual"] ** 2.0).sum(dim=-1) + 1e-8
         ).mean()
+        metrics[f"stage{stage_index + 1}_noise_strength_pred"] = stage[
+            "noise_strength"
+        ].mean()
+        metrics[f"stage{stage_index + 1}_residual_cap"] = stage[
+            "residual_cap"
+        ].mean()
         previous = stage["prediction"]
     return total, prediction, metrics
 
@@ -263,6 +319,20 @@ def full_summary(rows):
     return result
 
 
+def noise_band_gains(rows, score_sigma):
+    sigma = np.asarray(score_sigma).reshape(-1)
+    gains = np.asarray([row["score_gain"] for row in rows])
+    masks = {
+        "low": sigma < 0.010,
+        "medium": (sigma >= 0.010) & (sigma < 0.015),
+        "high": sigma >= 0.015,
+    }
+    return {
+        key: float(gains[mask].mean()) if mask.any() else 0.0
+        for key, mask in masks.items()
+    }
+
+
 def cache_coarse(checkpoint, data, cache_path, batch_size, coarse_mode):
     cache_path = Path(cache_path)
     if cache_path.exists():
@@ -341,6 +411,12 @@ def main():
     parser.add_argument("--length-weight", type=float, default=0.1)
     parser.add_argument("--keep-weight", type=float, default=0.2)
     parser.add_argument("--keep-threshold", type=float, default=0.003)
+    parser.add_argument("--adaptive-v2", action="store_true")
+    parser.add_argument("--min-residual-ratio", type=float, default=0.2)
+    parser.add_argument("--gate-weight", type=float, default=0.5)
+    parser.add_argument("--noise-strength-weight", type=float, default=0.5)
+    parser.add_argument("--noise-sigma-min", type=float, default=0.005)
+    parser.add_argument("--noise-sigma-max", type=float, default=0.020)
     parser.add_argument("--hard-sample-weight", type=float, default=0.25)
     parser.add_argument("--ordinary-sample-weight", type=float, default=0.60)
     parser.add_argument("--high-score-sample-weight", type=float, default=0.15)
@@ -399,6 +475,8 @@ def main():
         k=args.k,
         local_dim=args.local_dim,
         hidden_dim=args.hidden_dim,
+        adaptive_v2=args.adaptive_v2,
+        min_residual_ratio=args.min_residual_ratio,
     )
     if args.load_refiner:
         model.load(args.load_refiner)
@@ -429,6 +507,7 @@ def main():
                 jt.array(train_coarse[indices]),
                 jt.array(train["pc_noisy"][indices]),
                 jt.array(train["pc_clean"][indices]),
+                jt.array(train["score_sigma"][indices]),
                 args,
             )
             optimizer.step(loss)
@@ -460,6 +539,12 @@ def main():
         )
         add_score_bands(rows, val_thresholds)
         summary = full_summary(rows)
+        band_gains = noise_band_gains(rows, val["score_sigma"])
+        selection_score = (
+            summary["overall"]["refined_score_mean"]
+            + min(band_gains["low"], 0.0)
+            - 5.0 * summary["overall"]["degraded_ge_1_rate"]
+        )
         metric_keys = batch_metrics[0].keys()
         record = {
             "epoch": epoch,
@@ -477,13 +562,18 @@ def main():
                 "score_gain"
             ]["mean"],
             "improved_rate": summary["overall"]["improved_rate"],
+            "degraded_ge_1_rate": summary["overall"]["degraded_ge_1_rate"],
+            "low_noise_gain": band_gains["low"],
+            "medium_noise_gain": band_gains["medium"],
+            "high_noise_gain": band_gains["high"],
+            "selection_score": selection_score,
         }
         history.append(record)
         write_csv(out_dir / "epoch_log.csv", history)
         print(record, flush=True)
 
-        if record["val_score"] >= best_score:
-            best_score = record["val_score"]
+        if record["selection_score"] >= best_score:
+            best_score = record["selection_score"]
             best_epoch = epoch
             model.save(str(out_dir / "refiner_best.pkl"))
             write_csv(out_dir / "best_val_eval.csv", rows)
@@ -495,7 +585,7 @@ def main():
     model.save(str(out_dir / "refiner_last.pkl"))
     final = {
         "best_epoch": best_epoch,
-        "best_val_score": best_score,
+        "best_selection_score": best_score,
         "coarse_val_score": full_summary(identity_val_rows)["overall"][
             "coarse_score_mean"
         ],

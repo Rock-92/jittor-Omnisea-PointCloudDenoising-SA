@@ -89,6 +89,8 @@ def main():
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--stage1-max-residual", type=float, default=0.012)
     parser.add_argument("--stage2-max-residual", type=float, default=0.008)
+    parser.add_argument("--adaptive-v2", action="store_true")
+    parser.add_argument("--min-residual-ratio", type=float, default=0.2)
     parser.add_argument("--use-cuda", action="store_true")
     args = parser.parse_args()
 
@@ -112,6 +114,8 @@ def main():
         k=args.k,
         local_dim=args.local_dim,
         hidden_dim=args.hidden_dim,
+        adaptive_v2=args.adaptive_v2,
+        min_residual_ratio=args.min_residual_ratio,
     )
     model.load(args.refiner_checkpoint)
     prediction = predict(
@@ -131,8 +135,8 @@ def main():
         sigma = float(data["score_sigma"][index].reshape(-1)[0])
         row["noise_sigma"] = sigma
         row["noise_band"] = (
-            "low" if sigma < 0.0125
-            else "medium" if sigma < 0.0185
+            "low" if sigma < 0.010
+            else "medium" if sigma < 0.015
             else "high"
         )
         row["category"] = category_of(row["rel_path"])
@@ -235,9 +239,9 @@ def main():
                 - formal_row["coarse_final_score"]
             )
             formal_row["noise_band"] = (
-                "low" if formal_row["noise_sigma"] < 0.0125
+                "low" if formal_row["noise_sigma"] < 0.010
                 else "medium"
-                if formal_row["noise_sigma"] < 0.0185
+                if formal_row["noise_sigma"] < 0.015
                 else "high"
             )
             formal_rows.append(formal_row)

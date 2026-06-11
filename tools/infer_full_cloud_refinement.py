@@ -66,6 +66,8 @@ def main():
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--stage1-max-residual", type=float, default=0.012)
     parser.add_argument("--stage2-max-residual", type=float, default=0.008)
+    parser.add_argument("--adaptive-v2", action="store_true")
+    parser.add_argument("--min-residual-ratio", type=float, default=0.2)
     parser.add_argument("--use-cuda", action="store_true")
     args = parser.parse_args()
 
@@ -96,6 +98,8 @@ def main():
         k=args.k,
         local_dim=args.local_dim,
         hidden_dim=args.hidden_dim,
+        adaptive_v2=args.adaptive_v2,
+        min_residual_ratio=args.min_residual_ratio,
     )
     refiner.load(args.refiner_checkpoint)
 

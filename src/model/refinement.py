@@ -225,12 +225,16 @@ class DynamicGeometryRefinementStage(nn.Module):
         k=24,
         local_dim=96,
         hidden_dim=128,
+        adaptive_v2=False,
+        min_residual_ratio=0.2,
         eps=1e-6,
     ):
         super().__init__()
         self.k = int(k)
         self.local_dim = int(local_dim)
         self.hidden_dim = int(hidden_dim)
+        self.adaptive_v2 = bool(adaptive_v2)
+        self.min_residual_ratio = float(min_residual_ratio)
         self.eps = float(eps)
 
         # Local offset, distance, current displacement, and initial VM
@@ -246,6 +250,8 @@ class DynamicGeometryRefinementStage(nn.Module):
         point_input_dim = (
             3 + 3 + 3 + 3 + 3 + 1 + 1 + self.local_dim + 4 + 1
         )
+        if self.adaptive_v2:
+            point_input_dim += 1
         self.point_mlp = nn.Sequential(
             nn.Linear(point_input_dim, self.hidden_dim),
             nn.ReLU(),
@@ -255,6 +261,12 @@ class DynamicGeometryRefinementStage(nn.Module):
         self.direction_head = nn.Linear(self.hidden_dim, 3)
         self.length_head = nn.Linear(self.hidden_dim, 1)
         self.confidence_head = nn.Linear(self.hidden_dim, 1)
+        if self.adaptive_v2:
+            self.noise_strength_head = nn.Sequential(
+                nn.Linear(4, self.hidden_dim // 2),
+                nn.ReLU(),
+                nn.Linear(self.hidden_dim // 2, 1),
+            )
 
         self.direction_head.weight.update(
             jt.randn(self.direction_head.weight.shape) * 1e-4
@@ -266,6 +278,13 @@ class DynamicGeometryRefinementStage(nn.Module):
             jt.randn(self.length_head.weight.shape) * 1e-4
         )
         self.length_head.bias.update(jt.ones_like(self.length_head.bias) * -3.0)
+        if self.adaptive_v2:
+            self.confidence_head.bias.update(
+                jt.ones_like(self.confidence_head.bias) * -2.0
+            )
+            self.noise_strength_head[-1].bias.update(
+                jt.ones_like(self.noise_strength_head[-1].bias) * -1.0
+            )
 
     def _geometry(self, current, neighbor_idx):
         neighbors = gather_neighbors(current, neighbor_idx)
@@ -378,25 +397,40 @@ class DynamicGeometryRefinementStage(nn.Module):
                 nonplanarity.mean(dim=1, keepdims=True),
             ],
             dim=-1,
-        ).broadcast((batch_size, num_points, 4))
+        )
+        if self.adaptive_v2:
+            noise_strength = jt.sigmoid(
+                self.noise_strength_head(patch_summary.reshape(batch_size, 4))
+            ).reshape(batch_size, 1, 1)
+            residual_ratio = (
+                self.min_residual_ratio
+                + (1.0 - self.min_residual_ratio) * noise_strength
+            )
+            residual_cap = float(max_residual) * residual_ratio
+        else:
+            noise_strength = jt.ones((batch_size, 1, 1))
+            residual_cap = jt.ones((batch_size, 1, 1)) * float(max_residual)
+        patch_summary = patch_summary.broadcast((batch_size, num_points, 4))
         stage_feature = (
             jt.ones((batch_size, num_points, 1)) * float(stage_progress)
         )
-        point_input = jt.concat(
-            [
-                current,
-                current_displacement,
-                initial_displacement,
-                local_mean,
-                normal,
-                radius,
-                nonplanarity,
-                neighbor_feature,
-                patch_summary,
-                stage_feature,
-            ],
-            dim=-1,
-        )
+        point_parts = [
+            current,
+            current_displacement,
+            initial_displacement,
+            local_mean,
+            normal,
+            radius,
+            nonplanarity,
+            neighbor_feature,
+            patch_summary,
+            stage_feature,
+        ]
+        if self.adaptive_v2:
+            point_parts.append(
+                noise_strength.broadcast((batch_size, num_points, 1))
+            )
+        point_input = jt.concat(point_parts, dim=-1)
         feature = apply_point_mlp(self.point_mlp, point_input)
 
         direction = apply_point_mlp(self.direction_head, feature)
@@ -406,16 +440,20 @@ class DynamicGeometryRefinementStage(nn.Module):
         )
         length = jt.sigmoid(
             apply_point_mlp(self.length_head, feature)
-        ) * float(max_residual)
+        ) * residual_cap
         confidence = jt.sigmoid(
             apply_point_mlp(self.confidence_head, feature)
         )
-        residual = direction * length * confidence
+        raw_residual = direction * length
+        residual = raw_residual * confidence
         return current + residual, {
             "residual": residual,
+            "raw_residual": raw_residual,
             "direction": direction,
             "length": length,
             "confidence": confidence,
+            "noise_strength": noise_strength,
+            "residual_cap": residual_cap,
             "normal": normal,
             "nonplanarity": nonplanarity,
         }
@@ -431,6 +469,8 @@ class MultiStageGeometryRefiner(nn.Module):
         k=24,
         local_dim=96,
         hidden_dim=128,
+        adaptive_v2=False,
+        min_residual_ratio=0.2,
     ):
         super().__init__()
         self.num_stages = int(num_stages)
@@ -442,6 +482,8 @@ class MultiStageGeometryRefiner(nn.Module):
             k=k,
             local_dim=local_dim,
             hidden_dim=hidden_dim,
+            adaptive_v2=adaptive_v2,
+            min_residual_ratio=min_residual_ratio,
         )
 
     def execute(self, coarse, noisy):
