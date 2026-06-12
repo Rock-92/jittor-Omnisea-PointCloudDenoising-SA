@@ -51,6 +51,35 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
+def validate_checkpoint_compatibility(model, checkpoint):
+    checkpoint_state = jt.load(str(checkpoint))
+    if not isinstance(checkpoint_state, dict):
+        raise TypeError("checkpoint must contain a parameter dictionary")
+    model_state = model.state_dict()
+    missing = sorted(set(model_state) - set(checkpoint_state))
+    extra = sorted(set(checkpoint_state) - set(model_state))
+    shape_mismatch = sorted(
+        key
+        for key in set(model_state) & set(checkpoint_state)
+        if tuple(model_state[key].shape) != tuple(checkpoint_state[key].shape)
+    )
+    result = {
+        "checkpoint_parameter_count": len(checkpoint_state),
+        "model_parameter_count": len(model_state),
+        "missing_parameters": missing,
+        "extra_parameters": extra,
+        "shape_mismatch_parameters": shape_mismatch,
+        "compatible": not missing and not extra and not shape_mismatch,
+    }
+    if not result["compatible"]:
+        raise RuntimeError(
+            "checkpoint is not an exact match for the current VM: "
+            f"missing={len(missing)}, extra={len(extra)}, "
+            f"shape_mismatch={len(shape_mismatch)}"
+        )
+    return result
+
+
 def parse_noise_bands(value):
     bands = []
     for item in str(value).split(","):
@@ -171,10 +200,10 @@ def usable_paths(paths, clean_root, mesh_root, sample_missing_clean):
     return usable
 
 
-def farthest_point_indices(points, count, rng):
+def farthest_point_indices(points, count):
     count = min(max(int(count), 1), points.shape[0])
     selected = np.empty((count,), dtype=np.int64)
-    selected[0] = int(rng.integers(points.shape[0]))
+    selected[0] = 0
     min_dist = ((points - points[selected[0]]) ** 2.0).sum(axis=1)
     for index in range(1, count):
         selected[index] = int(np.argmax(min_dist))
@@ -183,15 +212,18 @@ def farthest_point_indices(points, count, rng):
     return selected
 
 
-def build_patch_layout(noisy, patch_size, seed_k, rng):
+def build_patch_layout(noisy, patch_size, seed_k):
     point_count = noisy.shape[0]
     patch_size = min(int(patch_size), point_count)
-    base_count = max(
-        1,
-        int(np.ceil(float(seed_k) * point_count / patch_size)),
+    base_count = min(
+        point_count,
+        max(
+            1,
+            int(float(seed_k) * point_count / patch_size),
+        ),
     )
     tree = cKDTree(noisy)
-    seed_indices = farthest_point_indices(noisy, base_count, rng).tolist()
+    seed_indices = farthest_point_indices(noisy, base_count).tolist()
     all_indices = []
     all_distances = []
     covered = np.zeros((point_count,), dtype=np.bool_)
@@ -202,17 +234,19 @@ def build_patch_layout(noisy, patch_size, seed_k, rng):
             k=patch_size,
         )
         indices = np.asarray(indices, dtype=np.int64).reshape(-1)
-        distances = np.asarray(distances, dtype=np.float32).reshape(-1)
+        distances = (
+            np.asarray(distances, dtype=np.float32).reshape(-1) ** 2.0
+        )
         all_indices.append(indices)
         all_distances.append(distances)
         covered[indices] = True
 
     for seed_index in seed_indices:
         append_seed(seed_index)
-    while not covered.all():
-        missing = np.flatnonzero(~covered)
-        append_seed(int(missing[0]))
-        seed_indices.append(int(missing[0]))
+    missing = np.flatnonzero(~covered).astype(np.int64)
+    for seed_index in missing:
+        append_seed(int(seed_index))
+        seed_indices.append(int(seed_index))
 
     point_indices = np.stack(all_indices)
     distances = np.stack(all_distances)
@@ -242,7 +276,6 @@ def make_instance(shape, sigma, patch_size, seed_k, rng):
         noisy,
         patch_size=patch_size,
         seed_k=seed_k,
-        rng=rng,
     )
     return {
         **shape,
@@ -307,6 +340,145 @@ def predict_and_fuse(
     return fused, patch_prediction
 
 
+def predict_patch_cache(model, instance, patch_batch_size, sampler):
+    patches_np = instance["patches"]
+    predictions = []
+    model.eval()
+    with jt.no_grad():
+        for start in range(0, patches_np.shape[0], patch_batch_size):
+            end = min(start + patch_batch_size, patches_np.shape[0])
+            patches = jt.array(patches_np[start:end])
+            if sampler == "fixed":
+                sigma_batch = (
+                    jt.ones((end - start, 1)) * float(instance["sigma"])
+                )
+                prediction = model.predict_clean(
+                    patches,
+                    sigma=sigma_batch,
+                )
+            elif sampler == "heun":
+                prediction = model.edm_heun_sampler(patches)
+            else:
+                raise ValueError(f"unsupported sampler: {sampler}")
+            predictions.append(
+                prediction.numpy().astype(np.float32, copy=False)
+            )
+    return np.concatenate(predictions, axis=0)
+
+
+def fuse_cached_prediction(instance, patch_prediction, fusion_tau):
+    point_count = instance["noisy"].shape[0]
+    weighted_sum = np.zeros(
+        (point_count, 3),
+        dtype=np.float64,
+    )
+    weight_sum = np.zeros(
+        (point_count,),
+        dtype=np.float64,
+    )
+    absolute_prediction = (
+        patch_prediction + instance["seeds"][:, None, :]
+    )
+    weights = np.exp(
+        -float(fusion_tau) * instance["normalized_distances"]
+    ).astype(np.float64)
+    for patch_index in range(instance["point_indices"].shape[0]):
+        indices = instance["point_indices"][patch_index]
+        patch_weights = weights[patch_index]
+        np.add.at(
+            weighted_sum,
+            indices,
+            absolute_prediction[patch_index]
+            * patch_weights[:, None],
+        )
+        np.add.at(weight_sum, indices, patch_weights)
+    output = instance["noisy"].copy()
+    covered = weight_sum > 0.0
+    output[covered] = (
+        weighted_sum[covered] / weight_sum[covered, None]
+    ).astype(np.float32)
+    return output
+
+
+def cached_partial_gradient_fusion(
+    model,
+    instance,
+    cached_prediction,
+    patch_indices,
+    fusion_tau,
+):
+    point_indices_np = instance["point_indices"]
+    weights_np = np.exp(
+        -float(fusion_tau) * instance["normalized_distances"]
+    ).astype(np.float32)
+    absolute_cache = (
+        cached_prediction + instance["seeds"][:, None, :]
+    )
+    patch_indices = np.asarray(patch_indices, dtype=np.int32)
+    keep_mask = np.ones(
+        (point_indices_np.shape[0],),
+        dtype=np.bool_,
+    )
+    keep_mask[patch_indices] = False
+    weighted_sum_np = np.zeros(
+        (instance["noisy"].shape[0], 3),
+        dtype=np.float32,
+    )
+    weight_sum_np = np.zeros(
+        (instance["noisy"].shape[0], 1),
+        dtype=np.float32,
+    )
+    np.add.at(
+        weighted_sum_np,
+        point_indices_np[keep_mask].reshape(-1),
+        (
+            absolute_cache[keep_mask]
+            * weights_np[keep_mask, :, None]
+        ).reshape(-1, 3),
+    )
+    np.add.at(
+        weight_sum_np[:, 0],
+        point_indices_np.reshape(-1),
+        weights_np.reshape(-1),
+    )
+
+    selected_point_indices = point_indices_np[patch_indices]
+    selected_weights = weights_np[patch_indices]
+
+    selected_patches = jt.array(instance["patches"][patch_indices])
+    sigma_batch = (
+        jt.ones((len(patch_indices), 1)) * float(instance["sigma"])
+    )
+    selected_prediction = model.predict_clean(
+        selected_patches,
+        sigma=sigma_batch,
+    )
+    selected_absolute = (
+        selected_prediction
+        + jt.array(instance["seeds"][patch_indices]).unsqueeze(1)
+    )
+    flat_indices = jt.array(
+        selected_point_indices.reshape(-1)
+    ).int32()
+    flat_weights = jt.array(selected_weights.reshape(-1, 1))
+    flat_absolute = selected_absolute.reshape(-1, 3)
+    index_3d = flat_indices.reshape(-1, 1).broadcast(
+        flat_absolute.shape
+    )
+    selected_sum = jt.zeros(
+        (instance["noisy"].shape[0], 3)
+    ).scatter(
+        0,
+        index_3d,
+        flat_absolute * flat_weights,
+        reduce="add",
+    )
+    fused = (
+        jt.array(weighted_sum_np) + selected_sum
+    ) / (jt.array(weight_sum_np) + 1e-8)
+    return fused, selected_prediction, patch_indices
+
+
 def pairwise_sqdist(a, b):
     return ((a.unsqueeze(1) - b.unsqueeze(0)) ** 2.0).sum(dim=-1)
 
@@ -327,6 +499,7 @@ def fusion_losses(
     instance,
     rng,
     chamfer_points,
+    patch_indices=None,
 ):
     clean = jt.array(instance["clean"])
     noisy = jt.array(instance["noisy"])
@@ -375,10 +548,19 @@ def fusion_losses(
         jt.maximum(clean_nn - pred_nn, 0.0) ** 2.0
     ).mean() / sigma2
 
-    point_indices = jt.array(instance["point_indices"]).int32()
+    point_indices_np = instance["point_indices"]
+    seeds_np = instance["seeds"]
+    if patch_indices is not None:
+        point_indices_np = point_indices_np[patch_indices]
+        seeds_np = seeds_np[patch_indices]
+    point_indices = jt.array(point_indices_np).int32()
     clean_patches = clean[point_indices]
     patch_paired = (
-        (patch_prediction - (clean_patches - instance_seed_var(instance))) ** 2.0
+        (
+            patch_prediction
+            - (clean_patches - jt.array(seeds_np).unsqueeze(1))
+        )
+        ** 2.0
     ).sum(dim=-1).mean() / sigma2
     noisy_paired = ((noisy - clean) ** 2.0).sum(dim=-1).mean() / sigma2
     return {
@@ -389,25 +571,22 @@ def fusion_losses(
         "noisy_paired": noisy_paired,
     }
 
-
-def instance_seed_var(instance):
-    return jt.array(instance["seeds"]).unsqueeze(1)
-
-
 def score_instance(instance, prediction):
     clean = instance["clean"]
     noisy = instance["noisy"]
-    cd_noisy = chamfer_distance(noisy, clean, normalize=False)
-    cd_pred = chamfer_distance(prediction, clean, normalize=False)
+    cd_noisy = chamfer_distance(noisy, clean, normalize=True)
+    cd_pred = chamfer_distance(prediction, clean, normalize=True)
     p2s_noisy = point_to_surface_distance(
         noisy,
         instance["mesh_vertices"],
         instance["mesh_faces"],
+        normalize_ref_pc=clean,
     )
     p2s_pred = point_to_surface_distance(
         prediction,
         instance["mesh_vertices"],
         instance["mesh_faces"],
+        normalize_ref_pc=clean,
     )
     cd_score = metric_to_score(cd_pred, cd_noisy)
     p2s_score = metric_to_score(p2s_pred, p2s_noisy)
@@ -434,23 +613,25 @@ def evaluate(
 ):
     model.eval()
     rows = []
-    with jt.no_grad():
-        for index, instance in enumerate(instances):
-            fused, _ = predict_and_fuse(
-                model,
-                instance,
-                patch_batch_size=patch_batch_size,
-                fusion_tau=fusion_tau,
-                sampler=sampler,
-            )
-            prediction = fused.numpy().astype(np.float32, copy=False)
-            row = score_instance(instance, prediction)
-            rows.append(row)
-            print(
-                f"  eval [{index + 1}/{len(instances)}] "
-                f"final={row['final_score']:.3f}",
-                flush=True,
-            )
+    for index, instance in enumerate(instances):
+        cached_prediction = predict_patch_cache(
+            model,
+            instance,
+            patch_batch_size=patch_batch_size,
+            sampler=sampler,
+        )
+        prediction = fuse_cached_prediction(
+            instance,
+            cached_prediction,
+            fusion_tau=fusion_tau,
+        )
+        row = score_instance(instance, prediction)
+        rows.append(row)
+        print(
+            f"  eval [{index + 1}/{len(instances)}] "
+            f"final={row['final_score']:.3f}",
+            flush=True,
+        )
     summary = {
         "count": len(rows),
         "cd_score": float(np.mean([row["cd_score"] for row in rows])),
@@ -524,10 +705,15 @@ def main():
     parser.add_argument("--train-shapes", type=int, default=20)
     parser.add_argument("--train-eval-shapes", type=int, default=5)
     parser.add_argument("--val-shapes", type=int, default=10)
-    parser.add_argument("--num-points", type=int, default=8192)
-    parser.add_argument("--patch-size", type=int, default=512)
-    parser.add_argument("--seed-k", type=float, default=3.0)
-    parser.add_argument("--patch-batch-size", type=int, default=2)
+    parser.add_argument("--train-num-points", type=int, default=32768)
+    parser.add_argument("--train-patch-size", type=int, default=1000)
+    parser.add_argument("--train-seed-k", type=float, default=6.0)
+    parser.add_argument("--eval-num-points", type=int, default=32768)
+    parser.add_argument("--eval-patch-size", type=int, default=1000)
+    parser.add_argument("--eval-seed-k", type=float, default=6.0)
+    parser.add_argument("--train-cache-batch-size", type=int, default=16)
+    parser.add_argument("--train-patches-per-step", type=int, default=8)
+    parser.add_argument("--eval-patch-batch-size", type=int, default=16)
     parser.add_argument("--fusion-tau", type=float, default=2.0)
     parser.add_argument(
         "--train-sampler",
@@ -557,9 +743,32 @@ def main():
     parser.add_argument("--patch-weight", type=float, default=0.1)
     parser.add_argument("--chamfer-points", type=int, default=512)
     parser.add_argument("--seed", type=int, default=20260612)
+    parser.add_argument("--minimum-baseline-score", type=float, default=40.0)
+    parser.add_argument("--baseline-only", action="store_true")
+    parser.add_argument("--allow-nonstandard-protocol", action="store_true")
     parser.add_argument("--sample-missing-clean", action="store_true")
     parser.add_argument("--use-cuda", action="store_true")
     args = parser.parse_args()
+
+    standard_protocol = (
+        args.train_num_points == 32768
+        and args.train_patch_size == 1000
+        and args.train_seed_k == 6.0
+        and args.eval_num_points == 32768
+        and args.eval_patch_size == 1000
+        and args.eval_seed_k == 6.0
+    )
+    if not standard_protocol and not args.allow_nonstandard_protocol:
+        raise ValueError(
+            "VM fusion training must use the original "
+            "32768 points / 1000-point patches / seed_k=6 protocol; "
+            "pass --allow-nonstandard-protocol only for smoke tests"
+        )
+    if args.train_sampler != "fixed":
+        raise ValueError(
+            "cached partial-gradient training currently requires "
+            "--train-sampler fixed"
+        )
 
     jt.flags.use_cuda = 1 if args.use_cuda else 0
     np.random.seed(args.seed)
@@ -612,7 +821,7 @@ def main():
             path,
             clean_root=args.clean_root,
             mesh_root=args.mesh_root,
-            num_points=args.num_points,
+            num_points=args.train_num_points,
             rng=selection_rng,
             sample_missing_clean=args.sample_missing_clean,
         )
@@ -623,7 +832,7 @@ def main():
             path,
             clean_root=args.clean_root,
             mesh_root=args.mesh_root,
-            num_points=args.num_points,
+            num_points=args.eval_num_points,
             rng=selection_rng,
             sample_missing_clean=args.sample_missing_clean,
         )
@@ -631,16 +840,34 @@ def main():
     ]
     train_shapes = assign_bands(train_shapes, noise_bands, selection_rng)
     val_shapes = assign_bands(val_shapes, noise_bands, selection_rng)
+    train_band_by_path = {
+        shape["rel_path"]: shape["noise_band"]
+        for shape in train_shapes
+    }
+    train_eval_shapes = [
+        {
+            **load_shape(
+                path,
+                clean_root=args.clean_root,
+                mesh_root=args.mesh_root,
+                num_points=args.eval_num_points,
+                rng=selection_rng,
+                sample_missing_clean=args.sample_missing_clean,
+            ),
+            "noise_band": train_band_by_path[path],
+        }
+        for path in train_paths[: min(args.train_eval_shapes, len(train_paths))]
+    ]
     val_instances = fixed_instances(
         val_shapes,
-        patch_size=args.patch_size,
-        seed_k=args.seed_k,
+        patch_size=args.eval_patch_size,
+        seed_k=args.eval_seed_k,
         rng=val_rng,
     )
     train_eval_instances = fixed_instances(
-        train_shapes[: min(args.train_eval_shapes, len(train_shapes))],
-        patch_size=args.patch_size,
-        seed_k=args.seed_k,
+        train_eval_shapes,
+        patch_size=args.eval_patch_size,
+        seed_k=args.eval_seed_k,
         rng=np.random.default_rng(args.seed + 3),
     )
     write_json(
@@ -665,6 +892,19 @@ def main():
     )
 
     model = load_model(checkpoint)
+    checkpoint_compatibility = validate_checkpoint_compatibility(
+        model,
+        checkpoint,
+    )
+    write_json(
+        out_dir / "checkpoint_compatibility.json",
+        checkpoint_compatibility,
+    )
+    print(
+        "Checkpoint compatibility: exact match "
+        f"({checkpoint_compatibility['model_parameter_count']} parameters)",
+        flush=True,
+    )
     set_train_scope(model, args.train_scope)
     optimizer = jt.optim.Adam(
         collect_train_parameters(model, args.train_scope),
@@ -675,7 +915,7 @@ def main():
     baseline_rows, baseline_summary = evaluate(
         model,
         val_instances,
-        patch_batch_size=args.patch_batch_size,
+        patch_batch_size=args.eval_patch_batch_size,
         fusion_tau=args.fusion_tau,
         sampler=args.eval_sampler,
     )
@@ -683,11 +923,45 @@ def main():
     write_json(out_dir / "baseline_summary.json", baseline_summary)
     write_csv(out_dir / "best_val.csv", baseline_rows)
     write_json(out_dir / "best_summary.json", baseline_summary)
+    if baseline_summary["final_score"] < args.minimum_baseline_score:
+        write_json(
+            out_dir / "baseline_rejected.json",
+            {
+                "reason": "baseline score below minimum",
+                "baseline": baseline_summary,
+                "minimum_baseline_score": args.minimum_baseline_score,
+                "action": "training aborted before optimizer updates",
+            },
+        )
+        raise RuntimeError(
+            "baseline score "
+            f"{baseline_summary['final_score']:.3f} is below "
+            f"{args.minimum_baseline_score:.3f}; "
+            "checkpoint or evaluation protocol is not aligned"
+        )
+    if args.baseline_only:
+        write_json(
+            out_dir / "baseline_check.json",
+            {
+                "checkpoint": str(checkpoint.resolve()),
+                "checkpoint_compatibility": checkpoint_compatibility,
+                "baseline": baseline_summary,
+                "protocol": {
+                    "num_points": args.eval_num_points,
+                    "patch_size": args.eval_patch_size,
+                    "seed_k": args.eval_seed_k,
+                    "sampler": args.eval_sampler,
+                },
+                "status": "passed",
+            },
+        )
+        print("Baseline check passed; no training was run.", flush=True)
+        return
     print("Baseline train-shape evaluation:", flush=True)
     train_baseline_rows, train_baseline_summary = evaluate(
         model,
         train_eval_instances,
-        patch_batch_size=args.patch_batch_size,
+        patch_batch_size=args.eval_patch_batch_size,
         fusion_tau=args.fusion_tau,
         sampler=args.eval_sampler,
     )
@@ -713,16 +987,31 @@ def main():
             instance = make_instance(
                 shape,
                 sigma=sigma,
-                patch_size=args.patch_size,
-                seed_k=args.seed_k,
+                patch_size=args.train_patch_size,
+                seed_k=args.train_seed_k,
                 rng=train_rng,
             )
-            fused, patch_prediction = predict_and_fuse(
+            cached_prediction = predict_patch_cache(
                 model,
                 instance,
-                patch_batch_size=args.patch_batch_size,
-                fusion_tau=args.fusion_tau,
+                patch_batch_size=args.train_cache_batch_size,
                 sampler=args.train_sampler,
+            )
+            model.train()
+            patch_count = instance["patches"].shape[0]
+            selected_patch_indices = train_rng.choice(
+                patch_count,
+                size=min(args.train_patches_per_step, patch_count),
+                replace=False,
+            ).astype(np.int32)
+            fused, patch_prediction, selected_patch_indices = (
+                cached_partial_gradient_fusion(
+                    model,
+                    instance,
+                    cached_prediction=cached_prediction,
+                    patch_indices=selected_patch_indices,
+                    fusion_tau=args.fusion_tau,
+                )
             )
             losses = fusion_losses(
                 fused,
@@ -730,18 +1019,36 @@ def main():
                 instance,
                 rng=train_rng,
                 chamfer_points=args.chamfer_points,
+                patch_indices=selected_patch_indices,
             )
-            loss = (
+            gradient_scale = (
+                patch_count / max(len(selected_patch_indices), 1)
+            )
+            fusion_loss = (
                 args.chamfer_weight * losses["chamfer"]
                 + args.paired_weight * losses["paired"]
                 + args.spacing_weight * losses["spacing"]
+            )
+            loss = (
+                gradient_scale * fusion_loss
                 + args.patch_weight * losses["patch_paired"]
             )
             optimizer.step(loss)
             epoch_metrics.append(
                 {
                     key: float(value.item())
-                    for key, value in {"loss": loss, **losses}.items()
+                    for key, value in {
+                        "loss": loss,
+                        "fusion_loss": fusion_loss,
+                        **losses,
+                    }.items()
+                }
+                | {
+                    "gradient_scale": float(gradient_scale),
+                    "selected_patch_count": int(
+                        len(selected_patch_indices)
+                    ),
+                    "total_patch_count": int(patch_count),
                 }
             )
             jt.gc()
@@ -765,7 +1072,7 @@ def main():
             val_rows, val_summary = evaluate(
                 model,
                 val_instances,
-                patch_batch_size=args.patch_batch_size,
+                patch_batch_size=args.eval_patch_batch_size,
                 fusion_tau=args.fusion_tau,
                 sampler=args.eval_sampler,
             )
@@ -796,7 +1103,7 @@ def main():
     best_train_rows, best_train_summary = evaluate(
         model,
         train_eval_instances,
-        patch_batch_size=args.patch_batch_size,
+        patch_batch_size=args.eval_patch_batch_size,
         fusion_tau=args.fusion_tau,
         sampler=args.eval_sampler,
     )
