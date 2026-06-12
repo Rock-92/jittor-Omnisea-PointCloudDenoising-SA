@@ -28,6 +28,7 @@ from tools.hard_patch_common import (  # noqa: E402
     quantile_summary,
     read_datalist,
 )
+from tools.build_refinement_probe_dataset import choose_paths  # noqa: E402
 
 
 def write_csv(path, rows):
@@ -207,6 +208,27 @@ def score_prediction(noisy, clean, prediction, mesh_vertices, mesh_faces):
     }
 
 
+def parse_noise_bands(value):
+    if not value:
+        return None
+    bands = []
+    for item in value.split(","):
+        lower, upper = item.split(":", maxsplit=1)
+        lower = float(lower)
+        upper = float(upper)
+        if lower > upper:
+            raise ValueError("noise band lower bound must be <= upper bound")
+        bands.append((lower, upper))
+    return bands
+
+
+def method_summary(rows, prefix):
+    return {
+        key: float(np.mean([row[f"{prefix}_{key}"] for row in rows]))
+        for key in ["cd_score", "p2s_score", "final_score"]
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -217,12 +239,23 @@ def main():
     parser.add_argument("--clean-root", default="cache_clean_points")
     parser.add_argument("--mesh-root", default="dataset_clean")
     parser.add_argument("--datalist", default="datalist/validate.txt")
+    parser.add_argument("--category-reference-datalist", default=None)
+    parser.add_argument(
+        "--exclude-dataset",
+        action="append",
+        default=[],
+    )
     parser.add_argument(
         "--out-dir",
         default="outputs/full_cloud_refinement_eval",
     )
     parser.add_argument("--max-shapes", type=int, default=20)
     parser.add_argument("--noise-std", type=float, default=0.020)
+    parser.add_argument(
+        "--balanced-noise-bands",
+        default=None,
+        help="Comma-separated low:high ranges.",
+    )
     parser.add_argument("--seed", type=int, default=789)
     parser.add_argument("--patch-size", type=int, default=1000)
     parser.add_argument("--seed-k", type=float, default=6.0)
@@ -244,6 +277,7 @@ def main():
     np.random.seed(args.seed)
     jt.set_global_seed(args.seed)
     rng = np.random.default_rng(args.seed)
+    noise_bands = parse_noise_bands(args.balanced_noise_bands)
 
     out_dir = Path(args.out_dir)
     coarse_dir = out_dir / "vm"
@@ -251,7 +285,15 @@ def main():
     coarse_dir.mkdir(parents=True, exist_ok=True)
     refined_dir.mkdir(parents=True, exist_ok=True)
 
-    rel_paths = read_datalist(args.datalist)
+    excluded = set()
+    for dataset_path in args.exclude_dataset:
+        dataset = np.load(dataset_path, allow_pickle=True)
+        excluded.update(str(path) for path in dataset["rel_path"].tolist())
+    rel_paths = [
+        rel_path
+        for rel_path in read_datalist(args.datalist)
+        if rel_path not in excluded
+    ]
     usable = [
         rel_path
         for rel_path in rel_paths
@@ -264,7 +306,16 @@ def main():
             / "models/model_normalized.obj"
         ).exists()
     ]
-    if args.max_shapes > 0:
+    if args.category_reference_datalist:
+        usable = choose_paths(
+            usable,
+            args.max_shapes,
+            rng,
+            category_reference=read_datalist(
+                args.category_reference_datalist
+            ),
+        )
+    elif args.max_shapes > 0:
         usable = usable[:args.max_shapes]
     if not usable:
         raise FileNotFoundError("no complete validation shapes found")
@@ -288,8 +339,17 @@ def main():
 
     rows = []
     for shape_index, rel_path in enumerate(usable):
+        if noise_bands:
+            noise_band_index = shape_index % len(noise_bands)
+            lower, upper = noise_bands[noise_band_index]
+            noise_std = float(rng.uniform(lower, upper))
+            noise_band = f"{lower:.4f}:{upper:.4f}"
+        else:
+            noise_std = float(args.noise_std)
+            noise_band = "fixed"
         print(
-            f"[{shape_index + 1}/{len(usable)}] {rel_path}",
+            f"[{shape_index + 1}/{len(usable)}] {rel_path} "
+            f"sigma={noise_std:.5f}",
             flush=True,
         )
         clean_raw = np.load(
@@ -299,7 +359,7 @@ def main():
         noisy = (
             clean
             + rng.standard_normal(clean.shape).astype(np.float32)
-            * float(args.noise_std)
+            * noise_std
         ).astype(np.float32, copy=False)
 
         mesh = trimesh.load(
@@ -328,7 +388,7 @@ def main():
             patches,
             args.batch_size,
             args.coarse_mode,
-            args.noise_std,
+            noise_std,
         )
         seeds_np = seeds.numpy().astype(np.float32, copy=False)
         coarse = fuse_patches(
@@ -366,6 +426,8 @@ def main():
             "rel_path": rel_path,
             "num_points": int(clean.shape[0]),
             "num_patches": int(patches.shape[0]),
+            "noise_std": noise_std,
+            "noise_band": noise_band,
             **{
                 f"coarse_{key}": value
                 for key, value in coarse_score.items()
@@ -397,14 +459,8 @@ def main():
 
     summary = {
         "shape_count": len(rows),
-        "coarse": {
-            key: float(np.mean([row[f"coarse_{key}"] for row in rows]))
-            for key in ["cd_score", "p2s_score", "final_score"]
-        },
-        "refined": {
-            key: float(np.mean([row[f"refined_{key}"] for row in rows]))
-            for key in ["cd_score", "p2s_score", "final_score"]
-        },
+        "coarse": method_summary(rows, "coarse"),
+        "refined": method_summary(rows, "refined"),
         "gain": {
             key: quantile_summary([row[f"{key}_gain"] for row in rows])
             for key in ["cd", "p2s", "final"]
@@ -412,6 +468,21 @@ def main():
         "improved_rate": float(
             np.mean([row["final_gain"] > 0.0 for row in rows])
         ),
+        "by_noise_band": {
+            band: {
+                "count": len(selected),
+                "coarse": method_summary(selected, "coarse"),
+                "refined": method_summary(selected, "refined"),
+                "final_gain": quantile_summary(
+                    [row["final_gain"] for row in selected]
+                ),
+            }
+            for band in sorted({row["noise_band"] for row in rows})
+            for selected in [[
+                row for row in rows if row["noise_band"] == band
+            ]]
+        },
+        "excluded_shape_count": len(excluded),
         "args": vars(args),
     }
     (out_dir / "summary.json").write_text(

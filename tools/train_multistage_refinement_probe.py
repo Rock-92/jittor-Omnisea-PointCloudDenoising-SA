@@ -73,6 +73,44 @@ def sampled_chamfer(prediction, clean, max_points):
     )
 
 
+def sampled_spacing_loss(
+    prediction,
+    clean,
+    max_points,
+    loss_scale,
+):
+    point_count = prediction.shape[1]
+    sample_count = min(int(max_points), point_count)
+    if sample_count < point_count:
+        indices = np.linspace(
+            0,
+            point_count - 1,
+            sample_count,
+            dtype=np.int32,
+        )
+        prediction = prediction[:, indices, :]
+        clean = clean[:, indices, :]
+    diagonal = jt.array(
+        np.eye(sample_count, dtype=np.float32)[None, :, :] * 1e6
+    )
+    prediction_nn = jt.sqrt(
+        (pairwise_sqdist(prediction, prediction) + diagonal)
+        .min(dim=2)
+        + 1e-8
+    )
+    clean_nn = jt.sqrt(
+        (pairwise_sqdist(clean, clean) + diagonal)
+        .min(dim=2)
+        + 1e-8
+    )
+    scale = max(float(loss_scale), 1e-6)
+    spacing = (((prediction_nn - clean_nn) / scale) ** 2.0).mean()
+    under_spacing = (
+        jt.maximum((clean_nn - prediction_nn) / scale, 0.0) ** 2.0
+    ).mean()
+    return spacing, under_spacing
+
+
 def stage_loss(
     previous,
     prediction,
@@ -90,6 +128,9 @@ def stage_loss(
     noise_strength_weight,
     noise_sigma_min,
     noise_sigma_max,
+    spacing_points,
+    spacing_weight,
+    under_spacing_weight,
 ):
     scale = max(float(loss_scale), 1e-6)
     scale2 = scale ** 2.0
@@ -129,6 +170,8 @@ def stage_loss(
     ).sum() / (keep_map.sum() + 1e-6)
     gate = jt.zeros(())
     noise_strength = jt.zeros(())
+    spacing = jt.zeros(())
+    under_spacing = jt.zeros(())
     if "raw_residual" in aux:
         raw_residual = aux["raw_residual"]
         gate_target = (
@@ -163,6 +206,13 @@ def stage_loss(
         noise_strength = (
             (aux["noise_strength"] - sigma_target) ** 2.0
         ).mean()
+    if float(spacing_weight) > 0.0 or float(under_spacing_weight) > 0.0:
+        spacing, under_spacing = sampled_spacing_loss(
+            prediction,
+            clean,
+            spacing_points,
+            scale,
+        )
 
     total = (
         paired
@@ -172,6 +222,8 @@ def stage_loss(
         + float(keep_weight) * keep
         + float(gate_weight) * gate
         + float(noise_strength_weight) * noise_strength
+        + float(spacing_weight) * spacing
+        + float(under_spacing_weight) * under_spacing
     )
     return total, {
         "paired": paired,
@@ -181,6 +233,8 @@ def stage_loss(
         "keep": keep,
         "gate": gate,
         "noise_strength": noise_strength,
+        "spacing": spacing,
+        "under_spacing": under_spacing,
     }
 
 
@@ -208,6 +262,9 @@ def refinement_loss(model, coarse, noisy, clean, score_sigma, args):
             noise_strength_weight=args.noise_strength_weight,
             noise_sigma_min=args.noise_sigma_min,
             noise_sigma_max=args.noise_sigma_max,
+            spacing_points=args.spacing_points,
+            spacing_weight=args.spacing_weight,
+            under_spacing_weight=args.under_spacing_weight,
         )
         deep_weight = 1.0 if stage_index == stage_count - 1 else 0.5
         total = total + deep_weight * stage_total
@@ -296,6 +353,27 @@ def add_score_bands(rows, thresholds=None):
 
 
 def summarize_rows(rows):
+    if not rows:
+        empty_gain = {
+            "count": 0,
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "p10": 0.0,
+            "p25": 0.0,
+            "median": 0.0,
+            "p75": 0.0,
+            "p90": 0.0,
+            "max": 0.0,
+        }
+        return {
+            "count": 0,
+            "coarse_score_mean": 0.0,
+            "refined_score_mean": 0.0,
+            "score_gain": empty_gain,
+            "improved_rate": 0.0,
+            "degraded_ge_1_rate": 0.0,
+        }
     gains = np.asarray([row["score_gain"] for row in rows])
     return {
         "count": len(rows),
@@ -417,6 +495,9 @@ def main():
     parser.add_argument("--noise-strength-weight", type=float, default=0.5)
     parser.add_argument("--noise-sigma-min", type=float, default=0.005)
     parser.add_argument("--noise-sigma-max", type=float, default=0.020)
+    parser.add_argument("--spacing-points", type=int, default=128)
+    parser.add_argument("--spacing-weight", type=float, default=0.0)
+    parser.add_argument("--under-spacing-weight", type=float, default=0.0)
     parser.add_argument("--hard-sample-weight", type=float, default=0.25)
     parser.add_argument("--ordinary-sample-weight", type=float, default=0.60)
     parser.add_argument("--high-score-sample-weight", type=float, default=0.15)
