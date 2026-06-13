@@ -1,6 +1,7 @@
 import argparse
 import csv
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -195,8 +196,11 @@ def sample_patch(shape, sigma, patch_size, rng):
 
 
 def closest_surface(points, vertices, faces):
+    points = np.asarray(points, dtype=np.float32)
+    if not np.isfinite(points).all():
+        raise FloatingPointError("surface query received non-finite points")
     _, face_ids, barycentric = pcu.closest_points_on_mesh(
-        np.asarray(points, dtype=np.float32),
+        points,
         vertices,
         faces,
     )
@@ -205,12 +209,34 @@ def closest_surface(points, vertices, faces):
         barycentric,
         dtype=np.float32,
     ).reshape(-1, 3)
-    return pcu.interpolate_barycentric_coords(
+    target = pcu.interpolate_barycentric_coords(
         faces,
         face_ids,
         barycentric,
         vertices,
     ).astype(np.float32, copy=False)
+    finite = np.isfinite(target).all(axis=1)
+    if not finite.all():
+        _, vertex_ids = cKDTree(vertices).query(points[~finite], k=1)
+        target = target.copy()
+        target[~finite] = vertices[
+            np.asarray(vertex_ids, dtype=np.int64).reshape(-1)
+        ]
+    if not np.isfinite(target).all():
+        raise FloatingPointError("surface query produced non-finite targets")
+    return target
+
+
+def optimizer_grad_norm(optimizer):
+    grads = []
+    for group in optimizer.param_groups:
+        for param, grad in zip(group["params"], group["grads"]):
+            if param.is_stop_grad():
+                continue
+            grads.append(grad.flatten())
+    if not grads:
+        return 0.0
+    return float(jt.norm(jt.concat(grads), 2).item())
 
 
 def pairwise_sqdist(a, b):
@@ -524,6 +550,7 @@ def main():
     parser.add_argument("--monotonic-weight", type=float, default=0.5)
     parser.add_argument("--final-surface-weight", type=float, default=1.0)
     parser.add_argument("--chamfer-points", type=int, default=256)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=20260613)
     parser.add_argument("--sample-missing-clean", action="store_true")
     parser.add_argument("--use-cuda", action="store_true")
@@ -531,6 +558,8 @@ def main():
 
     if args.patch_size != 1000:
         raise ValueError("surface-flow probe must keep patch_size=1000")
+    if args.max_grad_norm <= 0:
+        raise ValueError("max_grad_norm must be positive")
     jt.flags.use_cuda = 1 if args.use_cuda else 0
     np.random.seed(args.seed)
     jt.set_global_seed(args.seed)
@@ -646,6 +675,7 @@ def main():
     for epoch in range(args.epochs):
         model.train()
         losses_epoch = []
+        skipped_steps = 0
         order = train_rng.permutation(len(train_shapes))
         total_steps = len(train_shapes) * args.train_patches_per_shape
         running_loss = 0.0
@@ -688,25 +718,52 @@ def main():
                         + args.final_surface_weight
                         * losses["final_surface"]
                     ) / sigma2
-                    optimizer.step(loss)
+                    loss_value = float(loss.item())
+                    grad_norm = float("nan")
+                    if math.isfinite(loss_value):
+                        optimizer.zero_grad()
+                        optimizer.backward(loss)
+                        grad_norm = optimizer_grad_norm(optimizer)
+                    if math.isfinite(loss_value) and math.isfinite(grad_norm):
+                        optimizer.clip_grad_norm(args.max_grad_norm)
+                        optimizer.step()
+                    else:
+                        skipped_steps += 1
+                        optimizer.zero_grad()
                     loss_values = {
-                        "loss": float(loss.item()),
+                        "loss": loss_value,
                         **{
                             key: float(value.item() / sigma2)
                             for key, value in losses.items()
                         },
                     }
-                    losses_epoch.append(loss_values)
-                    running_loss += loss_values["loss"]
+                    if math.isfinite(loss_value):
+                        losses_epoch.append(loss_values)
+                        running_loss += loss_value
                     pbar.update(1)
                     pbar.set_postfix(
-                        loss=f"{running_loss / len(losses_epoch):.4f}",
+                        loss=(
+                            f"{running_loss / len(losses_epoch):.4f}"
+                            if losses_epoch
+                            else "nan"
+                        ),
+                        grad=(
+                            f"{grad_norm:.3f}"
+                            if math.isfinite(grad_norm)
+                            else "nan"
+                        ),
+                        skipped=skipped_steps,
                         sigma=f"{sigma:.4f}",
                     )
                     jt.gc()
 
+        if not losses_epoch:
+            raise RuntimeError(
+                f"epoch {epoch} had no finite optimization steps"
+            )
         record = {
             "epoch": epoch,
+            "train_skipped_steps": skipped_steps,
             **{
                 f"train_{key}": float(
                     np.mean([item[key] for item in losses_epoch])
