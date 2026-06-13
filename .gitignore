@@ -34,6 +34,7 @@ tools/*
 !tools/infer_three_expert_refinement.py
 !tools/evaluate_full_cloud_three_expert.py
 !tools/train_full_cloud_fusion_probe.py
+!tools/train_recurrent_surface_flow_probe.py
 
 # Datasets and ground truth
 dataset_train/

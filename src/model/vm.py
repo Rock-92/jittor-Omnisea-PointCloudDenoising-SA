@@ -39,6 +39,16 @@ class VelocityModule(ModelSpec):
             'global_token_ffn_hidden_dim',
             self.feat_embedding_dim * 2,
         )
+        self.relative_position_bias_hidden_dim = cfg.get(
+            'relative_position_bias_hidden_dim',
+            None,
+        )
+        self.global_attn_bias_init = float(
+            cfg.get('global_attn_bias_init', 1.0)
+        )
+        self.legacy_graph_updates = bool(
+            cfg.get('legacy_graph_updates', False)
+        )
         self.decoder_hidden_dims = cfg.get(
             'decoder_hidden_dims',
             [cfg.get('decoder_hidden_dim', 64)],
@@ -130,6 +140,11 @@ class VelocityModule(ModelSpec):
             global_token_blocks=self.global_token_blocks,
             global_token_ffn_hidden_dim=self.global_token_ffn_hidden_dim,
             noise_embedding_dim=self.noise_embedding_dim if self.use_edm else None,
+            relative_position_bias_hidden_dim=(
+                self.relative_position_bias_hidden_dim
+            ),
+            global_attn_bias_init=self.global_attn_bias_init,
+            legacy_graph_updates=self.legacy_graph_updates,
         )
         if self.use_edgeconv_branch:
             self.edgeconv_branch = EdgeConvFeatureExtraction(

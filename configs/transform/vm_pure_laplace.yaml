@@ -1,0 +1,23 @@
+train_transform:
+  augments:
+    - __target__: normalize_pc
+    - __target__: add_noise
+      noise_std_min: 0.005
+      noise_std_max: 0.020
+      noise_type: laplace
+    - __target__: patch
+      patch_size: 1000
+      num_patches: 1
+
+validate_transform:
+  augments:
+    - __target__: normalize_pc
+    - __target__: add_noise
+      noise_std_min: 0.005
+      noise_std_max: 0.020
+      noise_type: laplace
+    - __target__: patch
+      patch_size: 1000
+      num_patches: 1
+
+predict_transform: {}

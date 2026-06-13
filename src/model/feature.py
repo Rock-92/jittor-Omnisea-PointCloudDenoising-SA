@@ -95,6 +95,23 @@ class PointLayerNorm(nn.Module):
         return x * self.weight.reshape(1, 1, self.dim) + self.bias.reshape(1, 1, self.dim)
 
 
+class RelativePositionBias(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.lin_1 = nn.Linear(4, hidden_dim)
+        self.lin_2 = nn.Linear(hidden_dim, 1)
+        self.act = nn.ReLU()
+
+    def execute(self, rel_pos):
+        B, N, K, _ = rel_pos.shape
+        dist = jt.sqrt((rel_pos ** 2).sum(dim=-1, keepdims=True) + 1e-8)
+        rel_feat = jt.concat([rel_pos, dist], dim=-1)
+        bias = apply_edge_linear(self.lin_1, rel_feat)
+        bias = self.act(bias)
+        bias = apply_edge_linear(self.lin_2, bias)
+        return bias.reshape(B, N, K)
+
+
 class TokenSelfAttentionBlock(nn.Module):
     def __init__(self, dim, ffn_hidden_dim=None):
         super().__init__()
@@ -173,6 +190,8 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
         knn_scales,
         ffn_hidden_dim=None,
         noise_embedding_dim=None,
+        relative_position_bias_hidden_dim=None,
+        global_attn_bias_init=1.0,
     ):
         super().__init__()
         self.dim = dim
@@ -186,11 +205,18 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
         self.q_proj = nn.Linear(dim, dim)
         self.k_proj = nn.Linear(dim, dim)
         self.v_proj = nn.Linear(dim, dim)
+        self.rel_pos_bias = None
+        if relative_position_bias_hidden_dim is not None:
+            self.rel_pos_bias = RelativePositionBias(
+                int(relative_position_bias_hidden_dim)
+            )
         self.out_proj = nn.Linear(dim * len(knn_scales), dim)
         self.global_norm = PointLayerNorm(dim)
         self.global_k_proj = nn.Linear(dim, dim)
         self.global_v_proj = nn.Linear(dim, dim)
-        self.global_attn_bias = jt.ones((1,))
+        self.global_attn_bias = (
+            jt.ones((1,)) * float(global_attn_bias_init)
+        )
 
         self.ffn_norm = PointLayerNorm(dim)
         self.ffn_lin_1 = nn.Linear(dim, self.ffn_hidden_dim)
@@ -213,7 +239,14 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
         shift = self.noise_shift(noise_emb).unsqueeze(1)
         return x * (1.0 + scale) + shift
 
-    def execute(self, x, graph_knn_idx, global_token=None, noise_emb=None):
+    def execute(
+        self,
+        x,
+        graph_knn_idx,
+        global_token=None,
+        noise_emb=None,
+        xyz=None,
+    ):
         """
         x:       (B, N, C), point features.
         graph_knn_idx: (B, N, max(knn_scales)), neighbor indices used for
@@ -236,6 +269,14 @@ class MultiScaleLocalSelfAttentionBlock(nn.Module):
             v_neighbors = gather_neighbors(v, idx)
 
             attn_logits = (q.unsqueeze(2) * k_neighbors).sum(dim=-1) * self.scale
+            if self.rel_pos_bias is not None:
+                if xyz is None:
+                    raise ValueError(
+                        "xyz is required when relative position bias is enabled"
+                    )
+                xyz_neighbors = gather_neighbors(xyz, idx)
+                rel_pos = xyz_neighbors - xyz.unsqueeze(2)
+                attn_logits = attn_logits + self.rel_pos_bias(rel_pos)
             v_all = v_neighbors
             if global_token is not None:
                 k_global_scale = k_global.unsqueeze(1).broadcast((B, N, 1, self.dim))
@@ -274,6 +315,9 @@ class FeatureExtraction(nn.Module):
         global_token_blocks=4,
         global_token_ffn_hidden_dim=None,
         noise_embedding_dim=None,
+        relative_position_bias_hidden_dim=None,
+        global_attn_bias_init=1.0,
+        legacy_graph_updates=False,
     ):
         super().__init__()
 
@@ -295,6 +339,11 @@ class FeatureExtraction(nn.Module):
         self.global_token_blocks = int(global_token_blocks)
         self.global_token_ffn_hidden_dim = int(global_token_ffn_hidden_dim)
         self.noise_embedding_dim = noise_embedding_dim
+        self.relative_position_bias_hidden_dim = (
+            relative_position_bias_hidden_dim
+        )
+        self.global_attn_bias_init = float(global_attn_bias_init)
+        self.legacy_graph_updates = bool(legacy_graph_updates)
 
         self.input_proj_1 = nn.Linear(input_dim, input_expand_dim)
         self.input_proj_2 = nn.Linear(input_expand_dim, embedding_dim)
@@ -321,6 +370,10 @@ class FeatureExtraction(nn.Module):
                 knn_scales=self.knn_scales,
                 ffn_hidden_dim=self.ffn_hidden_dim,
                 noise_embedding_dim=self.noise_embedding_dim,
+                relative_position_bias_hidden_dim=(
+                    self.relative_position_bias_hidden_dim
+                ),
+                global_attn_bias_init=self.global_attn_bias_init,
             )
             weight = jt.ones((1,)) * float(block_weight_values[i])
             setattr(self, f"block_{i}", block)
@@ -354,9 +407,35 @@ class FeatureExtraction(nn.Module):
         global_token = self.global_token_generator(global_feat)
 
         block_outputs = []
+        graph_knn_idx = None
+        reuse_knn_idx = None
+        if self.legacy_graph_updates:
+            graph_knn_idx = get_knn_idx(
+                x,
+                x,
+                self.max_knn,
+                offset=1,
+            )
         for block_idx, (block, weight) in enumerate(zip(self.blocks, self.block_weights)):
-            if block_idx == 0:
-                block_knn_idx = get_knn_idx(x, x, self.max_knn, offset=1)
+            if self.legacy_graph_updates and block_idx == 0:
+                block_knn_idx = graph_knn_idx
+            elif self.legacy_graph_updates and block_idx == 1:
+                reuse_knn_idx = get_knn_idx(
+                    feat,
+                    feat,
+                    self.max_knn,
+                    offset=1,
+                )
+                block_knn_idx = reuse_knn_idx
+            elif self.legacy_graph_updates:
+                block_knn_idx = reuse_knn_idx
+            elif block_idx == 0:
+                block_knn_idx = get_knn_idx(
+                    x,
+                    x,
+                    self.max_knn,
+                    offset=1,
+                )
             else:
                 block_knn_idx = get_knn_idx(feat, feat, self.max_knn, offset=1)
             feat = block(
@@ -364,6 +443,7 @@ class FeatureExtraction(nn.Module):
                 block_knn_idx,
                 global_token=global_token,
                 noise_emb=noise_emb,
+                xyz=x,
             )
             block_outputs.append(feat * weight)
 
