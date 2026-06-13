@@ -323,18 +323,8 @@ def recurrent_forward(
             size=sample_count,
             replace=False,
         ).astype(np.int32)
-        clean_indices = rng.choice(
-            point_count,
-            size=sample_count,
-            replace=False,
-        ).astype(np.int32)
         final_sample = state[0, jt.array(pred_indices).int32(), :]
-        clean_sample = clean_target[
-            0,
-            jt.array(clean_indices).int32(),
-            :,
-        ]
-        final_dist = pairwise_sqdist(final_sample, clean_sample)
+        final_dist = pairwise_sqdist(final_sample, clean_target[0])
         final_chamfer = (
             final_dist.min(dim=1).mean()
             + final_dist.min(dim=0).mean()
@@ -594,7 +584,8 @@ def main():
     parser.add_argument("--surface-weight", type=float, default=0.2)
     parser.add_argument("--monotonic-weight", type=float, default=0.2)
     parser.add_argument("--final-surface-weight", type=float, default=0.2)
-    parser.add_argument("--chamfer-points", type=int, default=256)
+    parser.add_argument("--chamfer-points", type=int, default=512)
+    parser.add_argument("--loss-scale", type=float, default=1.0)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=20260613)
     parser.add_argument("--sample-missing-clean", action="store_true")
@@ -605,6 +596,8 @@ def main():
         raise ValueError("surface-flow probe must keep patch_size=1000")
     if args.max_grad_norm <= 0:
         raise ValueError("max_grad_norm must be positive")
+    if args.loss_scale <= 0:
+        raise ValueError("loss_scale must be positive")
     jt.flags.use_cuda = 1 if args.use_cuda else 0
     np.random.seed(args.seed)
     jt.set_global_seed(args.seed)
@@ -721,6 +714,8 @@ def main():
         model.train()
         losses_epoch = []
         skipped_steps = 0
+        clipped_steps = 0
+        grad_norms = []
         order = train_rng.permutation(len(train_shapes))
         total_steps = len(train_shapes) * args.train_patches_per_shape
         running_loss = 0.0
@@ -756,8 +751,7 @@ def main():
                         rng=train_rng,
                         with_loss=True,
                     )
-                    sigma2 = max(sigma**2.0, 1e-8)
-                    loss = (
+                    raw_loss = (
                         args.flow_weight * losses["flow"]
                         + args.paired_weight * losses["paired"]
                         + args.chamfer_weight * losses["chamfer"]
@@ -765,7 +759,8 @@ def main():
                         + args.monotonic_weight * losses["monotonic"]
                         + args.final_surface_weight
                         * losses["final_surface"]
-                    ) / sigma2
+                    )
+                    loss = args.loss_scale * raw_loss
                     loss_value = float(loss.item())
                     grad_norm = float("nan")
                     if math.isfinite(loss_value):
@@ -773,6 +768,9 @@ def main():
                         optimizer.backward(loss)
                         grad_norm = optimizer_grad_norm(optimizer)
                     if math.isfinite(loss_value) and math.isfinite(grad_norm):
+                        grad_norms.append(grad_norm)
+                        if grad_norm > args.max_grad_norm:
+                            clipped_steps += 1
                         optimizer.clip_grad_norm(args.max_grad_norm)
                         optimizer.step()
                     else:
@@ -781,7 +779,7 @@ def main():
                     loss_values = {
                         "loss": loss_value,
                         **{
-                            key: float(value.item() / sigma2)
+                            key: float(value.item() * args.loss_scale)
                             for key, value in losses.items()
                         },
                     }
@@ -800,6 +798,7 @@ def main():
                             if math.isfinite(grad_norm)
                             else "nan"
                         ),
+                        clipped=clipped_steps,
                         skipped=skipped_steps,
                         sigma=f"{sigma:.4f}",
                     )
@@ -809,9 +808,19 @@ def main():
             raise RuntimeError(
                 f"epoch {epoch} had no finite optimization steps"
             )
+        if not grad_norms:
+            raise RuntimeError(
+                f"epoch {epoch} had no finite gradients"
+            )
         record = {
             "epoch": epoch,
             "train_skipped_steps": skipped_steps,
+            "train_clipped_steps": clipped_steps,
+            "train_clip_rate": (
+                clipped_steps / max(len(grad_norms), 1)
+            ),
+            "train_grad_norm_mean": float(np.mean(grad_norms)),
+            "train_grad_norm_max": float(np.max(grad_norms)),
             **{
                 f"train_{key}": float(
                     np.mean([item[key] for item in losses_epoch])
