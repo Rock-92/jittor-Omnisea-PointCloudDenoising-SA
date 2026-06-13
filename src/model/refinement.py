@@ -502,3 +502,204 @@ class MultiStageGeometryRefiner(nn.Module):
             )
             stage_outputs.append({"prediction": current, **aux})
         return current, {"stages": stage_outputs}
+
+
+class FusionAwareResidualRefiner(nn.Module):
+    """Bounded Stage2 residual model conditioned on overlap consensus."""
+
+    def __init__(
+        self,
+        k=24,
+        local_dim=96,
+        hidden_dim=192,
+        max_residual=0.008,
+        eps=1e-6,
+    ):
+        super().__init__()
+        self.k = int(k)
+        self.local_dim = int(local_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.max_residual = float(max_residual)
+        self.eps = float(eps)
+
+        # Coarse neighborhood geometry, Stage1 displacement, and the
+        # disagreement between this patch and the overlap consensus.
+        self.neighbor_mlp = nn.Sequential(
+            nn.Linear(10, self.local_dim),
+            nn.ReLU(),
+            nn.Linear(self.local_dim, self.local_dim),
+            nn.ReLU(),
+        )
+        point_input_dim = 3 + 3 + 3 + 3 + 3 + 1 + 1 + 1 + self.local_dim + 5
+        self.point_mlp = nn.Sequential(
+            nn.Linear(point_input_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.ReLU(),
+        )
+        self.direction_head = nn.Linear(self.hidden_dim, 3)
+        self.length_head = nn.Linear(self.hidden_dim, 1)
+        self.gate_head = nn.Linear(self.hidden_dim, 1)
+
+        self.direction_head.weight.update(
+            jt.randn(self.direction_head.weight.shape) * 1e-4
+        )
+        self.direction_head.bias.update(
+            jt.randn(self.direction_head.bias.shape) * 1e-4
+        )
+        self.length_head.weight.update(
+            jt.randn(self.length_head.weight.shape) * 1e-4
+        )
+        self.length_head.bias.update(
+            jt.ones_like(self.length_head.bias) * -2.5
+        )
+        self.gate_head.weight.update(
+            jt.randn(self.gate_head.weight.shape) * 1e-4
+        )
+        self.gate_head.bias.update(jt.ones_like(self.gate_head.bias) * -2.0)
+
+    def _geometry(self, coarse, neighbor_idx):
+        neighbors = gather_neighbors(coarse, neighbor_idx)
+        offsets = neighbors - coarse.unsqueeze(2)
+        sqdist = (offsets ** 2.0).sum(dim=-1)
+        radius = jt.sqrt(sqdist.mean(dim=2, keepdims=True) + self.eps)
+        normalized_offsets = offsets / (radius.unsqueeze(-1) + self.eps)
+
+        centered = offsets - offsets.mean(dim=2, keepdims=True)
+        x = centered[:, :, :, 0]
+        y = centered[:, :, :, 1]
+        z = centered[:, :, :, 2]
+        cxx = (x * x).mean(dim=2)
+        cyy = (y * y).mean(dim=2)
+        czz = (z * z).mean(dim=2)
+        cxy = (x * y).mean(dim=2)
+        cxz = (x * z).mean(dim=2)
+        cyz = (y * z).mean(dim=2)
+        det = (
+            cxx * cyy * czz
+            + 2.0 * cxy * cxz * cyz
+            - cxx * cyz * cyz
+            - cyy * cxz * cxz
+            - czz * cxy * cxy
+        )
+        trace = cxx + cyy + czz
+        nonplanarity = 27.0 * jt.maximum(det, 0.0) / jt.maximum(
+            trace ** 3.0,
+            self.eps ** 3.0,
+        )
+        nonplanarity = jt.minimum(
+            jt.maximum(nonplanarity, 0.0),
+            1.0,
+        ).unsqueeze(-1)
+
+        first = offsets[:, :, 0, :]
+        second = offsets[:, :, max(1, offsets.shape[2] // 3), :]
+        normal = jt.stack(
+            [
+                first[:, :, 1] * second[:, :, 2]
+                - first[:, :, 2] * second[:, :, 1],
+                first[:, :, 2] * second[:, :, 0]
+                - first[:, :, 0] * second[:, :, 2],
+                first[:, :, 0] * second[:, :, 1]
+                - first[:, :, 1] * second[:, :, 0],
+            ],
+            dim=-1,
+        )
+        normal = normal / (
+            jt.sqrt((normal ** 2.0).sum(dim=-1, keepdims=True)) + self.eps
+        )
+        return normalized_offsets, radius, offsets.mean(dim=2), normal, nonplanarity
+
+    def execute(self, coarse, noisy, consensus, patch_distance):
+        k = min(self.k, coarse.shape[1] - 1)
+        neighbor_idx = get_knn_idx(coarse, coarse, k=k, offset=1)
+        (
+            normalized_offsets,
+            radius,
+            local_mean,
+            normal,
+            nonplanarity,
+        ) = self._geometry(coarse, neighbor_idx)
+
+        stage1_displacement = coarse - noisy
+        consensus_delta = consensus - coarse
+        neighbor_input = jt.concat(
+            [
+                normalized_offsets,
+                jt.sqrt(
+                    (normalized_offsets ** 2.0).sum(
+                        dim=-1,
+                        keepdims=True,
+                    )
+                    + self.eps
+                ),
+                gather_neighbors(stage1_displacement, neighbor_idx),
+                gather_neighbors(consensus_delta, neighbor_idx),
+            ],
+            dim=-1,
+        )
+        neighbor_feature = apply_neighbor_mlp(
+            self.neighbor_mlp,
+            neighbor_input,
+        ).mean(dim=2)
+
+        displacement_length = jt.sqrt(
+            (stage1_displacement ** 2.0).sum(dim=-1, keepdims=True)
+            + self.eps
+        )
+        consensus_length = jt.sqrt(
+            (consensus_delta ** 2.0).sum(dim=-1, keepdims=True)
+            + self.eps
+        )
+        patch_summary = jt.concat(
+            [
+                displacement_length.mean(dim=1, keepdims=True),
+                displacement_length.max(dim=1, keepdims=True),
+                consensus_length.mean(dim=1, keepdims=True),
+                radius.mean(dim=1, keepdims=True),
+                nonplanarity.mean(dim=1, keepdims=True),
+            ],
+            dim=-1,
+        )
+        patch_summary = patch_summary.broadcast(
+            (coarse.shape[0], coarse.shape[1], 5)
+        )
+        point_input = jt.concat(
+            [
+                coarse,
+                stage1_displacement,
+                consensus_delta,
+                local_mean,
+                normal,
+                radius,
+                nonplanarity,
+                patch_distance,
+                neighbor_feature,
+                patch_summary,
+            ],
+            dim=-1,
+        )
+        feature = apply_point_mlp(self.point_mlp, point_input)
+        direction = apply_point_mlp(self.direction_head, feature)
+        direction = direction / (
+            jt.sqrt((direction ** 2.0).sum(dim=-1, keepdims=True))
+            + self.eps
+        )
+        length = (
+            jt.sigmoid(apply_point_mlp(self.length_head, feature))
+            * self.max_residual
+        )
+        gate = jt.sigmoid(apply_point_mlp(self.gate_head, feature))
+        raw_residual = direction * length
+        residual = raw_residual * gate
+        return coarse + residual, {
+            "residual": residual,
+            "raw_residual": raw_residual,
+            "direction": direction,
+            "length": length,
+            "gate": gate,
+            "normal": normal,
+            "nonplanarity": nonplanarity,
+        }
