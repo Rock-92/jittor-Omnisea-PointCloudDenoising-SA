@@ -246,6 +246,7 @@ def pairwise_sqdist(a, b):
 def recurrent_forward(
     model,
     noisy,
+    clean,
     vertices,
     faces,
     steps,
@@ -255,6 +256,9 @@ def recurrent_forward(
     with_loss,
 ):
     state = noisy
+    clean_target = None
+    if clean is not None:
+        clean_target = jt.array(clean[None, :, :])
     trajectory = [state]
     step_losses = []
     for step in range(int(steps)):
@@ -263,30 +267,49 @@ def recurrent_forward(
             copy=False,
         )
         target_np = closest_surface(state_np, vertices, faces)
-        target = jt.array(target_np[None, :, :])
-        target_flow = target - state.detach()
+        surface_target = jt.array(target_np[None, :, :])
+        if with_loss and clean_target is None:
+            raise ValueError("clean correspondence is required for training")
+        target_flow = (
+            clean_target - state.detach()
+            if with_loss
+            else surface_target - state.detach()
+        )
         predicted_flow = model.predict_displacement(state)
         next_state = state + float(step_scale) * predicted_flow
         trajectory.append(next_state)
         if with_loss:
             current_surface_mse = (
-                (state.detach() - target) ** 2.0
+                (state.detach() - surface_target) ** 2.0
+            ).sum(dim=-1).mean()
+            current_paired_mse = (
+                (state.detach() - clean_target) ** 2.0
             ).sum(dim=-1).mean()
             flow_loss = (
                 (predicted_flow - target_flow) ** 2.0
             ).sum(dim=-1).mean()
-            surface_mse = (
-                (next_state - target) ** 2.0
+            paired_mse = (
+                (next_state - clean_target) ** 2.0
             ).sum(dim=-1).mean()
-            monotonic = jt.maximum(
+            surface_mse = (
+                (next_state - surface_target) ** 2.0
+            ).sum(dim=-1).mean()
+            surface_monotonic = jt.maximum(
                 surface_mse - current_surface_mse,
+                0.0,
+            )
+            paired_monotonic = jt.maximum(
+                paired_mse - current_paired_mse,
                 0.0,
             )
             step_losses.append(
                 {
                     "flow": flow_loss,
+                    "paired": paired_mse,
                     "surface": surface_mse,
-                    "monotonic": monotonic.mean(),
+                    "monotonic": (
+                        surface_monotonic + paired_monotonic
+                    ).mean(),
                 }
             )
         state = next_state
@@ -295,12 +318,27 @@ def recurrent_forward(
     if with_loss:
         point_count = state.shape[1]
         sample_count = min(int(chamfer_points), point_count)
-        indices = rng.choice(
+        pred_indices = rng.choice(
             point_count,
             size=sample_count,
             replace=False,
         ).astype(np.int32)
-        final_sample = state[0, jt.array(indices).int32(), :]
+        clean_indices = rng.choice(
+            point_count,
+            size=sample_count,
+            replace=False,
+        ).astype(np.int32)
+        final_sample = state[0, jt.array(pred_indices).int32(), :]
+        clean_sample = clean_target[
+            0,
+            jt.array(clean_indices).int32(),
+            :,
+        ]
+        final_dist = pairwise_sqdist(final_sample, clean_sample)
+        final_chamfer = (
+            final_dist.min(dim=1).mean()
+            + final_dist.min(dim=0).mean()
+        )
         final_target_np = closest_surface(
             final_sample.detach().numpy(),
             vertices,
@@ -314,12 +352,16 @@ def recurrent_forward(
             "flow": jt.stack(
                 [item["flow"] for item in step_losses]
             ).mean(),
+            "paired": jt.stack(
+                [item["paired"] for item in step_losses]
+            ).mean(),
             "surface": jt.stack(
                 [item["surface"] for item in step_losses]
             ).mean(),
             "monotonic": jt.stack(
                 [item["monotonic"] for item in step_losses]
             ).mean(),
+            "chamfer": final_chamfer,
             "final_surface": final_surface,
         }
     return state, trajectory, losses
@@ -360,6 +402,7 @@ def predict_patch(model, patch, steps, step_scale):
         prediction, trajectory, _ = recurrent_forward(
             model,
             state,
+            patch["clean"],
             patch["vertices"],
             patch["faces"],
             steps=steps,
@@ -546,9 +589,11 @@ def main():
         default="all",
     )
     parser.add_argument("--flow-weight", type=float, default=1.0)
-    parser.add_argument("--surface-weight", type=float, default=1.0)
-    parser.add_argument("--monotonic-weight", type=float, default=0.5)
-    parser.add_argument("--final-surface-weight", type=float, default=1.0)
+    parser.add_argument("--paired-weight", type=float, default=1.0)
+    parser.add_argument("--chamfer-weight", type=float, default=1.0)
+    parser.add_argument("--surface-weight", type=float, default=0.2)
+    parser.add_argument("--monotonic-weight", type=float, default=0.2)
+    parser.add_argument("--final-surface-weight", type=float, default=0.2)
     parser.add_argument("--chamfer-points", type=int, default=256)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=20260613)
@@ -702,6 +747,7 @@ def main():
                     _, _, losses = recurrent_forward(
                         model,
                         noisy,
+                        patch["clean"],
                         patch["vertices"],
                         patch["faces"],
                         steps=args.steps,
@@ -713,6 +759,8 @@ def main():
                     sigma2 = max(sigma**2.0, 1e-8)
                     loss = (
                         args.flow_weight * losses["flow"]
+                        + args.paired_weight * losses["paired"]
+                        + args.chamfer_weight * losses["chamfer"]
                         + args.surface_weight * losses["surface"]
                         + args.monotonic_weight * losses["monotonic"]
                         + args.final_surface_weight
