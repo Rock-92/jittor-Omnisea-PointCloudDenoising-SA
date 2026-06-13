@@ -1,6 +1,6 @@
 mode: predict
 debug: False
-load_ckpt: outputs/EdgeConv/checkpoints/checkpoint_best.pkl
+load_ckpt: outputs/EdgeConv_EDM/checkpoints/checkpoint_best.pkl
 
 components:
   data: edgeconv_baseline
@@ -10,6 +10,6 @@ components:
 
 writer:
   __target__: vm
-  save_dir: outputs/EdgeConv/result/test_noisy
+  save_dir: outputs/EdgeConv_EDM/result/test_noisy
   save_name: denoised
-  result_zip: outputs/EdgeConv/result/result.zip
+  result_zip: outputs/EdgeConv_EDM/result/result.zip

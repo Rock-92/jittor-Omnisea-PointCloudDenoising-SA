@@ -74,20 +74,37 @@ class DynamicEdgeConv(EdgeConv):
 
 
 class EdgeConvFeatureExtraction(nn.Module):
-    def __init__(self, k=16, input_dim=3, embedding_dim=256, distance_estimation=False):
+    def __init__(
+        self,
+        k=16,
+        input_dim=3,
+        embedding_dim=256,
+        distance_estimation=False,
+        noise_embedding_dim=None,
+    ):
         super().__init__()
         self.k = int(k)
         self.input_dim = int(input_dim)
         self.embedding_dim = int(embedding_dim)
         self.distance_estimation = bool(distance_estimation)
+        self.noise_embedding_dim = noise_embedding_dim
 
-        self.conv1 = DynamicEdgeConv(self.input_dim, self.embedding_dim // 8)
-        self.conv2 = DynamicEdgeConv(self.embedding_dim // 8, self.embedding_dim // 4)
+        dim1 = self.embedding_dim // 8
+        dim2 = self.embedding_dim // 4
+        self.conv1 = DynamicEdgeConv(self.input_dim, dim1)
+        self.conv2 = DynamicEdgeConv(dim1, dim2)
         self.conv3 = DynamicEdgeConv(
-            self.embedding_dim // 8 + self.embedding_dim // 4,
+            dim1 + dim2,
             self.embedding_dim,
             activation=None,
         )
+        if self.noise_embedding_dim is not None:
+            self.noise_film_1 = nn.Linear(self.noise_embedding_dim, 2 * dim1)
+            self.noise_film_2 = nn.Linear(self.noise_embedding_dim, 2 * dim2)
+            self.noise_film_3 = nn.Linear(
+                self.noise_embedding_dim,
+                2 * self.embedding_dim,
+            )
 
     def get_edge_index(self, x):
         """
@@ -111,9 +128,19 @@ class EdgeConvFeatureExtraction(nn.Module):
         scale = scale.max(dim=-2, keepdims=True)
         return pcl / (scale + 1e-8)
 
-    def execute(self, x):
+    def apply_noise_film(self, x, noise_emb, film):
+        if noise_emb is None:
+            return x
+        scale_shift = 0.1 * film(noise_emb)
+        split_dim = scale_shift.shape[-1] // 2
+        scale = scale_shift[:, :split_dim]
+        shift = scale_shift[:, split_dim:]
+        return x * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+    def execute(self, x, noise_emb=None):
         """
         x: (B, N, 3)
+        noise_emb: optional (B, noise_embedding_dim)
         return: (B, N, embedding_dim)
         """
         B, N, _ = x.shape
@@ -123,15 +150,22 @@ class EdgeConvFeatureExtraction(nn.Module):
         edge_index = self.get_edge_index(x)
         x1 = self.conv1(x.reshape(B * N, -1), edge_index)
         x1 = x1.reshape(B, N, -1)
+        if self.noise_embedding_dim is not None:
+            x1 = self.apply_noise_film(x1, noise_emb, self.noise_film_1)
 
         edge_index = self.get_edge_index(x1)
         x2 = self.conv2(x1.reshape(B * N, -1), edge_index)
         x2 = x2.reshape(B, N, -1)
+        if self.noise_embedding_dim is not None:
+            x2 = self.apply_noise_film(x2, noise_emb, self.noise_film_2)
 
         edge_index = self.get_edge_index(x2)
         x_combined = jt.concat([x1, x2], dim=-1)
         x3 = self.conv3(x_combined.reshape(B * N, -1), edge_index)
-        return x3.reshape(B, N, -1)
+        x3 = x3.reshape(B, N, -1)
+        if self.noise_embedding_dim is not None:
+            x3 = self.apply_noise_film(x3, noise_emb, self.noise_film_3)
+        return x3
 
 
 class EdgeConvDecoder(nn.Module):
@@ -177,18 +211,49 @@ class EdgeConvBaselineModule(ModelSpec):
         self.decoder_dropout = float(cfg.get("decoder_dropout", 0.1))
         self.num_train_points = int(cfg.get("num_train_points", 128))
         self.dsm_sigma = float(cfg.get("dsm_sigma", 0.01))
+        self.use_edm = bool(cfg.get("use_edm", True))
+        self.sigma_data = float(cfg.get("sigma_data", 0.10))
+        self.edm_default_sigma = float(
+            cfg.get("edm_default_sigma", self.dsm_sigma)
+        )
+        self.edm_loss_weighting = bool(cfg.get("edm_loss_weighting", True))
+        self.noise_embedding_dim = int(
+            cfg.get("noise_embedding_dim", self.feat_embedding_dim)
+        )
+        self.use_patch_scale_condition = bool(
+            cfg.get("use_patch_scale_condition", True)
+        )
+        self.patch_scale_eps = float(cfg.get("patch_scale_eps", 1e-4))
+        self.edm_sampler = str(cfg.get("edm_sampler", "heun"))
+        self.edm_sigma_min = float(cfg.get("edm_sigma_min", 1e-4))
+        self.edm_inference_sigmas = [
+            float(v)
+            for v in cfg.get(
+                "edm_inference_sigmas",
+                [0.020, 0.010, 0.005, 0.0],
+            )
+        ]
 
         self.predict_rounds = int(cfg.get("predict_rounds", 1))
-        self.denoise_num_steps = int(cfg.get("denoise_num_steps", 4))
         self.predict_patch_size = int(cfg.get("predict_patch_size", 1000))
         self.predict_seed_k = int(cfg.get("predict_seed_k", 6))
         self.predict_seed_interval = int(cfg.get("predict_seed_interval", 200))
         self.predict_seed_k_alpha = int(cfg.get("predict_seed_k_alpha", 1))
 
+        if self.use_edm:
+            self.noise_embed_1 = nn.Linear(1, self.noise_embedding_dim)
+            self.noise_embed_2 = nn.Linear(
+                self.noise_embedding_dim,
+                self.noise_embedding_dim,
+            )
+            self.noise_act = nn.ReLU()
         self.encoder = EdgeConvFeatureExtraction(
             k=self.frame_knn,
             input_dim=self.input_dim,
             embedding_dim=self.feat_embedding_dim,
+            noise_embedding_dim=(
+                self.noise_embedding_dim if self.use_edm else None
+            ),
         )
         self.decoder = EdgeConvDecoder(
             z_dim=self.encoder.embedding_dim,
@@ -197,47 +262,218 @@ class EdgeConvBaselineModule(ModelSpec):
             dropout=self.decoder_dropout,
         )
 
-    def predict_displacement(self, pc_noisy, point_idx=None):
-        B, _, d = pc_noisy.shape
-        feat = self.encoder(pc_noisy)
+    def _expand_sigma(self, sigma, batch_size):
+        if sigma is None:
+            sigma = self.edm_default_sigma
+        if not isinstance(sigma, jt.Var):
+            sigma = jt.ones((batch_size, 1)) * float(sigma)
+        elif len(sigma.shape) == 0:
+            sigma = jt.ones((batch_size, 1)) * sigma
+        elif len(sigma.shape) == 1:
+            sigma = sigma.reshape(-1, 1)
+        return sigma
+
+    def clamp_edm_sigma(self, sigma):
+        return jt.maximum(sigma, self.edm_sigma_min)
+
+    def get_patch_scale(self, pc_noisy):
+        centered = pc_noisy - pc_noisy.mean(dim=1).unsqueeze(1)
+        scale2 = (centered ** 2.0).sum(dim=-1).mean(dim=1)
+        scale = jt.sqrt(
+            scale2 + self.patch_scale_eps ** 2.0
+        ).reshape(pc_noisy.shape[0], 1)
+        return jt.maximum(scale, self.patch_scale_eps)
+
+    def get_noise_embedding(self, sigma, patch_scale=None):
+        sigma = self.clamp_edm_sigma(sigma)
+        sigma_condition = sigma
+        if self.use_patch_scale_condition and patch_scale is not None:
+            sigma_condition = sigma / jt.maximum(
+                patch_scale,
+                self.patch_scale_eps,
+            )
+            sigma_condition = self.clamp_edm_sigma(sigma_condition)
+        c_noise = jt.log(sigma_condition) / 4.0
+        return self.noise_embed_2(self.noise_act(self.noise_embed_1(c_noise)))
+
+    def get_edm_coefficients(self, sigma):
+        sigma = self.clamp_edm_sigma(sigma)
+        sigma2 = sigma ** 2.0
+        sigma_data2 = self.sigma_data ** 2.0
+        denom = sigma2 + sigma_data2
+        c_skip = sigma_data2 / denom
+        c_out = sigma * self.sigma_data / jt.sqrt(denom)
+        c_in = 1.0 / jt.sqrt(denom)
+        return c_skip, c_out, c_in
+
+    def encode_features(self, pc_noisy, sigma=None, point_idx=None):
+        B = pc_noisy.shape[0]
+        noise_emb = None
+        encoder_input = pc_noisy
+        if self.use_edm:
+            sigma = self._expand_sigma(sigma, B)
+            _, _, c_in = self.get_edm_coefficients(sigma)
+            patch_scale = self.get_patch_scale(pc_noisy)
+            noise_emb = self.get_noise_embedding(
+                sigma,
+                patch_scale=patch_scale,
+            )
+            encoder_input = pc_noisy * c_in.reshape(B, 1, 1)
+        feat = self.encoder(encoder_input, noise_emb=noise_emb)
         if point_idx is not None:
             feat = feat[:, point_idx, :]
+        return feat
+
+    def predict_raw(self, pc_noisy, sigma=None, point_idx=None):
+        B, _, d = pc_noisy.shape
+        feat = self.encode_features(
+            pc_noisy,
+            sigma=sigma,
+            point_idx=point_idx,
+        )
         N_out = feat.shape[1]
         F_dim = feat.shape[2]
         return self.decoder(feat.reshape(-1, F_dim)).reshape(B, N_out, d)
 
-    def get_supervised_loss(self, pc_noisy, pc_mix, pc_clean):
-        point_idx = get_random_indices(pc_mix.shape[1], self.num_train_points)
-        feat = self.encoder(pc_mix)
-        target = pc_clean - pc_noisy
+    def predict_clean(self, pc_noisy, sigma=None, point_idx=None):
+        if not self.use_edm:
+            pc_base = pc_noisy
+            if point_idx is not None:
+                pc_base = pc_noisy[:, point_idx, :]
+            return pc_base + self.predict_raw(
+                pc_noisy,
+                point_idx=point_idx,
+            )
+        B = pc_noisy.shape[0]
+        sigma = self._expand_sigma(sigma, B)
+        raw = self.predict_raw(
+            pc_noisy,
+            sigma=sigma,
+            point_idx=point_idx,
+        )
+        pc_base = pc_noisy
         if point_idx is not None:
-            feat = feat[:, point_idx, :]
+            pc_base = pc_noisy[:, point_idx, :]
+        c_skip, c_out, _ = self.get_edm_coefficients(sigma)
+        return (
+            c_skip.reshape(B, 1, 1) * pc_base
+            + c_out.reshape(B, 1, 1) * raw
+        )
+
+    def predict_displacement(self, pc_noisy, sigma=None, point_idx=None):
+        pc_base = pc_noisy
+        if point_idx is not None:
+            pc_base = pc_noisy[:, point_idx, :]
+        return (
+            self.predict_clean(
+                pc_noisy,
+                sigma=sigma,
+                point_idx=point_idx,
+            )
+            - pc_base
+        )
+
+    def get_supervised_loss(self, pc_noisy, pc_clean, score_sigma=None):
+        B = pc_noisy.shape[0]
+        point_idx = get_random_indices(
+            pc_noisy.shape[1],
+            self.num_train_points,
+        )
+        target = pc_clean
+        if point_idx is not None:
             target = target[:, point_idx, :]
 
-        B, N_out, F_dim = feat.shape
-        pred_dir = self.decoder(feat.reshape(-1, F_dim)).reshape(B, N_out, 3)
-        return (((pred_dir - target) ** 2.0) / self.dsm_sigma).sum(dim=-1).mean()
+        if self.use_edm:
+            score_sigma = self._expand_sigma(score_sigma, B)
+            pred_clean = self.predict_clean(
+                pc_noisy,
+                sigma=score_sigma,
+                point_idx=point_idx,
+            )
+            loss = ((pred_clean - target) ** 2.0).sum(dim=-1)
+            if self.edm_loss_weighting:
+                sigma = self.clamp_edm_sigma(score_sigma)
+                sigma2 = sigma ** 2.0
+                sigma_data2 = self.sigma_data ** 2.0
+                weight = (sigma2 + sigma_data2) / (
+                    sigma2 * sigma_data2
+                )
+                loss = loss * weight.reshape(B, 1)
+            return loss.mean()
+
+        pred_dir = self.predict_displacement(
+            pc_noisy,
+            point_idx=point_idx,
+        )
+        target_dir = target
+        pc_base = pc_noisy
+        if point_idx is not None:
+            pc_base = pc_noisy[:, point_idx, :]
+        target_dir = target_dir - pc_base
+        return (
+            ((pred_dir - target_dir) ** 2.0) / self.dsm_sigma
+        ).sum(dim=-1).mean()
+
+    def edm_derivative(self, x, sigma):
+        sigma_var = self._expand_sigma(sigma, x.shape[0])
+        sigma_var = self.clamp_edm_sigma(sigma_var)
+        denoised = self.predict_clean(x, sigma=sigma_var)
+        return (
+            (x - denoised)
+            / sigma_var.reshape(x.shape[0], 1, 1)
+        )
+
+    def edm_euler_sampler(self, x):
+        for sigma, sigma_next in zip(
+            self.edm_inference_sigmas[:-1],
+            self.edm_inference_sigmas[1:],
+        ):
+            step = sigma_next - sigma
+            x = x + step * self.edm_derivative(x, sigma)
+        return x
+
+    def edm_heun_sampler(self, x):
+        for sigma, sigma_next in zip(
+            self.edm_inference_sigmas[:-1],
+            self.edm_inference_sigmas[1:],
+        ):
+            step = sigma_next - sigma
+            derivative = self.edm_derivative(x, sigma)
+            x_euler = x + step * derivative
+            if sigma_next <= 0:
+                x = x_euler
+                continue
+            derivative_next = self.edm_derivative(x_euler, sigma_next)
+            x = x + 0.5 * step * (derivative + derivative_next)
+        return x
 
     def denoise_langevin_dynamics(self, pcl_noisy, num_steps=None):
-        if num_steps is None:
-            num_steps = self.denoise_num_steps
         with jt.no_grad():
-            pcl_next = pcl_noisy.clone()
-            for _ in range(num_steps):
-                pred_dir = self.predict_displacement(pcl_next)
-                pcl_next = pcl_next + (1.0 / num_steps) * pred_dir
+            if self.use_edm:
+                if self.edm_sampler == "heun":
+                    pcl_next = self.edm_heun_sampler(pcl_noisy.clone())
+                elif self.edm_sampler == "euler":
+                    pcl_next = self.edm_euler_sampler(pcl_noisy.clone())
+                else:
+                    raise ValueError(
+                        f"unsupported edm_sampler: {self.edm_sampler}"
+                    )
+            else:
+                pcl_next = self.predict_clean(pcl_noisy)
         return pcl_next, None
 
     def training_step(self, batch: Dict) -> Dict:
         patch_size = batch["pc_noisy"].shape[-2]
         pc_noisy = batch["pc_noisy"].reshape(-1, patch_size, 3)
         pc_clean = batch["pc_clean"].reshape(-1, patch_size, 3)
-        pc_mix = batch.get("pc_mix", batch["pc_noisy"]).reshape(-1, patch_size, 3)
+        score_sigma = batch.get("score_sigma")
+        if score_sigma is not None:
+            score_sigma = score_sigma.reshape(-1, 1)
         return {
             "loss": self.get_supervised_loss(
                 pc_noisy=pc_noisy,
-                pc_mix=pc_mix,
                 pc_clean=pc_clean,
+                score_sigma=score_sigma,
             )
         }
 
@@ -271,10 +507,11 @@ class EdgeConvBaselineModule(ModelSpec):
                 item = {
                     "pc_noisy": b.meta["pc_noisy"],
                     "pc_clean": b.meta["pc_clean"],
-                    "pc_mix": b.meta.get("pc_mix", b.meta["pc_noisy"]),
                 }
                 if "patch_seed" in b.meta:
                     item["patch_seed"] = b.meta["patch_seed"]
+                if "score_sigma" in b.meta:
+                    item["score_sigma"] = b.meta["score_sigma"]
                 res.append(item)
             else:
                 d = {"pc_noisy": b.sampled_vertices_noisy}

@@ -11,6 +11,6 @@ components:
 
 writer:
   __target__: vm
-  save_dir: outputs/EdgeConv/result/test_noisy
+  save_dir: outputs/EdgeConv_EDM/result/test_noisy
   save_name: denoised
-  result_zip: outputs/EdgeConv/result/result.zip
+  result_zip: outputs/EdgeConv_EDM/result/result.zip
