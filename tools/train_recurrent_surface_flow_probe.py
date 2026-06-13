@@ -9,6 +9,7 @@ import numpy as np
 import point_cloud_utils as pcu
 import trimesh
 from scipy.spatial import cKDTree
+from tqdm import tqdm
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -646,49 +647,63 @@ def main():
         model.train()
         losses_epoch = []
         order = train_rng.permutation(len(train_shapes))
-        for shape_index in order:
-            shape = train_shapes[int(shape_index)]
-            for _ in range(args.train_patches_per_shape):
-                sigma = float(
-                    train_rng.uniform(args.noise_min, args.noise_max)
-                )
-                patch = sample_patch(
-                    shape,
-                    sigma=sigma,
-                    patch_size=args.patch_size,
-                    rng=train_rng,
-                )
-                noisy = jt.array(patch["noisy"][None, :, :])
-                _, _, losses = recurrent_forward(
-                    model,
-                    noisy,
-                    patch["vertices"],
-                    patch["faces"],
-                    steps=args.steps,
-                    step_scale=args.step_scale,
-                    chamfer_points=args.chamfer_points,
-                    rng=train_rng,
-                    with_loss=True,
-                )
-                sigma2 = max(sigma**2.0, 1e-8)
-                loss = (
-                    args.flow_weight * losses["flow"]
-                    + args.surface_weight * losses["surface"]
-                    + args.monotonic_weight * losses["monotonic"]
-                    + args.final_surface_weight
-                    * losses["final_surface"]
-                ) / sigma2
-                optimizer.step(loss)
-                losses_epoch.append(
-                    {
+        total_steps = len(train_shapes) * args.train_patches_per_shape
+        running_loss = 0.0
+        with tqdm(
+            total=total_steps,
+            desc=f"Epoch {epoch}",
+            unit="patch",
+            dynamic_ncols=True,
+            mininterval=1.0,
+        ) as pbar:
+            for shape_index in order:
+                shape = train_shapes[int(shape_index)]
+                for _ in range(args.train_patches_per_shape):
+                    sigma = float(
+                        train_rng.uniform(args.noise_min, args.noise_max)
+                    )
+                    patch = sample_patch(
+                        shape,
+                        sigma=sigma,
+                        patch_size=args.patch_size,
+                        rng=train_rng,
+                    )
+                    noisy = jt.array(patch["noisy"][None, :, :])
+                    _, _, losses = recurrent_forward(
+                        model,
+                        noisy,
+                        patch["vertices"],
+                        patch["faces"],
+                        steps=args.steps,
+                        step_scale=args.step_scale,
+                        chamfer_points=args.chamfer_points,
+                        rng=train_rng,
+                        with_loss=True,
+                    )
+                    sigma2 = max(sigma**2.0, 1e-8)
+                    loss = (
+                        args.flow_weight * losses["flow"]
+                        + args.surface_weight * losses["surface"]
+                        + args.monotonic_weight * losses["monotonic"]
+                        + args.final_surface_weight
+                        * losses["final_surface"]
+                    ) / sigma2
+                    optimizer.step(loss)
+                    loss_values = {
                         "loss": float(loss.item()),
                         **{
                             key: float(value.item() / sigma2)
                             for key, value in losses.items()
                         },
                     }
-                )
-                jt.gc()
+                    losses_epoch.append(loss_values)
+                    running_loss += loss_values["loss"]
+                    pbar.update(1)
+                    pbar.set_postfix(
+                        loss=f"{running_loss / len(losses_epoch):.4f}",
+                        sigma=f"{sigma:.4f}",
+                    )
+                    jt.gc()
 
         record = {
             "epoch": epoch,
