@@ -544,10 +544,10 @@ class FusionAwareResidualRefiner(nn.Module):
         self.gate_head = nn.Linear(self.hidden_dim, 1)
 
         self.direction_head.weight.update(
-            jt.randn(self.direction_head.weight.shape) * 1e-4
+            jt.randn(self.direction_head.weight.shape) * 1e-2
         )
         self.direction_head.bias.update(
-            jt.randn(self.direction_head.bias.shape) * 1e-4
+            jt.randn(self.direction_head.bias.shape) * 1e-3
         )
         self.length_head.weight.update(
             jt.randn(self.length_head.weight.shape) * 1e-4

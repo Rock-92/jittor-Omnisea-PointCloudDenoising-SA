@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.model.refinement import FusionAwareResidualRefiner  # noqa: E402
+from src.model.feature import gather_neighbors, get_knn_idx  # noqa: E402
 from tools.hard_patch_common import load_model, read_datalist  # noqa: E402
 from tools.probe_fusion_aware_residual_oracle import (  # noqa: E402
     fuse_absolute,
@@ -206,6 +207,38 @@ def run_refiner(refiner, instance, stage1_patch, patch_indices, fusion_tau):
     return prediction, aux
 
 
+def smooth_bounded_teacher(coarse, clean_patch, k, alpha, max_residual):
+    raw_target = clean_patch - coarse
+    neighbor_count = min(int(k), coarse.shape[1] - 1)
+    if neighbor_count > 0 and float(alpha) > 0.0:
+        neighbor_idx = get_knn_idx(
+            coarse,
+            coarse,
+            k=neighbor_count,
+            offset=1,
+        )
+        local_target = gather_neighbors(
+            raw_target,
+            neighbor_idx,
+        ).mean(dim=2)
+        target = (
+            (1.0 - float(alpha)) * raw_target
+            + float(alpha) * local_target
+        )
+    else:
+        target = raw_target
+    target_norm = jt.sqrt(
+        (target ** 2.0).sum(dim=-1, keepdims=True) + 1e-12
+    )
+    target_scale = jt.minimum(
+        jt.ones_like(target_norm),
+        float(max_residual) / jt.maximum(target_norm, 1e-12),
+    )
+    teacher = target * target_scale
+    teacher.stop_grad()
+    return teacher, raw_target
+
+
 def stage2_loss(
     instance,
     patch_indices,
@@ -230,29 +263,49 @@ def stage2_loss(
     scale = max(float(max_residual), 1e-6)
     scale2 = scale ** 2.0
 
-    fused_paired = (
-        ((fused[anchor_points] - clean[anchor_points]) ** 2.0)
+    point_indices = jt.array(instance["point_indices"][patch_indices]).int32()
+    clean_patch = clean[point_indices] - seeds
+    coarse = jt.array(
+        instance["stage1_patch"][patch_indices]
+    )
+    teacher, raw_target = smooth_bounded_teacher(
+        coarse,
+        clean_patch,
+        k=args.teacher_smooth_k,
+        alpha=args.teacher_smooth_alpha,
+        max_residual=max_residual,
+    )
+    teacher_prediction = coarse + teacher
+    teacher_absolute = teacher_prediction + seeds
+    teacher_fused = fuse_group_jittor(
+        instance,
+        teacher_absolute,
+        patch_indices,
+        fusion_tau=fusion_tau,
+    )
+    fused_teacher = (
+        ((fused[anchor_points] - teacher_fused[anchor_points]) ** 2.0)
         .sum(dim=-1)
         .mean()
         / scale2
     )
-    point_indices = jt.array(instance["point_indices"][patch_indices]).int32()
-    clean_patch = clean[point_indices] - seeds
-    patch_paired = (
+    teacher_residual = (
+        ((aux["residual"] - teacher) ** 2.0)
+        .sum(dim=-1)
+        .mean()
+        / scale2
+    )
+    clean_paired = (
         ((prediction - clean_patch) ** 2.0).sum(dim=-1).mean() / scale2
     )
-    coarse = jt.array(
-        instance["stage1_patch"][patch_indices]
-    )
-    target = clean_patch - coarse
     target_length = jt.sqrt(
-        (target ** 2.0).sum(dim=-1, keepdims=True) + 1e-8
+        (teacher ** 2.0).sum(dim=-1, keepdims=True) + 1e-8
     )
     residual = aux["residual"]
     residual_length = jt.sqrt(
         (residual ** 2.0).sum(dim=-1, keepdims=True) + 1e-8
     )
-    cosine = (residual * target).sum(dim=-1, keepdims=True) / (
+    cosine = (residual * teacher).sum(dim=-1, keepdims=True) / (
         residual_length * target_length + 1e-8
     )
     direction_map = jt.minimum(
@@ -264,8 +317,11 @@ def stage2_loss(
         / (direction_map.sum() + 1e-6)
     )
     length = (jt.abs(residual_length - target_length) / scale).mean()
+    raw_target_length = jt.sqrt(
+        (raw_target ** 2.0).sum(dim=-1, keepdims=True) + 1e-8
+    )
     keep_map = jt.exp(
-        -target_length / max(float(args.keep_threshold), 1e-6)
+        -raw_target_length / max(float(args.keep_threshold), 1e-6)
     )
     keep = (
         keep_map * (residual_length / scale) ** 2.0
@@ -287,8 +343,9 @@ def stage2_loss(
         ((absolute - fused_patch) ** 2.0).sum(dim=-1).mean() / scale2
     )
     total = (
-        float(args.fused_weight) * fused_paired
-        + float(args.patch_weight) * patch_paired
+        float(args.teacher_weight) * teacher_residual
+        + float(args.fused_weight) * fused_teacher
+        + float(args.patch_weight) * clean_paired
         + float(args.direction_weight) * direction
         + float(args.length_weight) * length
         + float(args.keep_weight) * keep
@@ -296,14 +353,20 @@ def stage2_loss(
         + float(args.overlap_weight) * overlap
     )
     return total, {
-        "fused_paired": fused_paired,
-        "patch_paired": patch_paired,
+        "teacher_residual": teacher_residual,
+        "fused_teacher": fused_teacher,
+        "clean_paired": clean_paired,
         "direction": direction,
         "length": length,
         "keep": keep,
         "gate": gate_loss,
         "overlap": overlap,
         "residual_mean": residual_length.mean(),
+        "teacher_mean": target_length.mean(),
+        "teacher_clip_rate": (
+            raw_target_length >= float(max_residual)
+        ).float32().mean(),
+        "cosine_mean": cosine.mean(),
         "gate_mean": aux["gate"].mean(),
     }
 
@@ -529,11 +592,14 @@ def main():
     parser.add_argument("--min-lr", type=float, default=3e-5)
     parser.add_argument("--load-refiner", default=None)
     parser.add_argument("--grad-clip", type=float, default=5.0)
+    parser.add_argument("--teacher-smooth-k", type=int, default=24)
+    parser.add_argument("--teacher-smooth-alpha", type=float, default=0.75)
+    parser.add_argument("--teacher-weight", type=float, default=2.0)
     parser.add_argument("--fused-weight", type=float, default=1.0)
-    parser.add_argument("--patch-weight", type=float, default=0.5)
-    parser.add_argument("--direction-weight", type=float, default=0.2)
-    parser.add_argument("--length-weight", type=float, default=0.2)
-    parser.add_argument("--keep-weight", type=float, default=0.3)
+    parser.add_argument("--patch-weight", type=float, default=0.05)
+    parser.add_argument("--direction-weight", type=float, default=0.5)
+    parser.add_argument("--length-weight", type=float, default=0.5)
+    parser.add_argument("--keep-weight", type=float, default=0.2)
     parser.add_argument("--keep-threshold", type=float, default=0.002)
     parser.add_argument("--gate-weight", type=float, default=0.2)
     parser.add_argument("--overlap-weight", type=float, default=0.1)
@@ -552,6 +618,10 @@ def main():
             "training must use 32768 points / 1000-point patches / seed_k=6; "
             "use --allow-nonstandard-protocol only for smoke tests"
         )
+    if not 0.0 <= args.teacher_smooth_alpha <= 1.0:
+        raise ValueError("teacher_smooth_alpha must be in [0, 1]")
+    if args.teacher_smooth_k < 1:
+        raise ValueError("teacher_smooth_k must be positive")
     jt.flags.use_cuda = 1 if args.use_cuda else 0
     np.random.seed(args.seed)
     jt.set_global_seed(args.seed)
@@ -756,6 +826,8 @@ def main():
                 loss=f"{row['loss']:.3f}",
                 gate=f"{row['gate_mean']:.3f}",
                 residual=f"{row['residual_mean']:.4f}",
+                teacher=f"{row['teacher_mean']:.4f}",
+                cosine=f"{row['cosine_mean']:.3f}",
             )
             jt.gc()
 
