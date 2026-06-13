@@ -37,6 +37,7 @@ tools/*
 !tools/train_recurrent_surface_flow_probe.py
 !tools/probe_fusion_aware_residual_oracle.py
 !tools/train_fusion_aware_stage2.py
+!tools/overfit_fusion_aware_stage2.py
 
 # Datasets and ground truth
 dataset_train/
