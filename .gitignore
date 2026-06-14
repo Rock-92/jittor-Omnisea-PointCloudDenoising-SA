@@ -39,6 +39,7 @@ tools/*
 !tools/train_fusion_aware_stage2.py
 !tools/overfit_fusion_aware_stage2.py
 !tools/probe_clean_shape_context_vm.py
+!tools/probe_shape_context_memorization.py
 
 # Datasets and ground truth
 dataset_train/

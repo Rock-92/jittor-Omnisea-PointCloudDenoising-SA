@@ -88,6 +88,7 @@ class ShapeContextVMAdapter(nn.Module):
         context_knn=4,
         max_residual=0.008,
         relative_bias_dim=32,
+        context_only_head=False,
         eps=1e-6,
     ):
         super().__init__()
@@ -96,6 +97,7 @@ class ShapeContextVMAdapter(nn.Module):
         self.point_knn = [int(value) for value in point_knn]
         self.context_knn = int(context_knn)
         self.max_residual = float(max_residual)
+        self.context_only_head = bool(context_only_head)
         self.eps = float(eps)
 
         self.point_input = nn.Linear(12, self.token_dim)
@@ -116,13 +118,15 @@ class ShapeContextVMAdapter(nn.Module):
         self.value_proj = nn.Linear(self.token_dim, self.token_dim)
         self.context_bias_1 = nn.Linear(4, relative_bias_dim)
         self.context_bias_2 = nn.Linear(relative_bias_dim, 1)
-        self.film = nn.Sequential(
-            nn.Linear(self.token_dim * 2, self.token_dim * 2),
-            nn.ReLU(),
-            nn.Linear(self.token_dim * 2, self.token_dim * 2),
-        )
+        if not self.context_only_head:
+            self.film = nn.Sequential(
+                nn.Linear(self.token_dim * 2, self.token_dim * 2),
+                nn.ReLU(),
+                nn.Linear(self.token_dim * 2, self.token_dim * 2),
+            )
+        fuse_dim = self.token_dim * (2 if self.context_only_head else 3)
         self.fuse = nn.Sequential(
-            nn.Linear(self.token_dim * 3, self.hidden_dim),
+            nn.Linear(fuse_dim, self.hidden_dim),
             nn.ReLU(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.ReLU(),
@@ -250,28 +254,31 @@ class ShapeContextVMAdapter(nn.Module):
             region_tokens,
             region_centers,
         )
-        patch_context = context.mean(dim=1, keepdims=True)
-        condition = jt.concat(
-            [global_token, patch_context],
-            dim=-1,
-        ).reshape(batch_size, self.token_dim * 2)
-        film = self.film(condition).reshape(
-            batch_size,
-            1,
-            self.token_dim * 2,
-        )
-        scale = film[:, :, :self.token_dim]
-        shift = film[:, :, self.token_dim:]
-        modulated = feature * (1.0 + scale) + shift
         global_broadcast = global_token.broadcast(
             (batch_size, feature.shape[1], self.token_dim)
         )
-        fused = jt.concat(
-            [modulated, context, global_broadcast],
-            dim=-1,
-        )
+        if self.context_only_head:
+            fused = jt.concat([context, global_broadcast], dim=-1)
+        else:
+            patch_context = context.mean(dim=1, keepdims=True)
+            condition = jt.concat(
+                [global_token, patch_context],
+                dim=-1,
+            ).reshape(batch_size, self.token_dim * 2)
+            film = self.film(condition).reshape(
+                batch_size,
+                1,
+                self.token_dim * 2,
+            )
+            scale = film[:, :, :self.token_dim]
+            shift = film[:, :, self.token_dim:]
+            modulated = feature * (1.0 + scale) + shift
+            fused = jt.concat(
+                [modulated, context, global_broadcast],
+                dim=-1,
+            )
         hidden = self.fuse(
-            fused.reshape(-1, self.token_dim * 3)
+            fused.reshape(-1, fused.shape[-1])
         ).reshape(batch_size, feature.shape[1], self.hidden_dim)
 
         direction = self.direction_head(
