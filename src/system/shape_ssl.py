@@ -32,6 +32,7 @@ class ShapePretrainSystem(DummySystem):
         "masked_precision",
         "masked_recall",
         "mask_ratio",
+        "noise_std",
     ]
 
     def _summary(self, storage, prefix):
@@ -138,6 +139,7 @@ class ShapePretrainSystem(DummySystem):
                     rmse=f"{values['masked_rmse']:.5f}",
                     fscore=f"{values['masked_fscore']:.3f}",
                     mask=f"{values['mask_ratio']:.2f}",
+                    sigma=f"{values['noise_std']:.4f}",
                 )
             train_summary = self._summary(self._train_loss, "train")
 
@@ -180,6 +182,7 @@ class ShapePretrainSystem(DummySystem):
                         rmse=f"{values['masked_rmse']:.5f}",
                         fscore=f"{values['masked_fscore']:.3f}",
                         mask=f"{values['mask_ratio']:.2f}",
+                        sigma=f"{values['noise_std']:.4f}",
                     )
             val_summary = {}
             for name in self.metric_names:
@@ -203,6 +206,7 @@ class ShapePretrainSystem(DummySystem):
                 f"val_rmse={val_summary['masked_rmse']:.6f}, "
                 f"val_fscore={val_summary['masked_fscore']:.4f}, "
                 f"mask={val_summary['mask_ratio']:.3f}, "
+                f"sigma={val_summary['noise_std']:.4f}, "
                 f"time={seconds:.1f}s"
             )
             self._save_best(epoch, val_summary)

@@ -12,5 +12,10 @@ mask_ratio_min: 0.40
 mask_ratio_max: 0.70
 spatial_mask_fraction: 0.70
 
+# Student input is a noisy complete shape; masked targets remain clean.
+noise_std_min: 0.005
+noise_std_max: 0.020
+noise_type: laplace
+
 reconstruction_scale: 0.01
 fscore_threshold: 0.01

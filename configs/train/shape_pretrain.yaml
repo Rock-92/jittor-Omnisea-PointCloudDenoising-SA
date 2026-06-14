@@ -6,6 +6,7 @@ loss:
   masked_precision: 0.0
   masked_recall: 0.0
   mask_ratio: 0.0
+  noise_std: 0.0
 
 optimizer:
   __target__: adam

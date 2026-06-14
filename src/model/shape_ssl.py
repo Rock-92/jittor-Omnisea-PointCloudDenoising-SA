@@ -220,6 +220,9 @@ class MaskedShapePretrainModule(VelocityModule):
         self.spatial_mask_fraction = float(
             cfg.get("spatial_mask_fraction", 0.7)
         )
+        self.noise_std_min = float(cfg.get("noise_std_min", 0.005))
+        self.noise_std_max = float(cfg.get("noise_std_max", 0.020))
+        self.noise_type = str(cfg.get("noise_type", "laplace"))
         self.reconstruction_scale = float(
             cfg.get("reconstruction_scale", 0.01)
         )
@@ -284,7 +287,8 @@ class MaskedShapePretrainModule(VelocityModule):
         }
 
     def training_step(self, batch: Dict) -> Dict:
-        region_points = batch["shape_region_points"]
+        region_points = batch["shape_region_input_points"]
+        target_points = batch["shape_region_target_points"]
         region_centers = batch["shape_region_centers"]
         mask = batch["shape_region_mask"]
         prediction, _, _ = self.processor(
@@ -292,11 +296,13 @@ class MaskedShapePretrainModule(VelocityModule):
             region_centers,
             mask=mask,
         )
-        return self.reconstruction_metrics(
+        metrics = self.reconstruction_metrics(
             prediction,
-            region_points,
+            target_points,
             mask,
         )
+        metrics["noise_std"] = batch["noise_std"].mean()
+        return metrics
 
     def process_fn(self, batch: List[Asset]) -> List[Dict]:
         result = []
@@ -305,11 +311,36 @@ class MaskedShapePretrainModule(VelocityModule):
                 raise ValueError("shape pretraining requires cached clean regions")
             centers_idx = asset.meta["region_center_indices"]
             neighbors_idx = asset.meta["region_neighbor_indices"]
-            points, centers = region_arrays(
-                asset.sampled_vertices,
+            clean = asset.sampled_vertices
+            noise_std = float(
+                np.random.uniform(
+                    self.noise_std_min,
+                    self.noise_std_max,
+                )
+            )
+            if self.noise_type == "laplace":
+                noise = np.random.laplace(
+                    0.0,
+                    noise_std,
+                    size=clean.shape,
+                )
+            elif self.noise_type == "gaussian":
+                noise = np.random.randn(*clean.shape) * noise_std
+            else:
+                raise ValueError(
+                    f"unsupported pretrain noise type: {self.noise_type}"
+                )
+            noisy = (
+                clean + noise.astype(np.float32, copy=False)
+            ).astype(np.float32, copy=False)
+            input_points, centers = region_arrays(
+                noisy,
                 centers_idx,
                 neighbors_idx,
             )
+            target_points = (
+                clean[neighbors_idx] - noisy[centers_idx, None, :]
+            ).astype(np.float32, copy=False)
             mask, mask_ratio = mixed_region_mask(
                 centers,
                 self.mask_ratio_min,
@@ -318,11 +349,12 @@ class MaskedShapePretrainModule(VelocityModule):
             )
             result.append(
                 {
-                    "shape_region_points": points,
+                    "shape_region_input_points": input_points,
+                    "shape_region_target_points": target_points,
                     "shape_region_centers": centers,
                     "shape_region_mask": mask,
-                    "sampled_mask_ratio": np.asarray(
-                        [mask_ratio],
+                    "noise_std": np.asarray(
+                        [noise_std],
                         dtype=np.float32,
                     ),
                 }
