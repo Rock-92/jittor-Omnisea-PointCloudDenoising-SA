@@ -38,6 +38,7 @@ tools/*
 !tools/probe_fusion_aware_residual_oracle.py
 !tools/train_fusion_aware_stage2.py
 !tools/overfit_fusion_aware_stage2.py
+!tools/probe_clean_shape_context_vm.py
 
 # Datasets and ground truth
 dataset_train/
