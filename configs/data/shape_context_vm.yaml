@@ -1,0 +1,30 @@
+data_name: &data_name shape_regions.npz
+loader: &loader shape_region_npz
+
+train_dataset:
+  shuffle: true
+  batch_size: 4
+  num_workers: 8
+  datapath:
+    input_dataset_dir: ./cache_clean_points
+    use_prob: false
+    loader: *loader
+    data_name: *data_name
+    ignore_check: false
+    data_path:
+      shapenet:
+        - [./datalist/train.txt, 1.0]
+
+validate_dataset:
+  shuffle: false
+  batch_size: 1
+  num_workers: 8
+  datapath:
+    input_dataset_dir: ./cache_clean_points
+    use_prob: false
+    loader: *loader
+    data_name: *data_name
+    ignore_check: false
+    data_path:
+      shapenet:
+        - [./datalist/validate.txt, 1.0]

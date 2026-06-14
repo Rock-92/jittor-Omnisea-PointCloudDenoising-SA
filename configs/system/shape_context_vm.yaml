@@ -1,0 +1,6 @@
+__target__: shape_context_vm
+
+ckpt_save_dir: outputs/shape_context_vm/checkpoints
+ckpt_save_name: checkpoint
+freeze_shape_epochs: 5
+shape_lr_scale: 0.1

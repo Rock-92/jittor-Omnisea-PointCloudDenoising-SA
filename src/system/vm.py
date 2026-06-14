@@ -254,7 +254,9 @@ class VMSystem(DummySystem):
             pc_noisy_abs = pc_noisy
             pc_clean_abs = pc_clean
         
-        if getattr(self.model, "use_edm", False) and "score_sigma" in batch:
+        if hasattr(self.model, "validation_predict"):
+            pc_pred = self.model.validation_predict(batch)
+        elif getattr(self.model, "use_edm", False) and "score_sigma" in batch:
             score_sigma = batch["score_sigma"].reshape(pc_noisy.shape[0], 1)
             pc_pred = self.model.predict_clean(pc_noisy, sigma=score_sigma)
         else:

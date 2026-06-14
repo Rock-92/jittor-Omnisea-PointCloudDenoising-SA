@@ -1,0 +1,4 @@
+__target__: shape_pretrain
+
+ckpt_save_dir: outputs/shape_pretrain/checkpoints
+ckpt_save_name: processor

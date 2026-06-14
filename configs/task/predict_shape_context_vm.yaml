@@ -1,0 +1,15 @@
+mode: predict
+debug: false
+load_ckpt: outputs/shape_context_vm/checkpoints/checkpoint_best.pkl
+
+components:
+  data: shape_context_predict
+  transform: shape_context_vm_laplace
+  system: shape_context_vm
+  model: shape_context_vm
+
+writer:
+  __target__: vm
+  save_dir: outputs/shape_context_vm/result/test_noisy
+  save_name: denoised
+  result_zip: outputs/shape_context_vm/result/result.zip

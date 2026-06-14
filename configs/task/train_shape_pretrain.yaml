@@ -1,0 +1,10 @@
+mode: train
+debug: false
+load_ckpt: null
+
+components:
+  data: shape_pretrain
+  transform: shape_pretrain
+  system: shape_pretrain
+  model: shape_pretrain
+  train: shape_pretrain

@@ -1,0 +1,13 @@
+mode: train
+debug: false
+
+# Initializes the patch VM from the existing pure-VM checkpoint. The new shape
+# processor is initialized separately from shape_pretrained_ckpt in the model config.
+load_ckpt: outputs/checkpoints/vm/checkpoint_best.pkl
+
+components:
+  data: shape_context_vm
+  transform: shape_context_vm_laplace
+  system: shape_context_vm
+  model: shape_context_vm
+  train: shape_context_vm

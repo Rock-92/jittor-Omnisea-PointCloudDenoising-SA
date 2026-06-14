@@ -1,0 +1,23 @@
+loss:
+  masked_reconstruction_loss: 1.0
+  masked_chamfer: 0.0
+  masked_rmse: 0.0
+  masked_fscore: 0.0
+  masked_precision: 0.0
+  masked_recall: 0.0
+  mask_ratio: 0.0
+
+optimizer:
+  __target__: adam
+  lr: 0.0003
+
+scheduler:
+  __target__: reduce_on_plateau
+  monitor: validation_loss
+  mode: min
+  factor: 0.5
+  patience: 4
+  min_lr: 0.00001
+
+trainer:
+  epochs: 30

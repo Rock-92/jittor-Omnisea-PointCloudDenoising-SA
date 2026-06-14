@@ -61,6 +61,40 @@ class CleanNpyLazyAsset(LazyAsset):
         )
         return asset
 
+
+@dataclass
+class ShapeRegionNpzLazyAsset(LazyAsset):
+    """Load clean points plus a cached FPS/KNN region layout."""
+
+    def load(self) -> 'Asset':
+        layout = np.load(self.path)
+        clean_path = os.path.join(os.path.dirname(self.path), "clean.npy")
+        pc = np.load(clean_path).astype(np.float32, copy=False)
+        p_max = pc.max(axis=0)
+        p_min = pc.min(axis=0)
+        center = (p_max + p_min) / 2.0
+        pc = pc - center
+        scale = float(np.sqrt((pc ** 2.0).sum(axis=1).max()))
+        pc = (pc / max(scale, 1e-12)).astype(np.float32, copy=False)
+        asset = Asset(
+            path=clean_path,
+            cls=self.cls,
+            sampled_vertices=pc,
+            meta={
+                "normalize_center": center.astype(np.float32, copy=False),
+                "normalize_scale": scale,
+                "region_center_indices": layout["center_indices"].astype(
+                    np.int32,
+                    copy=False,
+                ),
+                "region_neighbor_indices": layout["neighbor_indices"].astype(
+                    np.int32,
+                    copy=False,
+                ),
+            },
+        )
+        return asset
+
 @dataclass
 class Datapath(ConfigSpec):
     """handle input data paths"""
@@ -105,6 +139,7 @@ class Datapath(ConfigSpec):
             'obj': ObjLazyAsset,
             'npy': NpyLazyAsset,
             'clean_npy': CleanNpyLazyAsset,
+            'shape_region_npz': ShapeRegionNpzLazyAsset,
         }
         input_dataset_dir = kwargs.get('input_dataset_dir', '')
         num_files = kwargs.get('num_files', None)

@@ -1,0 +1,16 @@
+__target__: MaskedShapePretrainModule
+
+region_count: 256
+points_per_region: 64
+token_dim: 128
+region_knn: [8, 16]
+num_blocks: 4
+relative_bias_dim: 32
+max_reconstruction_radius: 0.08
+
+mask_ratio_min: 0.40
+mask_ratio_max: 0.70
+spatial_mask_fraction: 0.70
+
+reconstruction_scale: 0.01
+fscore_threshold: 0.01
