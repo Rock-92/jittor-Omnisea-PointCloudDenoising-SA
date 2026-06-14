@@ -22,7 +22,8 @@ use_edgeconv_branch: false
 use_hard_aware_loss: false
 use_length_projection_loss: false
 
-# Complete-shape processor and patch-to-shape injection.
+# Complete-shape processor. Only region tokens condition the denoiser; the
+# processor's shape-global output is not computed or injected.
 shape_pretrained_ckpt: outputs/shape_pretrain/checkpoints/processor_best.pkl
 shape_region_count: 256
 shape_points_per_region: 64

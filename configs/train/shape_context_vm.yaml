@@ -1,7 +1,7 @@
 loss:
   displacement_loss: 1.0
   normalized_surface_loss: 0.1
-  context_gate: 0.0
+  region_context_gate: 0.0
 
 optimizer:
   __target__: adam

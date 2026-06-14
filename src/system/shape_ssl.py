@@ -295,8 +295,8 @@ class ShapeContextVMSystem(VMSystem):
                     [],
                 )
             ),
-            "context_gate": mean_metric(
-                self._train_loss.get("train/context_gate", [])
+            "region_context_gate": mean_metric(
+                self._train_loss.get("train/region_context_gate", [])
             ),
             "val_loss": validation_loss,
             "cd_score": score_summary.get("cd_score"),

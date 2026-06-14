@@ -137,7 +137,13 @@ class MaskedShapeProcessor(nn.Module):
             nn.Linear(self.token_dim * 2, self.points_per_region * 3),
         )
 
-    def encode(self, region_points, region_centers, mask=None):
+    def encode(
+        self,
+        region_points,
+        region_centers,
+        mask=None,
+        return_global=True,
+    ):
         batch_size, region_count, _, _ = region_points.shape
         feature = self.act(
             apply_edge_linear(self.point_mlp_1, region_points)
@@ -173,6 +179,8 @@ class MaskedShapeProcessor(nn.Module):
                 xyz=region_centers,
             )
         feature = self.output_norm(feature)
+        if not return_global:
+            return feature, None
         global_token = self.global_proj(
             feature.mean(dim=1)
         ).reshape(batch_size, 1, self.token_dim)
@@ -365,7 +373,9 @@ class MaskedShapePretrainModule(VelocityModule):
         raise NotImplementedError("shape pretraining has no prediction mode")
 
 
-class ShapeTokenInjector(nn.Module):
+class RegionCrossAttentionModulation(nn.Module):
+    """Cross-attend to nearby region tokens and modulate one VM SA layer."""
+
     def __init__(
         self,
         patch_dim=256,
@@ -385,11 +395,24 @@ class ShapeTokenInjector(nn.Module):
         self.bias_1 = nn.Linear(4, relative_bias_dim)
         self.bias_2 = nn.Linear(relative_bias_dim, 1)
         self.context_proj = nn.Linear(self.token_dim, self.patch_dim)
-        self.global_scale = nn.Linear(self.token_dim, self.patch_dim)
-        self.global_shift = nn.Linear(self.token_dim, self.patch_dim)
+        self.context_scale = nn.Linear(self.token_dim, self.patch_dim)
+        self.context_shift = nn.Linear(self.token_dim, self.patch_dim)
         self.output_norm = PointLayerNorm(self.patch_dim)
         self.context_gate = jt.ones((1,)) * -2.0
         self.act = nn.ReLU()
+
+        self.context_scale.weight.assign(
+            jt.zeros_like(self.context_scale.weight)
+        )
+        self.context_scale.bias.assign(
+            jt.zeros_like(self.context_scale.bias)
+        )
+        self.context_shift.weight.assign(
+            jt.zeros_like(self.context_shift.weight)
+        )
+        self.context_shift.bias.assign(
+            jt.zeros_like(self.context_shift.bias)
+        )
 
     def execute(
         self,
@@ -397,24 +420,25 @@ class ShapeTokenInjector(nn.Module):
         point_global,
         region_tokens,
         region_centers,
-        global_token,
+        region_neighbor_idx=None,
     ):
         k = min(self.context_knn, region_tokens.shape[1])
-        neighbor_idx = get_knn_idx(
-            point_global,
-            region_centers,
-            k=k,
-            offset=0,
-        )
+        if region_neighbor_idx is None:
+            region_neighbor_idx = get_knn_idx(
+                point_global,
+                region_centers,
+                k=k,
+                offset=0,
+            )
         keys = gather_neighbors(
             apply_point_linear(self.key_proj, region_tokens),
-            neighbor_idx,
+            region_neighbor_idx,
         )
         values = gather_neighbors(
             apply_point_linear(self.value_proj, region_tokens),
-            neighbor_idx,
+            region_neighbor_idx,
         )
-        centers = gather_neighbors(region_centers, neighbor_idx)
+        centers = gather_neighbors(region_centers, region_neighbor_idx)
         relative = centers - point_global.unsqueeze(2)
         distance = jt.sqrt(
             (relative ** 2.0).sum(dim=-1, keepdims=True) + 1e-8
@@ -433,17 +457,21 @@ class ShapeTokenInjector(nn.Module):
         logits = (query * keys).sum(dim=-1) * self.scale + bias
         attention = nn.softmax(logits, dim=-1)
         context = (attention.unsqueeze(-1) * values).sum(dim=2)
-        context = apply_point_linear(self.context_proj, context)
-
-        global_flat = global_token.reshape(
-            global_token.shape[0],
-            global_token.shape[2],
+        context_residual = apply_point_linear(
+            self.context_proj,
+            context,
         )
-        scale = self.global_scale(global_flat).unsqueeze(1)
-        shift = self.global_shift(global_flat).unsqueeze(1)
-        conditioned = patch_feature * (1.0 + 0.1 * scale) + 0.1 * shift
+        scale = jt.tanh(
+            apply_point_linear(self.context_scale, context)
+        )
+        shift = apply_point_linear(self.context_shift, context)
         gate = jt.sigmoid(self.context_gate)
-        return self.output_norm(conditioned + gate * context), gate
+        conditioned = (
+            patch_feature * (1.0 + gate * scale)
+            + gate * shift
+            + gate * context_residual
+        )
+        return self.output_norm(conditioned), gate
 
 
 class ShapeContextVelocityModule(VelocityModule):
@@ -471,14 +499,23 @@ class ShapeContextVelocityModule(VelocityModule):
                 cfg.get("shape_max_reconstruction_radius", 0.08)
             ),
         )
-        self.shape_injector = ShapeTokenInjector(
-            patch_dim=self.encoder.embedding_dim,
-            token_dim=self.shape_token_dim,
-            context_knn=int(cfg.get("shape_context_knn", 4)),
-            relative_bias_dim=int(
-                cfg.get("shape_relative_bias_dim", 32)
-            ),
-        )
+        self.shape_context_knn = int(cfg.get("shape_context_knn", 4))
+        self.region_cross_blocks = []
+        for block_index in range(self.attention_blocks):
+            cross_block = RegionCrossAttentionModulation(
+                patch_dim=self.encoder.embedding_dim,
+                token_dim=self.shape_token_dim,
+                context_knn=self.shape_context_knn,
+                relative_bias_dim=int(
+                    cfg.get("shape_relative_bias_dim", 32)
+                ),
+            )
+            setattr(
+                self,
+                f"region_cross_block_{block_index}",
+                cross_block,
+            )
+            self.region_cross_blocks.append(cross_block)
         self.shape_pretrained_ckpt = cfg.get(
             "shape_pretrained_ckpt",
             None,
@@ -488,6 +525,8 @@ class ShapeContextVelocityModule(VelocityModule):
         self.shape_processor.mask_token.stop_grad()
         for parameter in self.shape_processor.reconstruction_head.parameters():
             parameter.stop_grad()
+        for parameter in self.shape_processor.global_proj.parameters():
+            parameter.stop_grad()
 
     def get_shape_train_parameters(self):
         excluded = {
@@ -495,6 +534,10 @@ class ShapeContextVelocityModule(VelocityModule):
             *{
                 id(parameter)
                 for parameter in self.shape_processor.reconstruction_head.parameters()
+            },
+            *{
+                id(parameter)
+                for parameter in self.shape_processor.global_proj.parameters()
             },
         }
         return [
@@ -528,11 +571,101 @@ class ShapeContextVelocityModule(VelocityModule):
         print(f"Loaded pretrained shape processor: {path}")
 
     def encode_shape(self, region_points, region_centers):
-        return self.shape_processor.encode(
+        region_tokens, _ = self.shape_processor.encode(
             region_points,
             region_centers,
             mask=None,
+            return_global=False,
         )
+        return region_tokens
+
+    def encode_patch_with_region_context(
+        self,
+        pc_noisy,
+        point_global,
+        region_tokens,
+        region_centers,
+        point_idx=None,
+    ):
+        feature = self.encoder.project_input(pc_noisy)
+        # This is VM's native patch-global token, not a shape-global token.
+        patch_global_token = self.encoder.global_token_generator(feature)
+        region_neighbor_idx = get_knn_idx(
+            point_global,
+            region_centers,
+            k=min(self.shape_context_knn, region_tokens.shape[1]),
+            offset=0,
+        )
+
+        block_outputs = []
+        graph_knn_idx = None
+        reuse_knn_idx = None
+        if self.encoder.legacy_graph_updates:
+            graph_knn_idx = get_knn_idx(
+                pc_noisy,
+                pc_noisy,
+                self.encoder.max_knn,
+                offset=1,
+            )
+        gates = []
+        for block_index, (
+            block,
+            weight,
+            cross_block,
+        ) in enumerate(
+            zip(
+                self.encoder.blocks,
+                self.encoder.block_weights,
+                self.region_cross_blocks,
+            )
+        ):
+            if self.encoder.legacy_graph_updates and block_index == 0:
+                block_knn_idx = graph_knn_idx
+            elif self.encoder.legacy_graph_updates and block_index == 1:
+                reuse_knn_idx = get_knn_idx(
+                    feature,
+                    feature,
+                    self.encoder.max_knn,
+                    offset=1,
+                )
+                block_knn_idx = reuse_knn_idx
+            elif self.encoder.legacy_graph_updates:
+                block_knn_idx = reuse_knn_idx
+            elif block_index == 0:
+                block_knn_idx = get_knn_idx(
+                    pc_noisy,
+                    pc_noisy,
+                    self.encoder.max_knn,
+                    offset=1,
+                )
+            else:
+                block_knn_idx = get_knn_idx(
+                    feature,
+                    feature,
+                    self.encoder.max_knn,
+                    offset=1,
+                )
+            feature = block(
+                feature,
+                block_knn_idx,
+                global_token=patch_global_token,
+                xyz=pc_noisy,
+            )
+            feature, gate = cross_block(
+                feature,
+                point_global,
+                region_tokens,
+                region_centers,
+                region_neighbor_idx=region_neighbor_idx,
+            )
+            gates.append(gate)
+            block_outputs.append(feature * weight)
+
+        feature = jt.concat(block_outputs, dim=-1)
+        feature = apply_point_linear(self.encoder.fuse, feature)
+        if point_idx is not None:
+            feature = feature[:, point_idx, :]
+        return feature, jt.stack(gates).mean()
 
     def predict_displacement_context(
         self,
@@ -548,18 +681,14 @@ class ShapeContextVelocityModule(VelocityModule):
                 region_points,
                 region_centers,
             )
-        region_tokens, global_token = encoded_shape
-        feature = self.encoder(pc_noisy)
         point_global = pc_noisy + patch_seed
-        feature, gate = self.shape_injector(
-            feature,
+        feature, gate = self.encode_patch_with_region_context(
+            pc_noisy,
             point_global,
-            region_tokens,
+            encoded_shape,
             region_centers,
-            global_token,
+            point_idx=point_idx,
         )
-        if point_idx is not None:
-            feature = feature[:, point_idx, :]
         displacement = self.decoder(
             feature.reshape(-1, feature.shape[-1])
         ).reshape(feature.shape[0], feature.shape[1], 3)
@@ -606,7 +735,7 @@ class ShapeContextVelocityModule(VelocityModule):
         return {
             "displacement_loss": displacement_loss,
             "normalized_surface_loss": surface_loss,
-            "context_gate": gate,
+            "region_context_gate": gate,
         }
 
     def process_fn(self, batch: List[Asset]) -> List[Dict]:
@@ -731,7 +860,7 @@ class ShapeContextVelocityModule(VelocityModule):
 
         region_points = region_points.unsqueeze(0)
         region_centers = region_centers.unsqueeze(0)
-        encoded_shape = self.encode_shape(
+        region_tokens = self.encode_shape(
             region_points,
             region_centers,
         )
@@ -745,15 +874,12 @@ class ShapeContextVelocityModule(VelocityModule):
             current = jt.array(patches[start:end])
             seed = jt.array(seeds[start:end, None, :])
             batch_size = end - start
-            tokens = encoded_shape[0].broadcast(
+            tokens = region_tokens.broadcast(
                 (
                     batch_size,
-                    encoded_shape[0].shape[1],
-                    encoded_shape[0].shape[2],
+                    region_tokens.shape[1],
+                    region_tokens.shape[2],
                 )
-            )
-            global_token = encoded_shape[1].broadcast(
-                (batch_size, 1, encoded_shape[1].shape[2])
             )
             centers = region_centers.broadcast(
                 (batch_size, region_centers.shape[1], 3)
@@ -770,7 +896,7 @@ class ShapeContextVelocityModule(VelocityModule):
                     )
                 ),
                 centers,
-                encoded_shape=(tokens, global_token),
+                encoded_shape=tokens,
             )
             outputs.append(
                 (current + displacement + seed).numpy()

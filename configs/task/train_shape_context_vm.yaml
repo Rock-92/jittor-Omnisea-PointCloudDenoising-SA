@@ -1,9 +1,9 @@
 mode: train
 debug: false
 
-# Initializes the patch VM from the existing pure-VM checkpoint. The new shape
-# processor is initialized separately from shape_pretrained_ckpt in the model config.
-load_ckpt: outputs/checkpoints/vm/checkpoint_best.pkl
+# The denoising VM and all per-layer cross-attention modules train from scratch.
+# Only the Shape Processor is initialized from shape_pretrained_ckpt.
+load_ckpt: null
 
 components:
   data: shape_context_vm
