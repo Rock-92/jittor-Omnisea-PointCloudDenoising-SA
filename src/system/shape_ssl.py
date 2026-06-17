@@ -294,6 +294,26 @@ class ShapeContextVMSystem(VMSystem):
             if gradient is not None:
                 gradient.update(gradient * self.shape_lr_scale)
 
+    def train_progress_postfix(self):
+        values = getattr(self, "_last_train_loss_dict", None)
+        if not values:
+            return {}
+
+        def value(name, default=float("nan")):
+            item = values.get(name)
+            if item is None:
+                return default
+            return float(_get_item(item))
+
+        return {
+            "ratio": f"{value('train_length_ratio'):.3f}",
+            "cos": f"{value('train_cosine'):.3f}",
+            "neg": f"{value('train_negative_cos_rate'):.2f}",
+            "pred": f"{value('train_pred_len'):.4f}",
+            "tgt": f"{value('train_target_len'):.4f}",
+            "gate": f"{value('region_context_gate'):.3f}",
+        }
+
     def log_epoch_metrics(
         self,
         epoch,
@@ -351,6 +371,22 @@ class ShapeContextVMSystem(VMSystem):
             )
             writer.writeheader()
             writer.writerows(self._epoch_metric_records)
+
+        def fmt(name, digits=3):
+            value = record.get(name)
+            if value is None:
+                return "nan"
+            return f"{value:.{digits}f}"
+
+        print(
+            "Shape-context train diagnostics: "
+            f"ratio={fmt('train_length_ratio')}, "
+            f"cos={fmt('train_cosine')}, "
+            f"neg={fmt('train_negative_cos_rate')}, "
+            f"pred_len={fmt('train_pred_len', 5)}, "
+            f"target_len={fmt('train_target_len', 5)}, "
+            f"gate={fmt('region_context_gate')}"
+        )
 
     def on_train_end(self):
         self._set_shape_grad(True)

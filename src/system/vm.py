@@ -428,6 +428,10 @@ class VMSSLSystem(VMSystem):
                 self.optimizer.zero_grad()
                 self.optimizer.backward(loss)
                 pbar.set_description(f"Epoch {epoch}, Loss: {_get_item(loss)}")
+                if hasattr(self, "train_progress_postfix"):
+                    postfix = self.train_progress_postfix()
+                    if postfix:
+                        pbar.set_postfix(postfix)
                 self.on_before_optimizer_step(self.optimizer)
                 self.optimizer.step()
                 self.record_train_losses(self._last_train_loss_dict)
