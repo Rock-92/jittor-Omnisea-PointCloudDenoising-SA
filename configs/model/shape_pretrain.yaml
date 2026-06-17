@@ -20,3 +20,12 @@ noise_type: laplace
 
 reconstruction_scale: 0.01
 fscore_threshold: 0.01
+
+# Pretraining is optimized through a single weighted `pretrain_loss`; the
+# component metrics are logged separately.
+masked_reconstruction_weight: 1.0
+all_reconstruction_weight: 0.35
+center_displacement_weight: 1.0
+geometry_weight: 0.2
+consistency_weight: 0.1
+center_displacement_scale: 0.02

@@ -25,12 +25,24 @@ class ShapePretrainSystem(DummySystem):
     """Training loop with explicit masked reconstruction diagnostics."""
 
     metric_names = [
+        "pretrain_loss",
         "masked_reconstruction_loss",
         "masked_chamfer",
         "masked_rmse",
         "masked_fscore",
         "masked_precision",
         "masked_recall",
+        "all_reconstruction_loss",
+        "all_chamfer",
+        "all_rmse",
+        "all_fscore",
+        "all_precision",
+        "all_recall",
+        "center_displacement_loss",
+        "center_rmse",
+        "center_cosine",
+        "geometry_loss",
+        "consistency_loss",
         "mask_ratio",
         "noise_std",
     ]
@@ -66,7 +78,7 @@ class ShapePretrainSystem(DummySystem):
             writer.writerows(self._epoch_metric_records)
 
     def _save_best(self, epoch, val_summary):
-        value = val_summary.get("masked_reconstruction_loss")
+        value = val_summary.get("pretrain_loss")
         if value is None or value >= self.best_validation_loss:
             return
         self.best_validation_loss = value
@@ -85,7 +97,7 @@ class ShapePretrainSystem(DummySystem):
             json.dump(
                 {
                     "best_epoch": epoch,
-                    "selection_metric": "min_val_masked_reconstruction_loss",
+                    "selection_metric": "min_val_pretrain_loss",
                     "val_metrics": val_summary,
                     "checkpoint": checkpoint,
                 },
@@ -95,9 +107,13 @@ class ShapePretrainSystem(DummySystem):
             )
         print(
             "Saved best shape processor: "
-            f"epoch={epoch}, masked_cd="
+            f"epoch={epoch}, pretrain_loss="
+            f"{val_summary.get('pretrain_loss', float('nan')):.4f}, "
+            f"masked_cd="
             f"{val_summary.get('masked_chamfer', float('nan')):.8f}, "
-            f"fscore={val_summary.get('masked_fscore', float('nan')):.4f}"
+            f"fscore={val_summary.get('masked_fscore', float('nan')):.4f}, "
+            f"center_rmse={val_summary.get('center_rmse', float('nan')):.5f}, "
+            f"center_cos={val_summary.get('center_cosine', float('nan')):.3f}"
         )
 
     def train(self):
@@ -134,9 +150,11 @@ class ShapePretrainSystem(DummySystem):
                     for name in self.metric_names
                 }
                 bar.set_postfix(
-                    loss=f"{values['masked_reconstruction_loss']:.4f}",
-                    cd=f"{values['masked_chamfer']:.6f}",
-                    rmse=f"{values['masked_rmse']:.5f}",
+                    loss=f"{values['pretrain_loss']:.4f}",
+                    mcd=f"{values['masked_chamfer']:.6f}",
+                    acd=f"{values['all_chamfer']:.6f}",
+                    crmse=f"{values['center_rmse']:.5f}",
+                    ccos=f"{values['center_cosine']:.3f}",
                     fscore=f"{values['masked_fscore']:.3f}",
                     mask=f"{values['mask_ratio']:.2f}",
                     sigma=f"{values['noise_std']:.4f}",
@@ -178,8 +196,11 @@ class ShapePretrainSystem(DummySystem):
                         ]
                         values[name] = flat[-1] if flat else float("nan")
                     bar.set_postfix(
-                        cd=f"{values['masked_chamfer']:.6f}",
-                        rmse=f"{values['masked_rmse']:.5f}",
+                        loss=f"{values['pretrain_loss']:.4f}",
+                        mcd=f"{values['masked_chamfer']:.6f}",
+                        acd=f"{values['all_chamfer']:.6f}",
+                        crmse=f"{values['center_rmse']:.5f}",
+                        ccos=f"{values['center_cosine']:.3f}",
                         fscore=f"{values['masked_fscore']:.3f}",
                         mask=f"{values['mask_ratio']:.2f}",
                         sigma=f"{values['noise_std']:.4f}",
@@ -201,9 +222,14 @@ class ShapePretrainSystem(DummySystem):
             seconds = time.time() - epoch_start
             print(
                 f"Epoch {epoch}: "
-                f"train_cd={train_summary['masked_chamfer']:.8f}, "
+                f"train_loss={train_summary['pretrain_loss']:.4f}, "
+                f"val_loss={val_summary['pretrain_loss']:.4f}, "
                 f"val_cd={val_summary['masked_chamfer']:.8f}, "
-                f"val_rmse={val_summary['masked_rmse']:.6f}, "
+                f"val_all_cd={val_summary['all_chamfer']:.8f}, "
+                f"center_rmse={val_summary['center_rmse']:.6f}, "
+                f"center_cos={val_summary['center_cosine']:.4f}, "
+                f"geometry={val_summary['geometry_loss']:.6f}, "
+                f"consistency={val_summary['consistency_loss']:.6f}, "
                 f"val_fscore={val_summary['masked_fscore']:.4f}, "
                 f"mask={val_summary['mask_ratio']:.3f}, "
                 f"sigma={val_summary['noise_std']:.4f}, "
@@ -218,10 +244,8 @@ class ShapePretrainSystem(DummySystem):
             )
             self.step_scheduler(
                 epoch,
-                train_loss=train_summary["masked_reconstruction_loss"],
-                validation_loss=val_summary[
-                    "masked_reconstruction_loss"
-                ],
+                train_loss=train_summary["pretrain_loss"],
+                validation_loss=val_summary["pretrain_loss"],
             )
             os.makedirs(self.ckpt_save_dir, exist_ok=True)
             self.model.save(
@@ -297,6 +321,21 @@ class ShapeContextVMSystem(VMSystem):
             ),
             "region_context_gate": mean_metric(
                 self._train_loss.get("train/region_context_gate", [])
+            ),
+            "train_length_ratio": mean_metric(
+                self._train_loss.get("train/train_length_ratio", [])
+            ),
+            "train_cosine": mean_metric(
+                self._train_loss.get("train/train_cosine", [])
+            ),
+            "train_negative_cos_rate": mean_metric(
+                self._train_loss.get("train/train_negative_cos_rate", [])
+            ),
+            "train_pred_len": mean_metric(
+                self._train_loss.get("train/train_pred_len", [])
+            ),
+            "train_target_len": mean_metric(
+                self._train_loss.get("train/train_target_len", [])
             ),
             "val_loss": validation_loss,
             "cd_score": score_summary.get("cd_score"),

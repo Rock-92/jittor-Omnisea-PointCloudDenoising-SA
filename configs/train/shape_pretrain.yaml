@@ -1,10 +1,22 @@
 loss:
-  masked_reconstruction_loss: 1.0
+  pretrain_loss: 1.0
+  masked_reconstruction_loss: 0.0
   masked_chamfer: 0.0
   masked_rmse: 0.0
   masked_fscore: 0.0
   masked_precision: 0.0
   masked_recall: 0.0
+  all_reconstruction_loss: 0.0
+  all_chamfer: 0.0
+  all_rmse: 0.0
+  all_fscore: 0.0
+  all_precision: 0.0
+  all_recall: 0.0
+  center_displacement_loss: 0.0
+  center_rmse: 0.0
+  center_cosine: 0.0
+  geometry_loss: 0.0
+  consistency_loss: 0.0
   mask_ratio: 0.0
   noise_std: 0.0
 

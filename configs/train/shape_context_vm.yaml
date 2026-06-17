@@ -2,6 +2,11 @@ loss:
   displacement_loss: 1.0
   normalized_surface_loss: 0.1
   region_context_gate: 0.0
+  train_length_ratio: 0.0
+  train_cosine: 0.0
+  train_negative_cos_rate: 0.0
+  train_pred_len: 0.0
+  train_target_len: 0.0
 
 optimizer:
   __target__: adam

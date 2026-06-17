@@ -87,6 +87,26 @@ def mixed_region_mask(
     return mask, np.float32(mask.mean())
 
 
+def clean_region_geometry(points):
+    centered = points - points.mean(axis=1, keepdims=True)
+    cov = np.matmul(
+        centered.transpose(0, 2, 1),
+        centered,
+    ) / max(points.shape[1] - 1, 1)
+    eigvals = np.linalg.eigvalsh(cov)
+    eigvals = np.maximum(eigvals, 0.0)
+    eigvals = eigvals[:, ::-1]
+    total = np.maximum(eigvals.sum(axis=1), 1e-12)
+    largest = np.maximum(eigvals[:, 0], 1e-12)
+    linearity = (eigvals[:, 0] - eigvals[:, 1]) / largest
+    planarity = (eigvals[:, 1] - eigvals[:, 2]) / largest
+    curvature = eigvals[:, 2] / total
+    return np.stack(
+        [linearity, planarity, curvature],
+        axis=1,
+    ).astype(np.float32, copy=False)
+
+
 class MaskedShapeProcessor(nn.Module):
     """Region PointNet + spatial transformer masked shape autoencoder."""
 
@@ -235,8 +255,25 @@ class MaskedShapePretrainModule(VelocityModule):
             cfg.get("reconstruction_scale", 0.01)
         )
         self.fscore_threshold = float(cfg.get("fscore_threshold", 0.01))
+        self.masked_reconstruction_weight = float(
+            cfg.get("masked_reconstruction_weight", 1.0)
+        )
+        self.all_reconstruction_weight = float(
+            cfg.get("all_reconstruction_weight", 0.35)
+        )
+        self.center_displacement_weight = float(
+            cfg.get("center_displacement_weight", 1.0)
+        )
+        self.geometry_weight = float(cfg.get("geometry_weight", 0.2))
+        self.consistency_weight = float(
+            cfg.get("consistency_weight", 0.1)
+        )
+        self.center_displacement_scale = float(
+            cfg.get("center_displacement_scale", 0.02)
+        )
+        self.token_dim = int(cfg.get("token_dim", 128))
         self.processor = MaskedShapeProcessor(
-            token_dim=int(cfg.get("token_dim", 128)),
+            token_dim=self.token_dim,
             region_knn=cfg.get("region_knn", [8, 16]),
             num_blocks=int(cfg.get("num_blocks", 4)),
             points_per_region=self.points_per_region,
@@ -244,6 +281,16 @@ class MaskedShapePretrainModule(VelocityModule):
             max_reconstruction_radius=float(
                 cfg.get("max_reconstruction_radius", 0.08)
             ),
+        )
+        self.center_head = nn.Sequential(
+            nn.Linear(self.token_dim, self.token_dim),
+            nn.ReLU(),
+            nn.Linear(self.token_dim, 3),
+        )
+        self.geometry_head = nn.Sequential(
+            nn.Linear(self.token_dim, self.token_dim),
+            nn.ReLU(),
+            nn.Linear(self.token_dim, 3),
         )
 
     def get_train_transform(self):
@@ -255,7 +302,7 @@ class MaskedShapePretrainModule(VelocityModule):
     def get_predict_transform(self):
         return super().get_predict_transform()
 
-    def reconstruction_metrics(self, prediction, target, mask):
+    def reconstruction_metrics(self, prediction, target, weight, prefix):
         difference = (
             prediction.unsqueeze(3) - target.unsqueeze(2)
         )
@@ -266,10 +313,10 @@ class MaskedShapePretrainModule(VelocityModule):
             pred_to_target.mean(dim=2)
             + target_to_pred.mean(dim=2)
         )
-        weight = mask.reshape(mask.shape[0], mask.shape[1])
+        weight = weight.reshape(weight.shape[0], weight.shape[1])
         denominator = weight.sum() + 1e-6
-        masked_cd = (region_cd * weight).sum() / denominator
-        masked_rmse = jt.sqrt(masked_cd * 0.5 + 1e-8)
+        chamfer = (region_cd * weight).sum() / denominator
+        rmse = jt.sqrt(chamfer * 0.5 + 1e-8)
 
         threshold2 = self.fscore_threshold ** 2.0
         precision_region = (
@@ -283,15 +330,14 @@ class MaskedShapePretrainModule(VelocityModule):
         fscore = 2.0 * precision * recall / (
             precision + recall + 1e-6
         )
-        loss = masked_cd / max(self.reconstruction_scale ** 2.0, 1e-8)
+        loss = chamfer / max(self.reconstruction_scale ** 2.0, 1e-8)
         return {
-            "masked_reconstruction_loss": loss,
-            "masked_chamfer": masked_cd,
-            "masked_rmse": masked_rmse,
-            "masked_fscore": fscore,
-            "masked_precision": precision,
-            "masked_recall": recall,
-            "mask_ratio": weight.mean(),
+            f"{prefix}_reconstruction_loss": loss,
+            f"{prefix}_chamfer": chamfer,
+            f"{prefix}_rmse": rmse,
+            f"{prefix}_fscore": fscore,
+            f"{prefix}_precision": precision,
+            f"{prefix}_recall": recall,
         }
 
     def training_step(self, batch: Dict) -> Dict:
@@ -299,16 +345,100 @@ class MaskedShapePretrainModule(VelocityModule):
         target_points = batch["shape_region_target_points"]
         region_centers = batch["shape_region_centers"]
         mask = batch["shape_region_mask"]
-        prediction, _, _ = self.processor(
+        masked_prediction, _, _ = self.processor(
             region_points,
             region_centers,
             mask=mask,
         )
+        tokens, global_token = self.processor.encode(
+            region_points,
+            region_centers,
+            mask=None,
+            return_global=True,
+        )
+        all_prediction = self.processor.reconstruct(
+            tokens
+            + global_token.broadcast(
+                (tokens.shape[0], tokens.shape[1], tokens.shape[2])
+            )
+        )
         metrics = self.reconstruction_metrics(
-            prediction,
+            masked_prediction,
             target_points,
             mask,
+            "masked",
         )
+        all_weight = jt.ones_like(mask)
+        metrics.update(
+            self.reconstruction_metrics(
+                all_prediction,
+                target_points,
+                all_weight,
+                "all",
+            )
+        )
+        center_target = batch["shape_region_center_target"]
+        center_prediction = self.center_head(
+            tokens.reshape(-1, self.token_dim)
+        ).reshape(tokens.shape[0], tokens.shape[1], 3)
+        center_diff = center_prediction - center_target
+        center_loss = (
+            (center_diff ** 2.0).sum(dim=-1).mean()
+            / max(self.center_displacement_scale ** 2.0, 1e-8)
+        )
+        center_rmse = jt.sqrt(
+            (center_diff ** 2.0).sum(dim=-1).mean() + 1e-8
+        )
+        center_pred_len = jt.sqrt(
+            (center_prediction ** 2.0).sum(dim=-1) + 1e-8
+        )
+        center_target_len = jt.sqrt(
+            (center_target ** 2.0).sum(dim=-1) + 1e-8
+        )
+        center_cosine = (
+            (center_prediction * center_target).sum(dim=-1)
+            / (center_pred_len * center_target_len + 1e-8)
+        ).mean()
+
+        geometry_target = batch["shape_region_geometry"]
+        geometry_prediction = self.geometry_head(
+            tokens.reshape(-1, self.token_dim)
+        ).reshape(tokens.shape[0], tokens.shape[1], 3)
+        geometry_loss = ((geometry_prediction - geometry_target) ** 2.0).mean()
+
+        consistency_loss = jt.array(0.0)
+        if "shape_region_input_points_view2" in batch:
+            _, global_view2 = self.processor.encode(
+                batch["shape_region_input_points_view2"],
+                batch["shape_region_centers_view2"],
+                mask=None,
+                return_global=True,
+            )
+            g1 = global_token.reshape(global_token.shape[0], -1)
+            g2 = global_view2.reshape(global_view2.shape[0], -1)
+            g1 = g1 / jt.sqrt((g1 ** 2.0).sum(dim=1, keepdims=True) + 1e-8)
+            g2 = g2 / jt.sqrt((g2 ** 2.0).sum(dim=1, keepdims=True) + 1e-8)
+            consistency_loss = ((g1 - g2) ** 2.0).sum(dim=1).mean()
+
+        pretrain_loss = (
+            self.masked_reconstruction_weight
+            * metrics["masked_reconstruction_loss"]
+            + self.all_reconstruction_weight
+            * metrics["all_reconstruction_loss"]
+            + self.center_displacement_weight
+            * center_loss
+            + self.geometry_weight
+            * geometry_loss
+            + self.consistency_weight
+            * consistency_loss
+        )
+        metrics["pretrain_loss"] = pretrain_loss
+        metrics["center_displacement_loss"] = center_loss
+        metrics["center_rmse"] = center_rmse
+        metrics["center_cosine"] = center_cosine
+        metrics["geometry_loss"] = geometry_loss
+        metrics["consistency_loss"] = consistency_loss
+        metrics["mask_ratio"] = mask.mean()
         metrics["noise_std"] = batch["noise_std"].mean()
         return metrics
 
@@ -335,9 +465,45 @@ class MaskedShapePretrainModule(VelocityModule):
                 centers_idx,
                 neighbors_idx,
             )
+            clean_region = clean[neighbors_idx]
             target_points = (
-                clean[neighbors_idx] - noisy[centers_idx, None, :]
+                clean_region - noisy[centers_idx, None, :]
             ).astype(np.float32, copy=False)
+            center_target = (
+                clean[centers_idx] - noisy[centers_idx]
+            ).astype(np.float32, copy=False)
+            geometry_target = clean_region_geometry(clean_region)
+            noise_std_view2 = float(
+                np.random.uniform(
+                    self.noise_std_min,
+                    self.noise_std_max,
+                )
+            )
+            if self.noise_type == "laplace":
+                noise_view2 = np.random.laplace(
+                    0.0,
+                    noise_std_view2,
+                    size=clean.shape,
+                )
+            elif self.noise_type == "gaussian":
+                noise_view2 = np.random.randn(*clean.shape) * noise_std_view2
+            else:
+                raise ValueError(
+                    f"unsupported pretrain noise type: {self.noise_type}"
+                )
+            noisy_view2 = (
+                clean + noise_view2.astype(np.float32, copy=False)
+            ).astype(np.float32, copy=False)
+            centers_idx_view2, neighbors_idx_view2 = build_region_layout(
+                noisy_view2,
+                self.region_count,
+                self.points_per_region,
+            )
+            input_points_view2, centers_view2 = region_arrays(
+                noisy_view2,
+                centers_idx_view2,
+                neighbors_idx_view2,
+            )
             mask, mask_ratio = mixed_region_mask(
                 centers,
                 self.mask_ratio_min,
@@ -349,6 +515,10 @@ class MaskedShapePretrainModule(VelocityModule):
                     "shape_region_input_points": input_points,
                     "shape_region_target_points": target_points,
                     "shape_region_centers": centers,
+                    "shape_region_center_target": center_target,
+                    "shape_region_geometry": geometry_target,
+                    "shape_region_input_points_view2": input_points_view2,
+                    "shape_region_centers_view2": centers_view2,
                     "shape_region_mask": mask,
                     "noise_std": np.asarray(
                         [noise_std],
@@ -716,6 +886,11 @@ class ShapeContextVelocityModule(VelocityModule):
         displacement_loss = (
             ((prediction - target) ** 2.0) / self.dsm_sigma
         ).sum(dim=-1).mean()
+        pred_len = jt.sqrt((prediction ** 2.0).sum(dim=-1) + 1e-8)
+        target_len = jt.sqrt((target ** 2.0).sum(dim=-1) + 1e-8)
+        cosine = (prediction * target).sum(dim=-1) / (
+            pred_len * target_len + 1e-8
+        )
         surface_loss = self.get_normalized_surface_loss(
             pc_pred=noisy_for_loss + prediction,
             pc_clean=pc_clean,
@@ -725,6 +900,12 @@ class ShapeContextVelocityModule(VelocityModule):
             "displacement_loss": displacement_loss,
             "normalized_surface_loss": surface_loss,
             "region_context_gate": gate,
+            "train_length_ratio": pred_len.mean()
+            / (target_len.mean() + 1e-8),
+            "train_cosine": cosine.mean(),
+            "train_negative_cos_rate": (cosine < 0.0).float().mean(),
+            "train_pred_len": pred_len.mean(),
+            "train_target_len": target_len.mean(),
         }
 
     def process_fn(self, batch: List[Asset]) -> List[Dict]:
