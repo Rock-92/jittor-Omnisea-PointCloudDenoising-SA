@@ -27,6 +27,7 @@ use_length_projection_loss: false
 shape_pretrained_ckpt: outputs/shape_pretrain/checkpoints/processor_best.pkl
 shape_region_count: 256
 shape_points_per_region: 64
+shape_region_fps_candidates: 8192
 shape_token_dim: 128
 shape_region_knn: [8, 16]
 shape_num_blocks: 4

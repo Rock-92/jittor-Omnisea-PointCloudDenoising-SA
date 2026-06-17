@@ -1,7 +1,8 @@
 __target__: MaskedShapePretrainModule
 
-region_count: 256
+region_count: 192
 points_per_region: 64
+fps_candidate_count: 8192
 token_dim: 128
 region_knn: [8, 16]
 num_blocks: 4

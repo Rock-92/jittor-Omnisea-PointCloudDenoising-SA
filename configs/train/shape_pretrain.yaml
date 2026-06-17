@@ -33,4 +33,4 @@ scheduler:
   min_lr: 0.00001
 
 trainer:
-  epochs: 30
+  epochs: 15

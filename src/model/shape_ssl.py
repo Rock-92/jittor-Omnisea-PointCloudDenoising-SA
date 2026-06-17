@@ -33,8 +33,27 @@ def farthest_point_indices(points, count):
     return selected
 
 
-def build_region_layout(points, region_count, points_per_region):
-    center_indices = farthest_point_indices(points, region_count)
+def build_region_layout(
+    points,
+    region_count,
+    points_per_region,
+    fps_candidate_count=0,
+):
+    if 0 < int(fps_candidate_count) < points.shape[0]:
+        candidate_indices = np.sort(
+            np.random.choice(
+                points.shape[0],
+                size=int(fps_candidate_count),
+                replace=False,
+            )
+        )
+        local_indices = farthest_point_indices(
+            points[candidate_indices],
+            region_count,
+        )
+        center_indices = candidate_indices[local_indices]
+    else:
+        center_indices = farthest_point_indices(points, region_count)
     _, neighbor_indices = cKDTree(points).query(
         points[center_indices],
         k=min(int(points_per_region), points.shape[0]),
@@ -243,6 +262,7 @@ class MaskedShapePretrainModule(VelocityModule):
         cfg = self.model_config
         self.region_count = int(cfg.get("region_count", 256))
         self.points_per_region = int(cfg.get("points_per_region", 64))
+        self.fps_candidate_count = int(cfg.get("fps_candidate_count", 0))
         self.mask_ratio_min = float(cfg.get("mask_ratio_min", 0.4))
         self.mask_ratio_max = float(cfg.get("mask_ratio_max", 0.7))
         self.spatial_mask_fraction = float(
@@ -455,6 +475,7 @@ class MaskedShapePretrainModule(VelocityModule):
                 noisy,
                 self.region_count,
                 self.points_per_region,
+                self.fps_candidate_count,
             )
             if asset.meta is not None and "noise_std" in asset.meta:
                 noise_std = float(asset.meta["noise_std"])
@@ -498,6 +519,7 @@ class MaskedShapePretrainModule(VelocityModule):
                 noisy_view2,
                 self.region_count,
                 self.points_per_region,
+                self.fps_candidate_count,
             )
             input_points_view2, centers_view2 = region_arrays(
                 noisy_view2,
@@ -644,6 +666,9 @@ class ShapeContextVelocityModule(VelocityModule):
         self.region_count = int(cfg.get("shape_region_count", 256))
         self.points_per_region = int(
             cfg.get("shape_points_per_region", 64)
+        )
+        self.fps_candidate_count = int(
+            cfg.get("shape_region_fps_candidates", 0)
         )
         self.shape_token_dim = int(cfg.get("shape_token_dim", 128))
         self.shape_processor = MaskedShapeProcessor(
@@ -921,6 +946,7 @@ class ShapeContextVelocityModule(VelocityModule):
                     noisy,
                     self.region_count,
                     self.points_per_region,
+                    self.fps_candidate_count,
                 )
                 region_points, region_centers = region_arrays(
                     noisy,
@@ -944,6 +970,7 @@ class ShapeContextVelocityModule(VelocityModule):
                     noisy,
                     self.region_count,
                     self.points_per_region,
+                    self.fps_candidate_count,
                 )
                 region_points, region_centers = region_arrays(
                     noisy,
