@@ -214,6 +214,13 @@ class VMSystem(DummySystem):
         if path is None:
             return None
         parts = Path(path).resolve().parts
+        if (
+            "dataset_clean" in parts
+            and len(parts) >= 2
+            and parts[-2] == "models"
+            and parts[-1] == "model_normalized.obj"
+        ):
+            return Path(path)
         if "cache_clean_points" not in parts:
             return None
         cache_idx = parts.index("cache_clean_points")

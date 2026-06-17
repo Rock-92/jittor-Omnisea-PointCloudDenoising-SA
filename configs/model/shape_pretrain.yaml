@@ -12,7 +12,8 @@ mask_ratio_min: 0.40
 mask_ratio_max: 0.70
 spatial_mask_fraction: 0.70
 
-# Student input is a noisy complete shape; masked targets remain clean.
+# Student input and region layout are built from noisy complete shapes;
+# masked reconstruction targets remain clean local geometry.
 noise_std_min: 0.005
 noise_std_max: 0.020
 noise_type: laplace

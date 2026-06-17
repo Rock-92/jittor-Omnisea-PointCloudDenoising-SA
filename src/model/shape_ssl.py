@@ -315,32 +315,21 @@ class MaskedShapePretrainModule(VelocityModule):
     def process_fn(self, batch: List[Asset]) -> List[Dict]:
         result = []
         for asset in batch:
-            if asset.sampled_vertices is None or asset.meta is None:
-                raise ValueError("shape pretraining requires cached clean regions")
-            centers_idx = asset.meta["region_center_indices"]
-            neighbors_idx = asset.meta["region_neighbor_indices"]
             clean = asset.sampled_vertices
-            noise_std = float(
-                np.random.uniform(
-                    self.noise_std_min,
-                    self.noise_std_max,
-                )
-            )
-            if self.noise_type == "laplace":
-                noise = np.random.laplace(
-                    0.0,
-                    noise_std,
-                    size=clean.shape,
-                )
-            elif self.noise_type == "gaussian":
-                noise = np.random.randn(*clean.shape) * noise_std
-            else:
+            noisy = asset.sampled_vertices_noisy
+            if clean is None or noisy is None:
                 raise ValueError(
-                    f"unsupported pretrain noise type: {self.noise_type}"
+                    "shape pretraining requires sampled clean and noisy shapes"
                 )
-            noisy = (
-                clean + noise.astype(np.float32, copy=False)
-            ).astype(np.float32, copy=False)
+            centers_idx, neighbors_idx = build_region_layout(
+                noisy,
+                self.region_count,
+                self.points_per_region,
+            )
+            if asset.meta is not None and "noise_std" in asset.meta:
+                noise_std = float(asset.meta["noise_std"])
+            else:
+                noise_std = float("nan")
             input_points, centers = region_arrays(
                 noisy,
                 centers_idx,
@@ -743,12 +732,15 @@ class ShapeContextVelocityModule(VelocityModule):
         for asset in batch:
             if not self.is_predict():
                 if asset.meta is None:
-                    raise ValueError("missing cached region metadata")
+                    raise ValueError("missing patch metadata")
                 noisy = asset.sampled_vertices_noisy
                 if noisy is None:
                     raise ValueError("missing noisy full shape")
-                centers_idx = asset.meta["region_center_indices"]
-                neighbors_idx = asset.meta["region_neighbor_indices"]
+                centers_idx, neighbors_idx = build_region_layout(
+                    noisy,
+                    self.region_count,
+                    self.points_per_region,
+                )
                 region_points, region_centers = region_arrays(
                     noisy,
                     centers_idx,
