@@ -126,6 +126,24 @@ def clean_region_geometry(points):
     ).astype(np.float32, copy=False)
 
 
+def clean_region_surface_targets(points):
+    centered = points - points.mean(axis=1, keepdims=True)
+    cov = np.matmul(
+        centered.transpose(0, 2, 1),
+        centered,
+    ) / max(points.shape[1] - 1, 1)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    eigvals = np.maximum(eigvals, 0.0)
+    normals = eigvecs[:, :, 0]
+    total = np.maximum(eigvals.sum(axis=1), 1e-12)
+    curvature = eigvals[:, 0] / total
+    crease = np.clip(curvature / 0.08, 0.0, 1.0)
+    return (
+        normals.astype(np.float32, copy=False),
+        crease[:, None].astype(np.float32, copy=False),
+    )
+
+
 class MaskedShapeProcessor(nn.Module):
     """Region PointNet + spatial transformer masked shape autoencoder."""
 
@@ -288,6 +306,11 @@ class MaskedShapePretrainModule(VelocityModule):
         self.consistency_weight = float(
             cfg.get("consistency_weight", 0.1)
         )
+        self.token_distill_weight = float(
+            cfg.get("token_distill_weight", 0.7)
+        )
+        self.normal_weight = float(cfg.get("normal_weight", 0.7))
+        self.crease_weight = float(cfg.get("crease_weight", 0.3))
         self.center_displacement_scale = float(
             cfg.get("center_displacement_scale", 0.02)
         )
@@ -311,6 +334,16 @@ class MaskedShapePretrainModule(VelocityModule):
             nn.Linear(self.token_dim, self.token_dim),
             nn.ReLU(),
             nn.Linear(self.token_dim, 3),
+        )
+        self.normal_head = nn.Sequential(
+            nn.Linear(self.token_dim, self.token_dim),
+            nn.ReLU(),
+            nn.Linear(self.token_dim, 3),
+        )
+        self.crease_head = nn.Sequential(
+            nn.Linear(self.token_dim, self.token_dim),
+            nn.ReLU(),
+            nn.Linear(self.token_dim, 1),
         )
 
     def get_train_transform(self):
@@ -426,6 +459,45 @@ class MaskedShapePretrainModule(VelocityModule):
         ).reshape(tokens.shape[0], tokens.shape[1], 3)
         geometry_loss = ((geometry_prediction - geometry_target) ** 2.0).mean()
 
+        with jt.no_grad():
+            teacher_tokens, _ = self.processor.encode(
+                batch["shape_region_clean_points"],
+                batch["shape_region_clean_centers"],
+                mask=None,
+                return_global=False,
+            )
+        token_norm = tokens / jt.sqrt(
+            (tokens ** 2.0).sum(dim=-1, keepdims=True) + 1e-8
+        )
+        teacher_norm = teacher_tokens / jt.sqrt(
+            (teacher_tokens ** 2.0).sum(dim=-1, keepdims=True) + 1e-8
+        )
+        token_cosine = (token_norm * teacher_norm).sum(dim=-1).mean()
+        token_distill_loss = 1.0 - token_cosine
+
+        normal_target = batch["shape_region_normal"]
+        normal_prediction = self.normal_head(
+            tokens.reshape(-1, self.token_dim)
+        ).reshape(tokens.shape[0], tokens.shape[1], 3)
+        normal_prediction = normal_prediction / jt.sqrt(
+            (normal_prediction ** 2.0).sum(dim=-1, keepdims=True) + 1e-8
+        )
+        normal_target = normal_target / jt.sqrt(
+            (normal_target ** 2.0).sum(dim=-1, keepdims=True) + 1e-8
+        )
+        normal_cosine_abs = jt.abs(
+            (normal_prediction * normal_target).sum(dim=-1)
+        ).mean()
+        normal_loss = 1.0 - normal_cosine_abs
+
+        crease_target = batch["shape_region_crease"]
+        crease_prediction = jt.sigmoid(
+            self.crease_head(
+                tokens.reshape(-1, self.token_dim)
+            ).reshape(tokens.shape[0], tokens.shape[1], 1)
+        )
+        crease_loss = ((crease_prediction - crease_target) ** 2.0).mean()
+
         consistency_loss = jt.array(0.0)
         if "shape_region_input_points_view2" in batch:
             _, global_view2 = self.processor.encode(
@@ -449,6 +521,12 @@ class MaskedShapePretrainModule(VelocityModule):
             * center_loss
             + self.geometry_weight
             * geometry_loss
+            + self.token_distill_weight
+            * token_distill_loss
+            + self.normal_weight
+            * normal_loss
+            + self.crease_weight
+            * crease_loss
             + self.consistency_weight
             * consistency_loss
         )
@@ -457,6 +535,13 @@ class MaskedShapePretrainModule(VelocityModule):
         metrics["center_rmse"] = center_rmse
         metrics["center_cosine"] = center_cosine
         metrics["geometry_loss"] = geometry_loss
+        metrics["token_distill_loss"] = token_distill_loss
+        metrics["token_cosine"] = token_cosine
+        metrics["normal_loss"] = normal_loss
+        metrics["normal_cosine_abs"] = normal_cosine_abs
+        metrics["crease_loss"] = crease_loss
+        metrics["crease_pred_mean"] = crease_prediction.mean()
+        metrics["crease_target_mean"] = crease_target.mean()
         metrics["consistency_loss"] = consistency_loss
         metrics["mask_ratio"] = mask.mean()
         metrics["noise_std"] = batch["noise_std"].mean()
@@ -486,6 +571,11 @@ class MaskedShapePretrainModule(VelocityModule):
                 centers_idx,
                 neighbors_idx,
             )
+            clean_input_points, clean_centers = region_arrays(
+                clean,
+                centers_idx,
+                neighbors_idx,
+            )
             clean_region = clean[neighbors_idx]
             target_points = (
                 clean_region - noisy[centers_idx, None, :]
@@ -494,6 +584,9 @@ class MaskedShapePretrainModule(VelocityModule):
                 clean[centers_idx] - noisy[centers_idx]
             ).astype(np.float32, copy=False)
             geometry_target = clean_region_geometry(clean_region)
+            normal_target, crease_target = clean_region_surface_targets(
+                clean_region
+            )
             noise_std_view2 = float(
                 np.random.uniform(
                     self.noise_std_min,
@@ -537,8 +630,12 @@ class MaskedShapePretrainModule(VelocityModule):
                     "shape_region_input_points": input_points,
                     "shape_region_target_points": target_points,
                     "shape_region_centers": centers,
+                    "shape_region_clean_points": clean_input_points,
+                    "shape_region_clean_centers": clean_centers,
                     "shape_region_center_target": center_target,
                     "shape_region_geometry": geometry_target,
+                    "shape_region_normal": normal_target,
+                    "shape_region_crease": crease_target,
                     "shape_region_input_points_view2": input_points_view2,
                     "shape_region_centers_view2": centers_view2,
                     "shape_region_mask": mask,
@@ -683,6 +780,24 @@ class ShapeContextVelocityModule(VelocityModule):
                 cfg.get("shape_max_reconstruction_radius", 0.08)
             ),
         )
+        self.normal_head = nn.Sequential(
+            nn.Linear(self.shape_token_dim, self.shape_token_dim),
+            nn.ReLU(),
+            nn.Linear(self.shape_token_dim, 3),
+        )
+        self.crease_head = nn.Sequential(
+            nn.Linear(self.shape_token_dim, self.shape_token_dim),
+            nn.ReLU(),
+            nn.Linear(self.shape_token_dim, 1),
+        )
+        self.surface_prior_proj = nn.Sequential(
+            nn.Linear(self.shape_token_dim + 4, self.shape_token_dim),
+            nn.ReLU(),
+            nn.Linear(self.shape_token_dim, self.shape_token_dim),
+        )
+        self.surface_prior_scale = float(
+            cfg.get("shape_surface_prior_scale", 0.1)
+        )
         self.shape_context_knn = int(cfg.get("shape_context_knn", 4))
         self.region_cross_blocks = []
         for block_index in range(self.attention_blocks):
@@ -724,11 +839,15 @@ class ShapeContextVelocityModule(VelocityModule):
                 for parameter in self.shape_processor.global_proj.parameters()
             },
         }
-        return [
+        parameters = [
             parameter
             for parameter in self.shape_processor.parameters()
             if id(parameter) not in excluded
         ]
+        parameters.extend(self.normal_head.parameters())
+        parameters.extend(self.crease_head.parameters())
+        parameters.extend(self.surface_prior_proj.parameters())
+        return parameters
 
     def load_shape_pretrained(self, path):
         if not Path(path).exists():
@@ -752,7 +871,49 @@ class ShapeContextVelocityModule(VelocityModule):
                 f"no processor parameters found in checkpoint: {path}"
             )
         self.shape_processor.load_state_dict(processor_state)
-        print(f"Loaded pretrained shape processor: {path}")
+
+        def load_prefixed(module, prefix_name):
+            state_dict = {
+                key[len(prefix_name):]: value
+                for key, value in state.items()
+                if key.startswith(prefix_name)
+            }
+            if state_dict:
+                module.load_state_dict(state_dict)
+            return len(state_dict)
+
+        normal_count = load_prefixed(self.normal_head, "normal_head.")
+        crease_count = load_prefixed(self.crease_head, "crease_head.")
+        print(
+            f"Loaded pretrained shape processor: {path} "
+            f"(normal_head={normal_count}, crease_head={crease_count})"
+        )
+
+    def apply_surface_prior(self, region_tokens):
+        normal = self.normal_head(
+            region_tokens.reshape(-1, self.shape_token_dim)
+        ).reshape(region_tokens.shape[0], region_tokens.shape[1], 3)
+        normal = normal / jt.sqrt(
+            (normal ** 2.0).sum(dim=-1, keepdims=True) + 1e-8
+        )
+        crease = jt.sigmoid(
+            self.crease_head(
+                region_tokens.reshape(-1, self.shape_token_dim)
+            ).reshape(region_tokens.shape[0], region_tokens.shape[1], 1)
+        )
+        prior_input = jt.concat([region_tokens, normal, crease], dim=-1)
+        prior_delta = self.surface_prior_proj(
+            prior_input.reshape(-1, self.shape_token_dim + 4)
+        ).reshape(
+            region_tokens.shape[0],
+            region_tokens.shape[1],
+            self.shape_token_dim,
+        )
+        self._last_region_crease_mean = crease.mean()
+        self._last_region_prior_delta = jt.sqrt(
+            (prior_delta ** 2.0).sum(dim=-1) + 1e-8
+        ).mean()
+        return region_tokens + self.surface_prior_scale * prior_delta
 
     def encode_shape(self, region_points, region_centers):
         region_tokens, _ = self.shape_processor.encode(
@@ -761,7 +922,7 @@ class ShapeContextVelocityModule(VelocityModule):
             mask=None,
             return_global=False,
         )
-        return region_tokens
+        return self.apply_surface_prior(region_tokens)
 
     def encode_patch_with_region_context(
         self,
@@ -925,6 +1086,16 @@ class ShapeContextVelocityModule(VelocityModule):
             "displacement_loss": displacement_loss,
             "normalized_surface_loss": surface_loss,
             "region_context_gate": gate,
+            "region_crease_mean": getattr(
+                self,
+                "_last_region_crease_mean",
+                jt.array(0.0),
+            ),
+            "region_prior_delta": getattr(
+                self,
+                "_last_region_prior_delta",
+                jt.array(0.0),
+            ),
             "train_length_ratio": pred_len.mean()
             / (target_len.mean() + 1e-8),
             "train_cosine": cosine.mean(),

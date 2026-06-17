@@ -34,6 +34,7 @@ shape_num_blocks: 4
 shape_relative_bias_dim: 32
 shape_max_reconstruction_radius: 0.08
 shape_context_knn: 4
+shape_surface_prior_scale: 0.1
 
 predict_rounds: 1
 denoise_num_steps: 1

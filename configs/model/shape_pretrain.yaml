@@ -24,9 +24,15 @@ fscore_threshold: 0.01
 
 # Pretraining is optimized through a single weighted `pretrain_loss`; the
 # component metrics are logged separately.
-masked_reconstruction_weight: 1.0
-all_reconstruction_weight: 0.35
-center_displacement_weight: 1.0
-geometry_weight: 0.2
-consistency_weight: 0.1
+# Noisy-student / clean-teacher pretraining:
+# - reconstruction keeps local clean geometry visible;
+# - token distillation, normal and crease heads teach clean surface priors.
+masked_reconstruction_weight: 0.75
+all_reconstruction_weight: 0.20
+center_displacement_weight: 0.80
+geometry_weight: 0.30
+token_distill_weight: 0.70
+normal_weight: 0.70
+crease_weight: 0.30
+consistency_weight: 0.10
 center_displacement_scale: 0.02

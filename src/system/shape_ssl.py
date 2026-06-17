@@ -42,6 +42,13 @@ class ShapePretrainSystem(DummySystem):
         "center_rmse",
         "center_cosine",
         "geometry_loss",
+        "token_distill_loss",
+        "token_cosine",
+        "normal_loss",
+        "normal_cosine_abs",
+        "crease_loss",
+        "crease_pred_mean",
+        "crease_target_mean",
         "consistency_loss",
         "mask_ratio",
         "noise_std",
@@ -113,7 +120,11 @@ class ShapePretrainSystem(DummySystem):
             f"{val_summary.get('masked_chamfer', float('nan')):.8f}, "
             f"fscore={val_summary.get('masked_fscore', float('nan')):.4f}, "
             f"center_rmse={val_summary.get('center_rmse', float('nan')):.5f}, "
-            f"center_cos={val_summary.get('center_cosine', float('nan')):.3f}"
+            f"center_cos={val_summary.get('center_cosine', float('nan')):.3f}, "
+            f"token_cos={val_summary.get('token_cosine', float('nan')):.3f}, "
+            f"normal_cos={val_summary.get('normal_cosine_abs', float('nan')):.3f}, "
+            f"crease={val_summary.get('crease_pred_mean', float('nan')):.3f}/"
+            f"{val_summary.get('crease_target_mean', float('nan')):.3f}"
         )
 
     def train(self):
@@ -156,6 +167,10 @@ class ShapePretrainSystem(DummySystem):
                     crmse=f"{values['center_rmse']:.5f}",
                     ccos=f"{values['center_cosine']:.3f}",
                     fscore=f"{values['masked_fscore']:.3f}",
+                    tok=f"{values['token_cosine']:.3f}",
+                    ncos=f"{values['normal_cosine_abs']:.3f}",
+                    crease=f"{values['crease_pred_mean']:.2f}/"
+                    f"{values['crease_target_mean']:.2f}",
                     mask=f"{values['mask_ratio']:.2f}",
                     sigma=f"{values['noise_std']:.4f}",
                 )
@@ -202,6 +217,10 @@ class ShapePretrainSystem(DummySystem):
                         crmse=f"{values['center_rmse']:.5f}",
                         ccos=f"{values['center_cosine']:.3f}",
                         fscore=f"{values['masked_fscore']:.3f}",
+                        tok=f"{values['token_cosine']:.3f}",
+                        ncos=f"{values['normal_cosine_abs']:.3f}",
+                        crease=f"{values['crease_pred_mean']:.2f}/"
+                        f"{values['crease_target_mean']:.2f}",
                         mask=f"{values['mask_ratio']:.2f}",
                         sigma=f"{values['noise_std']:.4f}",
                     )
@@ -229,6 +248,10 @@ class ShapePretrainSystem(DummySystem):
                 f"center_rmse={val_summary['center_rmse']:.6f}, "
                 f"center_cos={val_summary['center_cosine']:.4f}, "
                 f"geometry={val_summary['geometry_loss']:.6f}, "
+                f"token_cos={val_summary['token_cosine']:.4f}, "
+                f"normal_cos={val_summary['normal_cosine_abs']:.4f}, "
+                f"crease={val_summary['crease_pred_mean']:.3f}/"
+                f"{val_summary['crease_target_mean']:.3f}, "
                 f"consistency={val_summary['consistency_loss']:.6f}, "
                 f"val_fscore={val_summary['masked_fscore']:.4f}, "
                 f"mask={val_summary['mask_ratio']:.3f}, "
@@ -312,6 +335,8 @@ class ShapeContextVMSystem(VMSystem):
             "pred": f"{value('train_pred_len'):.4f}",
             "tgt": f"{value('train_target_len'):.4f}",
             "gate": f"{value('region_context_gate'):.3f}",
+            "crease": f"{value('region_crease_mean'):.3f}",
+            "prior": f"{value('region_prior_delta'):.3f}",
         }
 
     def log_epoch_metrics(
@@ -341,6 +366,12 @@ class ShapeContextVMSystem(VMSystem):
             ),
             "region_context_gate": mean_metric(
                 self._train_loss.get("train/region_context_gate", [])
+            ),
+            "region_crease_mean": mean_metric(
+                self._train_loss.get("train/region_crease_mean", [])
+            ),
+            "region_prior_delta": mean_metric(
+                self._train_loss.get("train/region_prior_delta", [])
             ),
             "train_length_ratio": mean_metric(
                 self._train_loss.get("train/train_length_ratio", [])
@@ -385,7 +416,9 @@ class ShapeContextVMSystem(VMSystem):
             f"neg={fmt('train_negative_cos_rate')}, "
             f"pred_len={fmt('train_pred_len', 5)}, "
             f"target_len={fmt('train_target_len', 5)}, "
-            f"gate={fmt('region_context_gate')}"
+            f"gate={fmt('region_context_gate')}, "
+            f"crease={fmt('region_crease_mean')}, "
+            f"prior_delta={fmt('region_prior_delta')}"
         )
 
     def on_train_end(self):

@@ -16,6 +16,13 @@ loss:
   center_rmse: 0.0
   center_cosine: 0.0
   geometry_loss: 0.0
+  token_distill_loss: 0.0
+  token_cosine: 0.0
+  normal_loss: 0.0
+  normal_cosine_abs: 0.0
+  crease_loss: 0.0
+  crease_pred_mean: 0.0
+  crease_target_mean: 0.0
   consistency_loss: 0.0
   mask_ratio: 0.0
   noise_std: 0.0
