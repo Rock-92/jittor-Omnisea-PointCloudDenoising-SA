@@ -388,6 +388,24 @@ class ShapeContextVMSystem(VMSystem):
             "train_target_len": mean_metric(
                 self._train_loss.get("train/train_target_len", [])
             ),
+            "candidate_surface_loss": mean_metric(
+                self._train_loss.get("train/candidate_surface_loss", [])
+            ),
+            "candidate_normal_loss": mean_metric(
+                self._train_loss.get("train/candidate_normal_loss", [])
+            ),
+            "candidate_diversity_loss": mean_metric(
+                self._train_loss.get("train/candidate_diversity_loss", [])
+            ),
+            "candidate_confidence_loss": mean_metric(
+                self._train_loss.get("train/candidate_confidence_loss", [])
+            ),
+            "candidate_best_score": mean_metric(
+                self._train_loss.get("train/candidate_best_score", [])
+            ),
+            "candidate_mean_entropy": mean_metric(
+                self._train_loss.get("train/candidate_mean_entropy", [])
+            ),
             "val_loss": validation_loss,
             "cd_score": score_summary.get("cd_score"),
             "p2s_score": score_summary.get("p2s_score"),
@@ -418,7 +436,10 @@ class ShapeContextVMSystem(VMSystem):
             f"target_len={fmt('train_target_len', 5)}, "
             f"gate={fmt('region_context_gate')}, "
             f"crease={fmt('region_crease_mean')}, "
-            f"prior_delta={fmt('region_prior_delta')}"
+            f"prior_delta={fmt('region_prior_delta')}, "
+            f"cand_surf={fmt('candidate_surface_loss')}, "
+            f"cand_conf={fmt('candidate_confidence_loss')}, "
+            f"cand_ent={fmt('candidate_mean_entropy')}"
         )
 
     def on_train_end(self):

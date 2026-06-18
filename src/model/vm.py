@@ -83,6 +83,49 @@ class VelocityModule(ModelSpec):
             False,
         )
         self.surface_normal_k = int(cfg.get('surface_normal_k', 3))
+        self.use_surface_threshold_loss = bool(
+            cfg.get('use_surface_threshold_loss', False)
+        )
+        self.surface_threshold_k = int(cfg.get('surface_threshold_k', 96))
+        self.surface_threshold_total_quantile = float(
+            cfg.get('surface_threshold_total_quantile', 0.90)
+        )
+        self.surface_threshold_total_fraction = float(
+            cfg.get('surface_threshold_total_fraction', 0.25)
+        )
+        self.surface_threshold_single_quantile = float(
+            cfg.get('surface_threshold_single_quantile', 0.25)
+        )
+        self.surface_threshold_single_factor = float(
+            cfg.get('surface_threshold_single_factor', 1.10)
+        )
+        self.surface_threshold_min = float(
+            cfg.get('surface_threshold_min', 0.004)
+        )
+        self.surface_threshold_extra_weight = float(
+            cfg.get('surface_threshold_extra_weight', 8.0)
+        )
+        self.multi_surface_candidate_count = int(
+            cfg.get('multi_surface_candidate_count', 1)
+        )
+        self.candidate_surface_aux_weight = float(
+            cfg.get('candidate_surface_aux_weight', 0.2)
+        )
+        self.candidate_normal_weight = float(
+            cfg.get('candidate_normal_weight', 0.05)
+        )
+        self.candidate_diversity_weight = float(
+            cfg.get('candidate_diversity_weight', 0.02)
+        )
+        self.candidate_confidence_weight = float(
+            cfg.get('candidate_confidence_weight', 0.1)
+        )
+        self.candidate_diversity_margin = float(
+            cfg.get('candidate_diversity_margin', 0.004)
+        )
+        self.use_multi_surface_candidates = (
+            self.multi_surface_candidate_count > 1
+        )
         
         # patch-based prediction
         self.predict_rounds = cfg.get('predict_rounds', 1)
@@ -161,11 +204,20 @@ class VelocityModule(ModelSpec):
         decoder_input_dim = self.encoder.embedding_dim
         if self.use_edgeconv_branch:
             decoder_input_dim += self.edgeconv_branch_dim
+        decoder_out_dim = 3
+        if self.use_multi_surface_candidates:
+            decoder_out_dim = self.multi_surface_candidate_count * 6
         self.decoder = Decoder(
             z_dim=decoder_input_dim,
-            out_dim=3,
+            out_dim=decoder_out_dim,
             hidden_dims=self.decoder_hidden_dims,
         )
+        if self.use_multi_surface_candidates:
+            self.candidate_logit_head = Decoder(
+                z_dim=decoder_input_dim,
+                out_dim=self.multi_surface_candidate_count,
+                hidden_dims=self.decoder_hidden_dims,
+            )
         if self.use_sigma_head:
             self.sigma_head_1 = nn.Linear(
                 self.encoder.embedding_dim,
@@ -336,8 +388,11 @@ class VelocityModule(ModelSpec):
         )
         return pred_loss + cover_loss
 
-    def get_clean_point_normals(self, pc_clean):
-        k = min(max(self.surface_normal_k, 3), pc_clean.shape[1])
+    def get_clean_point_normals(self, pc_clean, return_neighbors=False):
+        k = max(self.surface_normal_k, 3)
+        if return_neighbors and self.use_surface_threshold_loss:
+            k = max(k, self.surface_threshold_k)
+        k = min(k, pc_clean.shape[1])
         dist = ((pc_clean.unsqueeze(2) - pc_clean.unsqueeze(1)) ** 2.0).sum(dim=-1)
         _, idx = jt.topk(dist, k=k, dim=-1, largest=False)
         neighbors = []
@@ -361,7 +416,51 @@ class VelocityModule(ModelSpec):
         normal = normal / jt.sqrt(
             (normal ** 2.0).sum(dim=-1, keepdims=True) + 1e-8
         )
+        if return_neighbors:
+            return normal, neighbors
         return normal
+
+    def get_surface_distance_thresholds(self, pc_clean, clean_normals, clean_neighbors):
+        neighbor_count = clean_neighbors.shape[2]
+        if neighbor_count <= 1:
+            return jt.ones((pc_clean.shape[0], pc_clean.shape[1])) * self.surface_threshold_min
+
+        offsets = (
+            (clean_neighbors - pc_clean.unsqueeze(2))
+            * clean_normals.unsqueeze(2)
+        ).sum(dim=-1)
+        abs_offsets = jt.sqrt(offsets ** 2.0 + 1e-12)
+
+        single_count = max(
+            2,
+            int(round(neighbor_count * self.surface_threshold_single_quantile)),
+        )
+        single_count = min(single_count, neighbor_count)
+        total_count = max(
+            single_count,
+            int(round(neighbor_count * self.surface_threshold_total_quantile)),
+        )
+        total_count = min(total_count, neighbor_count)
+
+        single_values, _ = jt.topk(
+            abs_offsets,
+            k=single_count,
+            dim=-1,
+            largest=False,
+        )
+        total_values, _ = jt.topk(
+            abs_offsets,
+            k=total_count,
+            dim=-1,
+            largest=False,
+        )
+        single_thickness = single_values.max(dim=-1)
+        total_thickness = total_values.max(dim=-1)
+
+        single_threshold = single_thickness * self.surface_threshold_single_factor
+        total_threshold = total_thickness * self.surface_threshold_total_fraction
+        threshold = jt.maximum(single_threshold, total_threshold)
+        return jt.maximum(threshold, self.surface_threshold_min)
 
     def get_nearest_surface_loss(
         self,
@@ -372,16 +471,39 @@ class VelocityModule(ModelSpec):
     ):
         dist = ((pc_pred.unsqueeze(2) - pc_clean.unsqueeze(1)) ** 2.0).sum(dim=-1)
         _, idx = jt.topk(dist, k=1, dim=2, largest=False)
-        clean_normals = self.get_clean_point_normals(pc_clean)
+        if self.use_surface_threshold_loss:
+            clean_normals, clean_neighbors = self.get_clean_point_normals(
+                pc_clean,
+                return_neighbors=True,
+            )
+            clean_thresholds = self.get_surface_distance_thresholds(
+                pc_clean,
+                clean_normals,
+                clean_neighbors,
+            )
+        else:
+            clean_normals = self.get_clean_point_normals(pc_clean)
+            clean_thresholds = None
         anchors = []
         normals = []
+        thresholds = []
         for b in range(pc_pred.shape[0]):
             nearest_idx = idx[b].reshape(-1)
             anchors.append(pc_clean[b][nearest_idx])
             normals.append(clean_normals[b][nearest_idx])
+            if clean_thresholds is not None:
+                thresholds.append(clean_thresholds[b][nearest_idx])
         anchors = jt.stack(anchors, dim=0)
         normals = jt.stack(normals, dim=0)
-        plane_dist = (((pc_pred - anchors) * normals).sum(dim=-1) ** 2.0)
+        signed_plane_dist = ((pc_pred - anchors) * normals).sum(dim=-1)
+        plane_dist = signed_plane_dist ** 2.0
+        if clean_thresholds is not None:
+            thresholds = jt.stack(thresholds, dim=0)
+            threshold2 = thresholds ** 2.0
+            extra = jt.maximum(plane_dist - threshold2, 0.0)
+            plane_dist = plane_dist + self.surface_threshold_extra_weight * (
+                extra ** 2.0
+            ) / jt.maximum(threshold2, self.patch_scale_eps ** 2.0)
         sigma2 = self._loss_sigma2(sigma, pc_pred.shape[0])
         loss = plane_dist.mean(dim=1) / sigma2
         if hard_weight is not None:
@@ -482,6 +604,171 @@ class VelocityModule(ModelSpec):
         N_out = feat.shape[1]
         F_dim = feat.shape[2]
         return self.decoder(feat.reshape(-1, F_dim)).reshape(B, N_out, d)
+
+    def decode_multi_surface_candidates(self, feature):
+        B, N, F_dim = feature.shape
+        raw = self.decoder(feature.reshape(-1, F_dim)).reshape(
+            B,
+            N,
+            self.multi_surface_candidate_count,
+            6,
+        )
+        displacement = raw[:, :, :, :3]
+        normal = raw[:, :, :, 3:]
+        normal = normal / jt.sqrt(
+            (normal ** 2.0).sum(dim=-1, keepdims=True) + 1e-8
+        )
+        logits = self.candidate_logit_head(
+            feature.reshape(-1, F_dim)
+        ).reshape(B, N, self.multi_surface_candidate_count)
+        return displacement, normal, logits
+
+    def select_candidate_by_logits(self, candidates, logits):
+        _, selected_idx = jt.topk(logits, k=1, dim=-1, largest=True)
+        selected_idx = selected_idx.reshape(logits.shape[0], logits.shape[1])
+        selected = []
+        for b in range(candidates.shape[0]):
+            selected.append(candidates[b][jt.arange(candidates.shape[1]), selected_idx[b]])
+        return jt.stack(selected, dim=0), selected_idx
+
+    def select_candidate_by_score(self, candidates, score):
+        _, selected_idx = jt.topk(score, k=1, dim=-1, largest=False)
+        selected_idx = selected_idx.reshape(score.shape[0], score.shape[1])
+        selected = []
+        for b in range(candidates.shape[0]):
+            selected.append(candidates[b][jt.arange(candidates.shape[1]), selected_idx[b]])
+        return jt.stack(selected, dim=0), selected_idx
+
+    def gather_candidate_values(self, values, indices):
+        gathered = []
+        for b in range(values.shape[0]):
+            gathered.append(values[b][jt.arange(values.shape[1]), indices[b]])
+        return jt.stack(gathered, dim=0)
+
+    def get_candidate_surface_scores(
+        self,
+        pc_candidates,
+        candidate_normals,
+        pc_clean,
+    ):
+        B, N, K, _ = pc_candidates.shape
+        flat_candidates = pc_candidates.reshape(B, N * K, 3)
+        dist = (
+            (flat_candidates.unsqueeze(2) - pc_clean.unsqueeze(1)) ** 2.0
+        ).sum(dim=-1)
+        _, idx = jt.topk(dist, k=1, dim=2, largest=False)
+        clean_normals = self.get_clean_point_normals(pc_clean)
+        anchors = []
+        normals = []
+        for b in range(B):
+            nearest_idx = idx[b].reshape(-1)
+            anchors.append(pc_clean[b][nearest_idx])
+            normals.append(clean_normals[b][nearest_idx])
+        anchors = jt.stack(anchors, dim=0).reshape(B, N, K, 3)
+        normals = jt.stack(normals, dim=0).reshape(B, N, K, 3)
+        plane = (((pc_candidates - anchors) * normals).sum(dim=-1) ** 2.0)
+        point = ((pc_candidates - anchors) ** 2.0).sum(dim=-1)
+        normal_alignment = 1.0 - jt.abs(
+            (candidate_normals * normals).sum(dim=-1)
+        )
+        return point + plane, point, plane, normal_alignment
+
+    def get_multi_candidate_losses(
+        self,
+        pc_noisy,
+        pc_clean,
+        candidate_displacements,
+        candidate_normals,
+        candidate_logits,
+        sigma=None,
+        hard_weight=None,
+    ):
+        pc_candidates = pc_noisy.unsqueeze(2) + candidate_displacements
+        score, point_loss, plane_loss, normal_loss = self.get_candidate_surface_scores(
+            pc_candidates=pc_candidates,
+            candidate_normals=candidate_normals,
+            pc_clean=pc_clean,
+        )
+        selected_pred, selected_idx = self.select_candidate_by_score(
+            pc_candidates,
+            score,
+        )
+        confidence_target = selected_idx.stop_grad().int32()
+        confidence_loss = nn.cross_entropy_loss(
+            candidate_logits.reshape(-1, self.multi_surface_candidate_count),
+            confidence_target.reshape(-1),
+        )
+
+        best_score = self.gather_candidate_values(score, selected_idx)
+        best_normal = self.gather_candidate_values(normal_loss, selected_idx)
+        sigma2 = self._loss_sigma2(sigma, pc_noisy.shape[0])
+        candidate_surface_loss = score.mean(dim=2).mean(dim=1) / sigma2
+        candidate_normal_loss = best_normal.mean(dim=1)
+        if hard_weight is not None:
+            weight = hard_weight.reshape(pc_noisy.shape[0])
+            candidate_surface_loss = candidate_surface_loss * weight
+            candidate_normal_loss = candidate_normal_loss * weight
+
+        if self.multi_surface_candidate_count > 1:
+            diff = (
+                pc_candidates.unsqueeze(3)
+                - pc_candidates.unsqueeze(2)
+            )
+            distance = jt.sqrt((diff ** 2.0).sum(dim=-1) + 1e-8)
+            eye = jt.array(
+                np.eye(
+                    self.multi_surface_candidate_count,
+                    dtype=np.float32,
+                )
+            ).reshape(
+                1,
+                1,
+                self.multi_surface_candidate_count,
+                self.multi_surface_candidate_count,
+            )
+            off_diag = 1.0 - eye
+            diversity = (
+                jt.maximum(self.candidate_diversity_margin - distance, 0.0)
+                ** 2.0
+            )
+            diversity = (diversity * off_diag).sum(dim=3).sum(dim=2) / max(
+                self.multi_surface_candidate_count
+                * (self.multi_surface_candidate_count - 1),
+                1,
+            )
+            if hard_weight is not None:
+                diversity = diversity * hard_weight.reshape(pc_noisy.shape[0])
+            diversity_loss = diversity.mean()
+        else:
+            diversity_loss = jt.array(0.0)
+
+        selected_by_logits, _ = self.select_candidate_by_logits(
+            pc_candidates,
+            candidate_logits,
+        )
+        return {
+            "selected_prediction": selected_pred,
+            "confidence_prediction": selected_by_logits,
+            "candidate_surface_loss": candidate_surface_loss.mean(),
+            "candidate_normal_loss": candidate_normal_loss.mean(),
+            "candidate_diversity_loss": diversity_loss,
+            "candidate_confidence_loss": confidence_loss,
+            "candidate_best_score": best_score.mean(),
+            "candidate_best_plane": self.gather_candidate_values(
+                plane_loss,
+                selected_idx,
+            ).mean(),
+            "candidate_best_point": self.gather_candidate_values(
+                point_loss,
+                selected_idx,
+            ).mean(),
+            "candidate_mean_entropy": (
+                -(
+                    nn.softmax(candidate_logits, dim=-1)
+                    * jt.log(nn.softmax(candidate_logits, dim=-1) + 1e-8)
+                ).sum(dim=-1).mean()
+            ),
+        }
 
     def predict_confidence(self, pc_noisy, sigma=None, point_idx=None):
         B = pc_noisy.shape[0]

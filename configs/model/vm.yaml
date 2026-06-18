@@ -44,6 +44,14 @@ hard_chamfer_weight: 0.08
 hard_normal_weight: 0.02
 use_surface_aligned_loss: true
 surface_normal_k: 3
+use_surface_threshold_loss: true
+surface_threshold_k: 96
+surface_threshold_total_quantile: 0.90
+surface_threshold_total_fraction: 0.25
+surface_threshold_single_quantile: 0.25
+surface_threshold_single_factor: 1.10
+surface_threshold_min: 0.004
+surface_threshold_extra_weight: 8.0
 edm_sampler: heun
 edm_sigma_min: 0.0001
 edm_sigma_max: 0.025

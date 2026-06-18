@@ -1020,6 +1020,7 @@ class ShapeContextVelocityModule(VelocityModule):
         region_centers,
         point_idx=None,
         encoded_shape=None,
+        return_candidates=False,
     ):
         if encoded_shape is None:
             encoded_shape = self.encode_shape(
@@ -1034,9 +1035,26 @@ class ShapeContextVelocityModule(VelocityModule):
             region_centers,
             point_idx=point_idx,
         )
+        if self.use_multi_surface_candidates:
+            displacement, normal, logits = self.decode_multi_surface_candidates(
+                feature
+            )
+            selected, _ = self.select_candidate_by_logits(
+                displacement,
+                logits,
+            )
+            if return_candidates:
+                return selected, gate, {
+                    "displacements": displacement,
+                    "normals": normal,
+                    "logits": logits,
+                }
+            return selected, gate
         displacement = self.decoder(
             feature.reshape(-1, feature.shape[-1])
         ).reshape(feature.shape[0], feature.shape[1], 3)
+        if return_candidates:
+            return displacement, gate, None
         return displacement, gate
 
     def training_step(self, batch: Dict) -> Dict:
@@ -1057,12 +1075,13 @@ class ShapeContextVelocityModule(VelocityModule):
                 pc_noisy.shape[1],
                 self.num_train_points,
             )
-        prediction, gate = self.predict_displacement_context(
+        prediction, gate, candidate_info = self.predict_displacement_context(
             pc_noisy,
             patch_seed,
             region_points,
             region_centers,
             point_idx=point_idx,
+            return_candidates=True,
         )
         target = pc_clean - pc_noisy
         noisy_for_loss = pc_noisy
@@ -1105,6 +1124,71 @@ class ShapeContextVelocityModule(VelocityModule):
             "train_pred_len": pred_len.mean(),
             "train_target_len": target_len.mean(),
         }
+        if self.use_multi_surface_candidates and candidate_info is not None:
+            candidate_losses = self.get_multi_candidate_losses(
+                pc_noisy=noisy_for_loss,
+                pc_clean=clean_for_loss,
+                candidate_displacements=candidate_info["displacements"],
+                candidate_normals=candidate_info["normals"],
+                candidate_logits=candidate_info["logits"],
+                sigma=None,
+            )
+            oracle_prediction = candidate_losses["selected_prediction"]
+            confidence_prediction = candidate_losses["confidence_prediction"]
+            oracle_displacement = oracle_prediction - noisy_for_loss
+            confidence_displacement = confidence_prediction - noisy_for_loss
+            prediction = oracle_displacement
+            pred_len = jt.sqrt((prediction ** 2.0).sum(dim=-1) + 1e-8)
+            cosine = (prediction * target).sum(dim=-1) / (
+                pred_len * target_len + 1e-8
+            )
+            losses["displacement_loss"] = (
+                ((prediction - target) ** 2.0) / self.dsm_sigma
+            ).sum(dim=-1).mean()
+            losses["normalized_surface_loss"] = self.get_normalized_surface_loss(
+                pc_pred=oracle_prediction,
+                pc_clean=pc_clean,
+                pc_anchor=clean_for_loss,
+            )
+            losses["train_length_ratio"] = pred_len.mean() / (
+                target_len.mean() + 1e-8
+            )
+            losses["train_cosine"] = cosine.mean()
+            losses["train_negative_cos_rate"] = (cosine < 0.0).float().mean()
+            losses["train_pred_len"] = pred_len.mean()
+            losses.update(
+                {
+                    "candidate_surface_loss": candidate_losses[
+                        "candidate_surface_loss"
+                    ],
+                    "candidate_normal_loss": candidate_losses[
+                        "candidate_normal_loss"
+                    ],
+                    "candidate_diversity_loss": candidate_losses[
+                        "candidate_diversity_loss"
+                    ],
+                    "candidate_confidence_loss": candidate_losses[
+                        "candidate_confidence_loss"
+                    ],
+                    "candidate_best_score": candidate_losses[
+                        "candidate_best_score"
+                    ],
+                    "candidate_best_plane": candidate_losses[
+                        "candidate_best_plane"
+                    ],
+                    "candidate_best_point": candidate_losses[
+                        "candidate_best_point"
+                    ],
+                    "candidate_mean_entropy": candidate_losses[
+                        "candidate_mean_entropy"
+                    ],
+                    "candidate_confidence_displacement_loss": (
+                        (
+                            (confidence_displacement - target) ** 2.0
+                        ) / self.dsm_sigma
+                    ).sum(dim=-1).mean(),
+                }
+            )
         if self.use_surface_aligned_loss:
             losses.update(
                 self.get_surface_aligned_losses(

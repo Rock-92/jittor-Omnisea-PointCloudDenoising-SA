@@ -5,6 +5,15 @@ loss:
   clean_coverage_loss: 0.0
   patch_chamfer_loss: 1.0
   nearest_surface_loss: 1.0
+  candidate_surface_loss: 0.15
+  candidate_normal_loss: 0.03
+  candidate_diversity_loss: 0.02
+  candidate_confidence_loss: 0.08
+  candidate_best_score: 0.0
+  candidate_best_plane: 0.0
+  candidate_best_point: 0.0
+  candidate_mean_entropy: 0.0
+  candidate_confidence_displacement_loss: 0.0
   region_context_gate: 0.0
   region_crease_mean: 0.0
   region_prior_delta: 0.0

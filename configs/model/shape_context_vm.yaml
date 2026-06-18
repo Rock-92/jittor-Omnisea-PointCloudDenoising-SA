@@ -23,6 +23,16 @@ use_hard_aware_loss: false
 use_length_projection_loss: false
 use_surface_aligned_loss: true
 surface_normal_k: 3
+use_surface_threshold_loss: true
+surface_threshold_k: 96
+surface_threshold_total_quantile: 0.90
+surface_threshold_total_fraction: 0.25
+surface_threshold_single_quantile: 0.25
+surface_threshold_single_factor: 1.10
+surface_threshold_min: 0.004
+surface_threshold_extra_weight: 8.0
+multi_surface_candidate_count: 4
+candidate_diversity_margin: 0.006
 
 # Complete-shape processor. Only region tokens condition the denoiser; the
 # processor's shape-global output is not computed or injected.
