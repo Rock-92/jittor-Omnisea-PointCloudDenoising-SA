@@ -2,6 +2,6 @@ __target__: vm_ssl
 
 ckpt_save_dir: outputs/checkpoints/vm_ssl
 ckpt_save_name: checkpoint
-ssl_pretrained_ckpt: null
+ssl_pretrained_ckpt: outputs/checkpoints/global_token_ssl/checkpoint_best.pkl
 freeze_global_epochs: 0
 global_lr_scale: 1.0
