@@ -40,6 +40,9 @@ tools/*
 !tools/overfit_fusion_aware_stage2.py
 !tools/probe_clean_shape_context_vm.py
 !tools/probe_shape_context_memorization.py
+!tools/diagnose_outputs0618_3_low_patch_planes.py
+!tools/probe_outputs0618_3_surface_losses.py
+!tools/cluster_shape_surfaces.py
 !scripts/cache_shape_regions.py
 
 # Datasets and ground truth
