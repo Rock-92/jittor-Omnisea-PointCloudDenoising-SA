@@ -83,34 +83,11 @@ class VelocityModule(ModelSpec):
             False,
         )
         self.surface_normal_k = int(cfg.get('surface_normal_k', 3))
-        self.use_surface_threshold_loss = bool(
-            cfg.get('use_surface_threshold_loss', False)
+        self.use_surface_snap_loss = bool(
+            cfg.get('use_surface_snap_loss', False)
         )
-        self.surface_threshold_k = int(cfg.get('surface_threshold_k', 96))
-        self.surface_threshold_total_quantile = float(
-            cfg.get('surface_threshold_total_quantile', 0.90)
-        )
-        self.surface_threshold_total_fraction = float(
-            cfg.get('surface_threshold_total_fraction', 0.25)
-        )
-        self.surface_threshold_single_quantile = float(
-            cfg.get('surface_threshold_single_quantile', 0.25)
-        )
-        self.surface_threshold_single_factor = float(
-            cfg.get('surface_threshold_single_factor', 1.10)
-        )
-        self.surface_threshold_min = float(
-            cfg.get('surface_threshold_min', 0.004)
-        )
-        self.surface_threshold_extra_weight = float(
-            cfg.get('surface_threshold_extra_weight', 8.0)
-        )
-        self.surface_threshold_beta = float(
-            cfg.get('surface_threshold_beta', 1000.0)
-        )
-        self.surface_threshold_power = float(
-            cfg.get('surface_threshold_power', 4.0)
-        )
+        self.surface_snap_tau = float(cfg.get('surface_snap_tau', 0.001))
+        self.surface_snap_weight = float(cfg.get('surface_snap_weight', 3.0))
         
         # patch-based prediction
         self.predict_rounds = cfg.get('predict_rounds', 1)
@@ -364,11 +341,8 @@ class VelocityModule(ModelSpec):
         )
         return pred_loss + cover_loss
 
-    def get_clean_point_normals(self, pc_clean, return_neighbors=False):
-        k = max(self.surface_normal_k, 3)
-        if return_neighbors and self.use_surface_threshold_loss:
-            k = max(k, self.surface_threshold_k)
-        k = min(k, pc_clean.shape[1])
+    def get_clean_point_normals(self, pc_clean):
+        k = min(max(self.surface_normal_k, 3), pc_clean.shape[1])
         dist = ((pc_clean.unsqueeze(2) - pc_clean.unsqueeze(1)) ** 2.0).sum(dim=-1)
         _, idx = jt.topk(dist, k=k, dim=-1, largest=False)
         neighbors = []
@@ -392,51 +366,7 @@ class VelocityModule(ModelSpec):
         normal = normal / jt.sqrt(
             (normal ** 2.0).sum(dim=-1, keepdims=True) + 1e-8
         )
-        if return_neighbors:
-            return normal, neighbors
         return normal
-
-    def get_surface_distance_thresholds(self, pc_clean, clean_normals, clean_neighbors):
-        neighbor_count = clean_neighbors.shape[2]
-        if neighbor_count <= 1:
-            return jt.ones((pc_clean.shape[0], pc_clean.shape[1])) * self.surface_threshold_min
-
-        offsets = (
-            (clean_neighbors - pc_clean.unsqueeze(2))
-            * clean_normals.unsqueeze(2)
-        ).sum(dim=-1)
-        abs_offsets = jt.sqrt(offsets ** 2.0 + 1e-12)
-
-        single_count = max(
-            2,
-            int(round(neighbor_count * self.surface_threshold_single_quantile)),
-        )
-        single_count = min(single_count, neighbor_count)
-        total_count = max(
-            single_count,
-            int(round(neighbor_count * self.surface_threshold_total_quantile)),
-        )
-        total_count = min(total_count, neighbor_count)
-
-        single_values, _ = jt.topk(
-            abs_offsets,
-            k=single_count,
-            dim=-1,
-            largest=False,
-        )
-        total_values, _ = jt.topk(
-            abs_offsets,
-            k=total_count,
-            dim=-1,
-            largest=False,
-        )
-        single_thickness = single_values.max(dim=-1)
-        total_thickness = total_values.max(dim=-1)
-
-        single_threshold = single_thickness * self.surface_threshold_single_factor
-        total_threshold = total_thickness * self.surface_threshold_total_fraction
-        threshold = jt.maximum(single_threshold, total_threshold)
-        return jt.maximum(threshold, self.surface_threshold_min)
 
     def get_nearest_surface_loss(
         self,
@@ -447,42 +377,23 @@ class VelocityModule(ModelSpec):
     ):
         dist = ((pc_pred.unsqueeze(2) - pc_clean.unsqueeze(1)) ** 2.0).sum(dim=-1)
         _, idx = jt.topk(dist, k=1, dim=2, largest=False)
-        if self.use_surface_threshold_loss:
-            clean_normals, clean_neighbors = self.get_clean_point_normals(
-                pc_clean,
-                return_neighbors=True,
-            )
-            clean_thresholds = self.get_surface_distance_thresholds(
-                pc_clean,
-                clean_normals,
-                clean_neighbors,
-            )
-        else:
-            clean_normals = self.get_clean_point_normals(pc_clean)
-            clean_thresholds = None
+        clean_normals = self.get_clean_point_normals(pc_clean)
         anchors = []
         normals = []
-        thresholds = []
         for b in range(pc_pred.shape[0]):
             nearest_idx = idx[b].reshape(-1)
             anchors.append(pc_clean[b][nearest_idx])
             normals.append(clean_normals[b][nearest_idx])
-            if clean_thresholds is not None:
-                thresholds.append(clean_thresholds[b][nearest_idx])
         anchors = jt.stack(anchors, dim=0)
         normals = jt.stack(normals, dim=0)
         signed_plane_dist = ((pc_pred - anchors) * normals).sum(dim=-1)
         plane_dist = signed_plane_dist ** 2.0
-        if clean_thresholds is not None:
-            thresholds = jt.stack(thresholds, dim=0)
-            beta = max(self.surface_threshold_beta, 1e-6)
-            abs_plane_dist = jt.sqrt(plane_dist + 1e-12)
-            soft_excess = nn.softplus(
-                beta * (abs_plane_dist - thresholds)
-            ) / beta
-            plane_dist = plane_dist + self.surface_threshold_extra_weight * (
-                soft_excess ** self.surface_threshold_power
-            ) / jt.maximum(thresholds ** 2.0, self.patch_scale_eps ** 2.0)
+        if self.use_surface_snap_loss and self.surface_snap_weight > 0.0:
+            tau = max(self.surface_snap_tau, self.patch_scale_eps)
+            tau2 = tau ** 2.0
+            plane_dist = plane_dist + self.surface_snap_weight * tau2 * jt.atan(
+                plane_dist / tau2
+            )
         sigma2 = self._loss_sigma2(sigma, pc_pred.shape[0])
         loss = plane_dist.mean(dim=1) / sigma2
         if hard_weight is not None:
