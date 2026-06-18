@@ -1137,6 +1137,14 @@ class ShapeContextVelocityModule(VelocityModule):
             confidence_prediction = candidate_losses["confidence_prediction"]
             oracle_displacement = oracle_prediction - noisy_for_loss
             confidence_displacement = confidence_prediction - noisy_for_loss
+            candidate_overlap_loss = self.get_candidate_overlap_loss(
+                pc_noisy=noisy_for_loss,
+                pc_candidates=(
+                    noisy_for_loss.unsqueeze(2)
+                    + candidate_info["displacements"]
+                ),
+                candidate_normals=candidate_info["normals"],
+            )
             prediction = oracle_displacement
             pred_len = jt.sqrt((prediction ** 2.0).sum(dim=-1) + 1e-8)
             cosine = (prediction * target).sum(dim=-1) / (
@@ -1170,6 +1178,7 @@ class ShapeContextVelocityModule(VelocityModule):
                     "candidate_confidence_loss": candidate_losses[
                         "candidate_confidence_loss"
                     ],
+                    "candidate_overlap_loss": candidate_overlap_loss,
                     "candidate_best_score": candidate_losses[
                         "candidate_best_score"
                     ],

@@ -108,6 +108,9 @@ class VelocityModule(ModelSpec):
         self.multi_surface_candidate_count = int(
             cfg.get('multi_surface_candidate_count', 1)
         )
+        self.multi_surface_displacement_scale = float(
+            cfg.get('multi_surface_displacement_scale', 0.25)
+        )
         self.candidate_surface_aux_weight = float(
             cfg.get('candidate_surface_aux_weight', 0.2)
         )
@@ -122,6 +125,15 @@ class VelocityModule(ModelSpec):
         )
         self.candidate_diversity_margin = float(
             cfg.get('candidate_diversity_margin', 0.004)
+        )
+        self.candidate_overlap_knn = int(
+            cfg.get('candidate_overlap_knn', 8)
+        )
+        self.candidate_overlap_top_m = int(
+            cfg.get('candidate_overlap_top_m', 2)
+        )
+        self.candidate_overlap_normal_weight = float(
+            cfg.get('candidate_overlap_normal_weight', 0.05)
         )
         self.use_multi_surface_candidates = (
             self.multi_surface_candidate_count > 1
@@ -613,7 +625,7 @@ class VelocityModule(ModelSpec):
             self.multi_surface_candidate_count,
             6,
         )
-        displacement = raw[:, :, :, :3]
+        displacement = raw[:, :, :, :3] * self.multi_surface_displacement_scale
         normal = raw[:, :, :, 3:]
         normal = normal / jt.sqrt(
             (normal ** 2.0).sum(dim=-1, keepdims=True) + 1e-8
@@ -769,6 +781,52 @@ class VelocityModule(ModelSpec):
                 ).sum(dim=-1).mean()
             ),
         }
+
+    def get_candidate_overlap_loss(
+        self,
+        pc_noisy,
+        pc_candidates,
+        candidate_normals,
+        hard_weight=None,
+    ):
+        B, N, K, _ = pc_candidates.shape
+        neighbor_k = min(max(1, self.candidate_overlap_knn), max(N - 1, 0))
+        if neighbor_k <= 0:
+            return jt.array(0.0)
+        top_m = min(max(1, self.candidate_overlap_top_m), K * K)
+        dist = ((pc_noisy.unsqueeze(2) - pc_noisy.unsqueeze(1)) ** 2.0).sum(dim=-1)
+        _, idx = jt.topk(dist, k=neighbor_k + 1, dim=-1, largest=False)
+        idx = idx[:, :, 1:]
+        neighbor_candidates = []
+        neighbor_normals = []
+        for b in range(B):
+            neighbor_candidates.append(pc_candidates[b][idx[b]])
+            neighbor_normals.append(candidate_normals[b][idx[b]])
+        neighbor_candidates = jt.stack(neighbor_candidates, dim=0)
+        neighbor_normals = jt.stack(neighbor_normals, dim=0)
+
+        center_candidates = pc_candidates.unsqueeze(2).unsqueeze(4)
+        center_normals = candidate_normals.unsqueeze(2).unsqueeze(4)
+        neighbor_candidates = neighbor_candidates.unsqueeze(3)
+        neighbor_normals = neighbor_normals.unsqueeze(3)
+
+        delta = neighbor_candidates - center_candidates
+        plane_ij = ((delta * center_normals).sum(dim=-1) ** 2.0)
+        plane_ji = ((delta * neighbor_normals).sum(dim=-1) ** 2.0)
+        normal_cost = 1.0 - jt.abs(
+            (center_normals * neighbor_normals).sum(dim=-1)
+        )
+        cost = (
+            plane_ij
+            + plane_ji
+            + self.candidate_overlap_normal_weight * normal_cost
+        )
+        cost = cost.reshape(B, N, neighbor_k, K * K)
+        best, _ = jt.topk(cost, k=top_m, dim=-1, largest=False)
+        overlap = best.mean(dim=-1).mean(dim=-1)
+        if hard_weight is not None:
+            overlap = overlap * hard_weight.reshape(B, 1)
+        return overlap.mean()
 
     def predict_confidence(self, pc_noisy, sigma=None, point_idx=None):
         B = pc_noisy.shape[0]

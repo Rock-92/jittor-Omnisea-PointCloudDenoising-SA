@@ -9,6 +9,7 @@ loss:
   candidate_normal_loss: 0.03
   candidate_diversity_loss: 0.02
   candidate_confidence_loss: 0.08
+  candidate_overlap_loss: 0.12
   candidate_best_score: 0.0
   candidate_best_plane: 0.0
   candidate_best_point: 0.0

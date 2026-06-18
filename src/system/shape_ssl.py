@@ -400,6 +400,9 @@ class ShapeContextVMSystem(VMSystem):
             "candidate_confidence_loss": mean_metric(
                 self._train_loss.get("train/candidate_confidence_loss", [])
             ),
+            "candidate_overlap_loss": mean_metric(
+                self._train_loss.get("train/candidate_overlap_loss", [])
+            ),
             "candidate_best_score": mean_metric(
                 self._train_loss.get("train/candidate_best_score", [])
             ),
@@ -439,6 +442,7 @@ class ShapeContextVMSystem(VMSystem):
             f"prior_delta={fmt('region_prior_delta')}, "
             f"cand_surf={fmt('candidate_surface_loss')}, "
             f"cand_conf={fmt('candidate_confidence_loss')}, "
+            f"cand_overlap={fmt('candidate_overlap_loss')}, "
             f"cand_ent={fmt('candidate_mean_entropy')}"
         )
 
