@@ -52,6 +52,8 @@ surface_threshold_single_quantile: 0.25
 surface_threshold_single_factor: 1.10
 surface_threshold_min: 0.004
 surface_threshold_extra_weight: 8.0
+surface_threshold_beta: 1000.0
+surface_threshold_power: 4.0
 edm_sampler: heun
 edm_sigma_min: 0.0001
 edm_sigma_max: 0.025

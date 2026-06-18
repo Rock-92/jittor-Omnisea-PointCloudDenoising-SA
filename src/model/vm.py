@@ -105,6 +105,12 @@ class VelocityModule(ModelSpec):
         self.surface_threshold_extra_weight = float(
             cfg.get('surface_threshold_extra_weight', 8.0)
         )
+        self.surface_threshold_beta = float(
+            cfg.get('surface_threshold_beta', 1000.0)
+        )
+        self.surface_threshold_power = float(
+            cfg.get('surface_threshold_power', 4.0)
+        )
         
         # patch-based prediction
         self.predict_rounds = cfg.get('predict_rounds', 1)
@@ -469,11 +475,14 @@ class VelocityModule(ModelSpec):
         plane_dist = signed_plane_dist ** 2.0
         if clean_thresholds is not None:
             thresholds = jt.stack(thresholds, dim=0)
-            threshold2 = thresholds ** 2.0
-            extra = jt.maximum(plane_dist - threshold2, 0.0)
+            beta = max(self.surface_threshold_beta, 1e-6)
+            abs_plane_dist = jt.sqrt(plane_dist + 1e-12)
+            soft_excess = nn.softplus(
+                beta * (abs_plane_dist - thresholds)
+            ) / beta
             plane_dist = plane_dist + self.surface_threshold_extra_weight * (
-                extra ** 2.0
-            ) / jt.maximum(threshold2, self.patch_scale_eps ** 2.0)
+                soft_excess ** self.surface_threshold_power
+            ) / jt.maximum(thresholds ** 2.0, self.patch_scale_eps ** 2.0)
         sigma2 = self._loss_sigma2(sigma, pc_pred.shape[0])
         loss = plane_dist.mean(dim=1) / sigma2
         if hard_weight is not None:

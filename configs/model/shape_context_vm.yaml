@@ -31,6 +31,8 @@ surface_threshold_single_quantile: 0.25
 surface_threshold_single_factor: 1.10
 surface_threshold_min: 0.004
 surface_threshold_extra_weight: 8.0
+surface_threshold_beta: 1000.0
+surface_threshold_power: 4.0
 
 # Complete-shape processor. Only region tokens condition the denoiser; the
 # processor's shape-global output is not computed or injected.
