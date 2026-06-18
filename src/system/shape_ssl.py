@@ -329,11 +329,6 @@ class ShapeContextVMSystem(VMSystem):
             return float(_get_item(item))
 
         return {
-            "ratio": f"{value('train_length_ratio'):.3f}",
-            "cos": f"{value('train_cosine'):.3f}",
-            "neg": f"{value('train_negative_cos_rate'):.2f}",
-            "pred": f"{value('train_pred_len'):.4f}",
-            "tgt": f"{value('train_target_len'):.4f}",
             "gate": f"{value('region_context_gate'):.3f}",
             "crease": f"{value('region_crease_mean'):.3f}",
             "prior": f"{value('region_prior_delta'):.3f}",
@@ -355,15 +350,6 @@ class ShapeContextVMSystem(VMSystem):
             "epoch": epoch,
             "lr": get_optimizer_lr(self.optimizer),
             "train_loss": train_loss,
-            "train_displacement_loss": mean_metric(
-                self._train_loss.get("train/displacement_loss", [])
-            ),
-            "train_surface_loss": mean_metric(
-                self._train_loss.get(
-                    "train/normalized_surface_loss",
-                    [],
-                )
-            ),
             "region_context_gate": mean_metric(
                 self._train_loss.get("train/region_context_gate", [])
             ),
@@ -372,21 +358,6 @@ class ShapeContextVMSystem(VMSystem):
             ),
             "region_prior_delta": mean_metric(
                 self._train_loss.get("train/region_prior_delta", [])
-            ),
-            "train_length_ratio": mean_metric(
-                self._train_loss.get("train/train_length_ratio", [])
-            ),
-            "train_cosine": mean_metric(
-                self._train_loss.get("train/train_cosine", [])
-            ),
-            "train_negative_cos_rate": mean_metric(
-                self._train_loss.get("train/train_negative_cos_rate", [])
-            ),
-            "train_pred_len": mean_metric(
-                self._train_loss.get("train/train_pred_len", [])
-            ),
-            "train_target_len": mean_metric(
-                self._train_loss.get("train/train_target_len", [])
             ),
             "val_loss": validation_loss,
             "cd_score": score_summary.get("cd_score"),
@@ -411,11 +382,6 @@ class ShapeContextVMSystem(VMSystem):
 
         print(
             "Shape-context train diagnostics: "
-            f"ratio={fmt('train_length_ratio')}, "
-            f"cos={fmt('train_cosine')}, "
-            f"neg={fmt('train_negative_cos_rate')}, "
-            f"pred_len={fmt('train_pred_len', 5)}, "
-            f"target_len={fmt('train_target_len', 5)}, "
             f"gate={fmt('region_context_gate')}, "
             f"crease={fmt('region_crease_mean')}, "
             f"prior_delta={fmt('region_prior_delta')}"

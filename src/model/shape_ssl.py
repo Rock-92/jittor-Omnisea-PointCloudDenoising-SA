@@ -1064,29 +1064,12 @@ class ShapeContextVelocityModule(VelocityModule):
             region_centers,
             point_idx=point_idx,
         )
-        target = pc_clean - pc_noisy
         noisy_for_loss = pc_noisy
         clean_for_loss = pc_clean
         if point_idx is not None:
-            target = target[:, point_idx, :]
             noisy_for_loss = pc_noisy[:, point_idx, :]
             clean_for_loss = pc_clean[:, point_idx, :]
-        displacement_loss = (
-            ((prediction - target) ** 2.0) / self.dsm_sigma
-        ).sum(dim=-1).mean()
-        pred_len = jt.sqrt((prediction ** 2.0).sum(dim=-1) + 1e-8)
-        target_len = jt.sqrt((target ** 2.0).sum(dim=-1) + 1e-8)
-        cosine = (prediction * target).sum(dim=-1) / (
-            pred_len * target_len + 1e-8
-        )
-        surface_loss = self.get_normalized_surface_loss(
-            pc_pred=noisy_for_loss + prediction,
-            pc_clean=pc_clean,
-            pc_anchor=clean_for_loss,
-        )
         losses = {
-            "displacement_loss": displacement_loss,
-            "normalized_surface_loss": surface_loss,
             "region_context_gate": gate,
             "region_crease_mean": getattr(
                 self,
@@ -1098,12 +1081,6 @@ class ShapeContextVelocityModule(VelocityModule):
                 "_last_region_prior_delta",
                 jt.array(0.0),
             ),
-            "train_length_ratio": pred_len.mean()
-            / (target_len.mean() + 1e-8),
-            "train_cosine": cosine.mean(),
-            "train_negative_cos_rate": (cosine < 0.0).float().mean(),
-            "train_pred_len": pred_len.mean(),
-            "train_target_len": target_len.mean(),
         }
         if self.use_surface_aligned_loss:
             losses.update(
