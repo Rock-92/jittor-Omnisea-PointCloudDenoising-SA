@@ -21,6 +21,8 @@ use_edm: false
 use_edgeconv_branch: false
 use_hard_aware_loss: false
 use_length_projection_loss: false
+use_surface_aligned_loss: true
+surface_normal_k: 3
 
 # Complete-shape processor. Only region tokens condition the denoiser; the
 # processor's shape-global output is not computed or injected.

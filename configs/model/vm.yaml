@@ -42,6 +42,8 @@ use_length_projection_loss: false
 length_projection_over_weight: 0.25
 hard_chamfer_weight: 0.08
 hard_normal_weight: 0.02
+use_surface_aligned_loss: true
+surface_normal_k: 3
 edm_sampler: heun
 edm_sigma_min: 0.0001
 edm_sigma_max: 0.025

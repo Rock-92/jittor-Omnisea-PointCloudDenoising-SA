@@ -78,6 +78,11 @@ class VelocityModule(ModelSpec):
         )
         self.hard_chamfer_weight = float(cfg.get('hard_chamfer_weight', 0.05))
         self.hard_normal_weight = float(cfg.get('hard_normal_weight', 0.02))
+        self.use_surface_aligned_loss = cfg.get(
+            'use_surface_aligned_loss',
+            False,
+        )
+        self.surface_normal_k = int(cfg.get('surface_normal_k', 3))
         
         # patch-based prediction
         self.predict_rounds = cfg.get('predict_rounds', 1)
@@ -292,15 +297,123 @@ class VelocityModule(ModelSpec):
             weight = jt.maximum(scale_weight, geometry_weight)
         return jt.minimum(weight, self.hard_weight_max)
 
-    def get_patch_chamfer_loss(self, pc_pred, pc_clean, sigma, hard_weight=None):
+    def _loss_sigma2(self, sigma, batch_size):
+        if sigma is None:
+            sigma = jt.ones((batch_size, 1)) * float(self.dsm_sigma)
+        else:
+            sigma = self._expand_sigma(sigma, batch_size)
+        sigma = self.clamp_edm_sigma(sigma)
+        return jt.maximum(
+            sigma.reshape(batch_size) ** 2.0,
+            self.patch_scale_eps ** 2.0,
+        )
+
+    def get_patch_chamfer_components(
+        self,
+        pc_pred,
+        pc_clean,
+        sigma=None,
+        hard_weight=None,
+    ):
         dist = ((pc_pred.unsqueeze(2) - pc_clean.unsqueeze(1)) ** 2.0).sum(dim=-1)
         pred_to_clean = dist.min(dim=2)
         clean_to_pred = dist.min(dim=1)
-        sigma2 = self.clamp_edm_sigma(sigma).reshape(pc_pred.shape[0]) ** 2.0
-        loss = (pred_to_clean.mean(dim=1) + clean_to_pred.mean(dim=1)) / sigma2
+        sigma2 = self._loss_sigma2(sigma, pc_pred.shape[0])
+        pred_loss = pred_to_clean.mean(dim=1) / sigma2
+        cover_loss = clean_to_pred.mean(dim=1) / sigma2
+        if hard_weight is not None:
+            weight = hard_weight.reshape(pc_pred.shape[0])
+            pred_loss = pred_loss * weight
+            cover_loss = cover_loss * weight
+        return pred_loss.mean(), cover_loss.mean()
+
+    def get_patch_chamfer_loss(self, pc_pred, pc_clean, sigma=None, hard_weight=None):
+        pred_loss, cover_loss = self.get_patch_chamfer_components(
+            pc_pred=pc_pred,
+            pc_clean=pc_clean,
+            sigma=sigma,
+            hard_weight=hard_weight,
+        )
+        return pred_loss + cover_loss
+
+    def get_clean_point_normals(self, pc_clean):
+        k = min(max(self.surface_normal_k, 3), pc_clean.shape[1])
+        dist = ((pc_clean.unsqueeze(2) - pc_clean.unsqueeze(1)) ** 2.0).sum(dim=-1)
+        _, idx = jt.topk(dist, k=k, dim=-1, largest=False)
+        neighbors = []
+        for b in range(pc_clean.shape[0]):
+            neighbors.append(pc_clean[b][idx[b]])
+        neighbors = jt.stack(neighbors, dim=0)
+
+        p0 = pc_clean
+        p1 = neighbors[:, :, 1, :]
+        p2 = neighbors[:, :, 2, :]
+        v1 = p1 - p0
+        v2 = p2 - p0
+        normal = jt.stack(
+            [
+                v1[:, :, 1] * v2[:, :, 2] - v1[:, :, 2] * v2[:, :, 1],
+                v1[:, :, 2] * v2[:, :, 0] - v1[:, :, 0] * v2[:, :, 2],
+                v1[:, :, 0] * v2[:, :, 1] - v1[:, :, 1] * v2[:, :, 0],
+            ],
+            dim=-1,
+        )
+        normal = normal / jt.sqrt(
+            (normal ** 2.0).sum(dim=-1, keepdims=True) + 1e-8
+        )
+        return normal
+
+    def get_nearest_surface_loss(
+        self,
+        pc_pred,
+        pc_clean,
+        sigma=None,
+        hard_weight=None,
+    ):
+        dist = ((pc_pred.unsqueeze(2) - pc_clean.unsqueeze(1)) ** 2.0).sum(dim=-1)
+        _, idx = jt.topk(dist, k=1, dim=2, largest=False)
+        clean_normals = self.get_clean_point_normals(pc_clean)
+        anchors = []
+        normals = []
+        for b in range(pc_pred.shape[0]):
+            nearest_idx = idx[b].reshape(-1)
+            anchors.append(pc_clean[b][nearest_idx])
+            normals.append(clean_normals[b][nearest_idx])
+        anchors = jt.stack(anchors, dim=0)
+        normals = jt.stack(normals, dim=0)
+        plane_dist = (((pc_pred - anchors) * normals).sum(dim=-1) ** 2.0)
+        sigma2 = self._loss_sigma2(sigma, pc_pred.shape[0])
+        loss = plane_dist.mean(dim=1) / sigma2
         if hard_weight is not None:
             loss = loss * hard_weight.reshape(pc_pred.shape[0])
         return loss.mean()
+
+    def get_surface_aligned_losses(
+        self,
+        pc_pred,
+        pc_clean,
+        sigma=None,
+        hard_weight=None,
+    ):
+        nearest_clean_loss, clean_coverage_loss = self.get_patch_chamfer_components(
+            pc_pred=pc_pred,
+            pc_clean=pc_clean,
+            sigma=sigma,
+            hard_weight=hard_weight,
+        )
+        patch_chamfer_loss = nearest_clean_loss + clean_coverage_loss
+        nearest_surface_loss = self.get_nearest_surface_loss(
+            pc_pred=pc_pred,
+            pc_clean=pc_clean,
+            sigma=sigma,
+            hard_weight=hard_weight,
+        )
+        return {
+            "nearest_clean_loss": nearest_clean_loss,
+            "clean_coverage_loss": clean_coverage_loss,
+            "patch_chamfer_loss": patch_chamfer_loss,
+            "nearest_surface_loss": nearest_surface_loss,
+        }
 
     def get_length_projection_loss(
         self,
@@ -461,7 +574,9 @@ class VelocityModule(ModelSpec):
         B = pc_noisy.shape[0]
         score_sigma = self._expand_sigma(score_sigma, B)
         target = pc_clean - pc_noisy
-        point_idx = get_random_indices(pc_noisy.shape[1], self.num_train_points)
+        point_idx = None
+        if not self.use_surface_aligned_loss:
+            point_idx = get_random_indices(pc_noisy.shape[1], self.num_train_points)
         pc_noisy_for_loss = pc_noisy
         pc_clean_for_loss = pc_clean
         if point_idx is not None:
@@ -494,6 +609,15 @@ class VelocityModule(ModelSpec):
             losses = {
                 "displacement_loss": displacement_loss,
             }
+            if self.use_surface_aligned_loss:
+                losses.update(
+                    self.get_surface_aligned_losses(
+                        pc_pred=pc_pred,
+                        pc_clean=pc_clean_for_loss,
+                        sigma=score_sigma,
+                        hard_weight=hard_weight,
+                    )
+                )
             if self.use_hard_aware_loss and self.hard_chamfer_weight > 0:
                 losses["patch_chamfer_loss"] = self.get_patch_chamfer_loss(
                     pc_pred=pc_pred,
@@ -534,11 +658,20 @@ class VelocityModule(ModelSpec):
             pc_clean=pc_clean,
             pc_anchor=pc_clean_for_loss,
         )
-        
-        return {
+
+        losses = {
             "displacement_loss": displacement_loss,
             "normalized_surface_loss": normalized_surface_loss,
         }
+        if self.use_surface_aligned_loss:
+            losses.update(
+                self.get_surface_aligned_losses(
+                    pc_pred=pc_noisy_for_loss + pred_dir,
+                    pc_clean=pc_clean_for_loss,
+                    sigma=score_sigma,
+                )
+            )
+        return losses
 
     def denoise_langevin_dynamics(self, pcl_noisy, num_steps=None):
         """

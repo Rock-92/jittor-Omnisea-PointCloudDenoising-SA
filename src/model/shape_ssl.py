@@ -1051,10 +1051,12 @@ class ShapeContextVelocityModule(VelocityModule):
                 "shape-context training currently requires one patch per shape"
             )
 
-        point_idx = get_random_indices(
-            pc_noisy.shape[1],
-            self.num_train_points,
-        )
+        point_idx = None
+        if not self.use_surface_aligned_loss:
+            point_idx = get_random_indices(
+                pc_noisy.shape[1],
+                self.num_train_points,
+            )
         prediction, gate = self.predict_displacement_context(
             pc_noisy,
             patch_seed,
@@ -1082,7 +1084,7 @@ class ShapeContextVelocityModule(VelocityModule):
             pc_clean=pc_clean,
             pc_anchor=clean_for_loss,
         )
-        return {
+        losses = {
             "displacement_loss": displacement_loss,
             "normalized_surface_loss": surface_loss,
             "region_context_gate": gate,
@@ -1103,6 +1105,15 @@ class ShapeContextVelocityModule(VelocityModule):
             "train_pred_len": pred_len.mean(),
             "train_target_len": target_len.mean(),
         }
+        if self.use_surface_aligned_loss:
+            losses.update(
+                self.get_surface_aligned_losses(
+                    pc_pred=noisy_for_loss + prediction,
+                    pc_clean=clean_for_loss,
+                    sigma=None,
+                )
+            )
+        return losses
 
     def process_fn(self, batch: List[Asset]) -> List[Dict]:
         result = []

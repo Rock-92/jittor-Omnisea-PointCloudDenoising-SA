@@ -1,5 +1,13 @@
 loss:
-  displacement_loss: 1.0
+  displacement_loss: 0.0
+  nearest_clean_loss: 0.0
+  clean_coverage_loss: 0.0
+  patch_chamfer_loss: 1.0
+  nearest_surface_loss: 1.0
+  normalized_surface_loss: 0.0
+  length_projection_loss: 0.0
+  sigma_loss: 0.0
+  hard_normal_loss: 0.0
 
 optimizer:
   __target__: adam
