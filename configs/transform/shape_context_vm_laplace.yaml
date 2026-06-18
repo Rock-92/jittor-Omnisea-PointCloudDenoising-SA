@@ -1,8 +1,10 @@
 train_transform:
   augments:
-    - __target__: sample
-      num_samples: 32768
     - __target__: normalize_pc
+    - __target__: surface_branch_cache
+      cache_root: cache_surface_branches
+      cache_name: surface_branches.npz
+      required: false
     - __target__: add_noise
       noise_std_min: 0.005
       noise_std_max: 0.020
@@ -13,9 +15,11 @@ train_transform:
 
 validate_transform:
   augments:
-    - __target__: sample
-      num_samples: 32768
     - __target__: normalize_pc
+    - __target__: surface_branch_cache
+      cache_root: cache_surface_branches
+      cache_name: surface_branches.npz
+      required: false
     - __target__: add_noise
       noise_std_min: 0.005
       noise_std_max: 0.020

@@ -31,6 +31,11 @@ surface_coherence_k: 8
 surface_coherence_cos: 0.5
 surface_coherence_center_cos: 0.5
 surface_outlier_margin: 0.001
+use_surface_branch_loss: true
+surface_branch_tau: 0.001
+surface_branch_min_valid: 0.5
+surface_branch_separation_k: 8
+surface_branch_separation_margin: 0.8
 
 # Complete-shape processor. Only region tokens condition the denoiser; the
 # processor's shape-global output is not computed or injected.

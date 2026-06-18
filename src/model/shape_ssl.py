@@ -1046,6 +1046,15 @@ class ShapeContextVelocityModule(VelocityModule):
         patch_seed = batch["patch_seed"].reshape(-1, 1, 3)
         region_points = batch["shape_region_points"]
         region_centers = batch["shape_region_centers"]
+        branch_label = batch.get("pc_branch_label")
+        branch_valid = batch.get("pc_branch_valid")
+        branch_normal = batch.get("pc_branch_normal")
+        if branch_label is not None:
+            branch_label = branch_label.reshape(-1, patch_size)
+        if branch_valid is not None:
+            branch_valid = branch_valid.reshape(-1, patch_size)
+        if branch_normal is not None:
+            branch_normal = branch_normal.reshape(-1, patch_size, 3)
         if region_points.shape[0] != pc_noisy.shape[0]:
             raise ValueError(
                 "shape-context training currently requires one patch per shape"
@@ -1069,6 +1078,12 @@ class ShapeContextVelocityModule(VelocityModule):
         if point_idx is not None:
             noisy_for_loss = pc_noisy[:, point_idx, :]
             clean_for_loss = pc_clean[:, point_idx, :]
+            if branch_label is not None:
+                branch_label = branch_label[:, point_idx]
+            if branch_valid is not None:
+                branch_valid = branch_valid[:, point_idx]
+            if branch_normal is not None:
+                branch_normal = branch_normal[:, point_idx, :]
         losses = {
             "region_context_gate": gate,
             "region_crease_mean": getattr(
@@ -1091,6 +1106,24 @@ class ShapeContextVelocityModule(VelocityModule):
                     sigma=None,
                 )
             )
+        if (
+            self.use_surface_branch_loss
+            and branch_label is not None
+            and branch_valid is not None
+            and branch_normal is not None
+        ):
+            branch_snap_loss, branch_separation_loss = (
+                self.get_surface_branch_losses(
+                    pc_pred=noisy_for_loss + prediction,
+                    pc_clean=clean_for_loss,
+                    branch_label=branch_label,
+                    branch_valid=branch_valid,
+                    branch_normal=branch_normal,
+                    sigma=None,
+                )
+            )
+            losses["branch_snap_loss"] = branch_snap_loss
+            losses["branch_separation_loss"] = branch_separation_loss
         return losses
 
     def process_fn(self, batch: List[Asset]) -> List[Dict]:
@@ -1113,15 +1146,22 @@ class ShapeContextVelocityModule(VelocityModule):
                     centers_idx,
                     neighbors_idx,
                 )
-                result.append(
-                    {
-                        "pc_noisy": asset.meta["pc_noisy"],
-                        "pc_clean": asset.meta["pc_clean"],
-                        "patch_seed": asset.meta["patch_seed"],
-                        "shape_region_points": region_points,
-                        "shape_region_centers": region_centers,
-                    }
-                )
+                item = {
+                    "pc_noisy": asset.meta["pc_noisy"],
+                    "pc_clean": asset.meta["pc_clean"],
+                    "patch_seed": asset.meta["patch_seed"],
+                    "shape_region_points": region_points,
+                    "shape_region_centers": region_centers,
+                }
+                if "pc_branch_label" in asset.meta:
+                    item["pc_branch_label"] = asset.meta["pc_branch_label"]
+                    item["pc_branch_valid"] = asset.meta["pc_branch_valid"]
+                    item["pc_branch_normal"] = asset.meta["pc_branch_normal"]
+                if "pc_branch_noise_fraction" in asset.meta:
+                    item["pc_branch_noise_fraction"] = asset.meta[
+                        "pc_branch_noise_fraction"
+                    ]
+                result.append(item)
             else:
                 noisy = asset.sampled_vertices_noisy
                 if noisy is None:

@@ -1,12 +1,12 @@
-data_name: &data_name models/model_normalized.obj
-loader: &loader obj
+data_name: &data_name clean.npy
+loader: &loader clean_npy
 
 train_dataset:
   shuffle: true
   batch_size: 4
   num_workers: 8
   datapath:
-    input_dataset_dir: ./dataset_clean
+    input_dataset_dir: ./cache_clean_points
     use_prob: false
     loader: *loader
     data_name: *data_name
@@ -20,7 +20,7 @@ validate_dataset:
   batch_size: 1
   num_workers: 8
   datapath:
-    input_dataset_dir: ./dataset_clean
+    input_dataset_dir: ./cache_clean_points
     use_prob: false
     loader: *loader
     data_name: *data_name

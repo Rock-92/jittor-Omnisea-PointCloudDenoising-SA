@@ -5,6 +5,8 @@ loss:
   nearest_surface_loss: 1.0
   surface_coherence_loss: 0.5
   surface_outlier_loss: 0.5
+  branch_snap_loss: 0.5
+  branch_separation_loss: 0.2
   region_context_gate: 0.0
   region_crease_mean: 0.0
   region_prior_delta: 0.0

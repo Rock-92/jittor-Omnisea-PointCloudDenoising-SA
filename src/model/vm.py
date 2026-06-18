@@ -101,6 +101,21 @@ class VelocityModule(ModelSpec):
         self.surface_outlier_margin = float(
             cfg.get('surface_outlier_margin', self.surface_snap_tau)
         )
+        self.use_surface_branch_loss = bool(
+            cfg.get('use_surface_branch_loss', False)
+        )
+        self.surface_branch_tau = float(
+            cfg.get('surface_branch_tau', self.surface_snap_tau)
+        )
+        self.surface_branch_min_valid = float(
+            cfg.get('surface_branch_min_valid', 0.5)
+        )
+        self.surface_branch_separation_k = int(
+            cfg.get('surface_branch_separation_k', 8)
+        )
+        self.surface_branch_separation_margin = float(
+            cfg.get('surface_branch_separation_margin', 0.8)
+        )
         
         # patch-based prediction
         self.predict_rounds = cfg.get('predict_rounds', 1)
@@ -515,6 +530,72 @@ class VelocityModule(ModelSpec):
             outlier_loss = outlier_loss * hard_weight
         return coherence_loss.mean(), outlier_loss.mean()
 
+    def get_surface_branch_losses(
+        self,
+        pc_pred,
+        pc_clean,
+        branch_label,
+        branch_valid,
+        branch_normal,
+        sigma=None,
+    ):
+        valid = branch_valid
+        if len(valid.shape) == 3:
+            valid = valid.squeeze(-1)
+        valid_sum = valid.sum(dim=1)
+        active = jt.where(
+            valid_sum >= self.surface_branch_min_valid * pc_pred.shape[1],
+            jt.ones_like(valid_sum),
+            jt.zeros_like(valid_sum),
+        )
+
+        signed = ((pc_pred - pc_clean) * branch_normal).sum(dim=-1)
+        abs_dist = jt.sqrt(signed ** 2.0 + self.patch_scale_eps ** 2.0) - self.patch_scale_eps
+        tau = max(self.surface_branch_tau, self.patch_scale_eps)
+        snap_point = tau * jt.log(1.0 + abs_dist / tau)
+        snap_loss = (snap_point * valid).sum(dim=1) / (valid_sum + 1e-6)
+
+        k = min(max(self.surface_branch_separation_k, 1) + 1, pc_clean.shape[1])
+        dist = ((pc_clean.unsqueeze(2) - pc_clean.unsqueeze(1)) ** 2.0).sum(dim=-1)
+        _, idx = jt.topk(dist, k=k, dim=-1, largest=False)
+        idx = idx[:, :, 1:]
+        neigh_clean = []
+        neigh_pred = []
+        neigh_label = []
+        neigh_valid = []
+        for b in range(pc_clean.shape[0]):
+            neigh_idx = idx[b]
+            neigh_clean.append(pc_clean[b][neigh_idx])
+            neigh_pred.append(pc_pred[b][neigh_idx])
+            neigh_label.append(branch_label[b][neigh_idx])
+            neigh_valid.append(valid[b][neigh_idx])
+        neigh_clean = jt.stack(neigh_clean, dim=0)
+        neigh_pred = jt.stack(neigh_pred, dim=0)
+        neigh_label = jt.stack(neigh_label, dim=0)
+        neigh_valid = jt.stack(neigh_valid, dim=0)
+
+        pair_valid = valid.unsqueeze(2) * neigh_valid
+        different_branch = jt.where(
+            branch_label.unsqueeze(2) != neigh_label,
+            jt.ones_like(pair_valid),
+            jt.zeros_like(pair_valid),
+        )
+        pair_mask = pair_valid * different_branch
+        normal = branch_normal.unsqueeze(2)
+        clean_gap = jt.abs(((neigh_clean - pc_clean.unsqueeze(2)) * normal).sum(dim=-1))
+        pred_gap = jt.abs(((neigh_pred - pc_pred.unsqueeze(2)) * normal).sum(dim=-1))
+        target_gap = self.surface_branch_separation_margin * clean_gap
+        sep_point = jt.maximum(target_gap - pred_gap, 0.0) ** 2.0
+        sep_flat = (sep_point * pair_mask).reshape(pc_pred.shape[0], -1)
+        pair_flat = pair_mask.reshape(pc_pred.shape[0], -1)
+        sep_loss = sep_flat.sum(dim=1) / (pair_flat.sum(dim=1) + 1e-6)
+
+        sigma2 = self._loss_sigma2(sigma, pc_pred.shape[0])
+        snap_loss = active * snap_loss / sigma2
+        sep_loss = active * sep_loss / sigma2
+        active_count = active.sum() + 1e-6
+        return snap_loss.sum() / active_count, sep_loss.sum() / active_count
+
     def get_surface_aligned_losses(
         self,
         pc_pred,
@@ -707,7 +788,15 @@ class VelocityModule(ModelSpec):
             raise ValueError(f"unsupported surface loss reduction: {reduction}")
         return loss.mean()
 
-    def get_supervised_losses(self, pc_noisy, pc_clean, score_sigma=None):
+    def get_supervised_losses(
+        self,
+        pc_noisy,
+        pc_clean,
+        score_sigma=None,
+        branch_label=None,
+        branch_valid=None,
+        branch_normal=None,
+    ):
         """
         pc_noisy: (B, N, 3)
         pc_clean: (B, N, 3)
@@ -724,6 +813,12 @@ class VelocityModule(ModelSpec):
             target = target[:, point_idx, :]
             pc_noisy_for_loss = pc_noisy[:, point_idx, :]
             pc_clean_for_loss = pc_clean[:, point_idx, :]
+            if branch_label is not None:
+                branch_label = branch_label[:, point_idx]
+            if branch_valid is not None:
+                branch_valid = branch_valid[:, point_idx]
+            if branch_normal is not None:
+                branch_normal = branch_normal[:, point_idx, :]
         if self.use_edm:
             sigma_pred = self.predict_sigma(pc_noisy)
             pc_pred = self.predict_clean(
@@ -760,6 +855,24 @@ class VelocityModule(ModelSpec):
                         hard_weight=hard_weight,
                     )
                 )
+            if (
+                self.use_surface_branch_loss
+                and branch_label is not None
+                and branch_valid is not None
+                and branch_normal is not None
+            ):
+                branch_snap_loss, branch_separation_loss = (
+                    self.get_surface_branch_losses(
+                        pc_pred=pc_pred,
+                        pc_clean=pc_clean_for_loss,
+                        branch_label=branch_label,
+                        branch_valid=branch_valid,
+                        branch_normal=branch_normal,
+                        sigma=score_sigma,
+                    )
+                )
+                losses["branch_snap_loss"] = branch_snap_loss
+                losses["branch_separation_loss"] = branch_separation_loss
             if self.use_hard_aware_loss and self.hard_chamfer_weight > 0:
                 losses["patch_chamfer_loss"] = self.get_patch_chamfer_loss(
                     pc_pred=pc_pred,
@@ -814,6 +927,22 @@ class VelocityModule(ModelSpec):
                     sigma=score_sigma,
                 )
             )
+        if (
+            self.use_surface_branch_loss
+            and branch_label is not None
+            and branch_valid is not None
+            and branch_normal is not None
+        ):
+            branch_snap_loss, branch_separation_loss = self.get_surface_branch_losses(
+                pc_pred=pc_noisy_for_loss + pred_dir,
+                pc_clean=pc_clean_for_loss,
+                branch_label=branch_label,
+                branch_valid=branch_valid,
+                branch_normal=branch_normal,
+                sigma=score_sigma,
+            )
+            losses["branch_snap_loss"] = branch_snap_loss
+            losses["branch_separation_loss"] = branch_separation_loss
         return losses
 
     def denoise_langevin_dynamics(self, pcl_noisy, num_steps=None):
@@ -893,10 +1022,22 @@ class VelocityModule(ModelSpec):
         score_sigma = batch.get('score_sigma')
         if score_sigma is not None:
             score_sigma = score_sigma.reshape(-1, 1)
+        branch_label = batch.get('pc_branch_label')
+        branch_valid = batch.get('pc_branch_valid')
+        branch_normal = batch.get('pc_branch_normal')
+        if branch_label is not None:
+            branch_label = branch_label.reshape(-1, patch_size)
+        if branch_valid is not None:
+            branch_valid = branch_valid.reshape(-1, patch_size)
+        if branch_normal is not None:
+            branch_normal = branch_normal.reshape(-1, patch_size, 3)
         losses = self.get_supervised_losses(
             pc_noisy=pc_noisy,
             pc_clean=pc_clean,
             score_sigma=score_sigma,
+            branch_label=branch_label,
+            branch_valid=branch_valid,
+            branch_normal=branch_normal,
         )
         return losses
     
@@ -939,6 +1080,12 @@ class VelocityModule(ModelSpec):
                     item["patch_seed"] = b.meta['patch_seed']
                 if 'score_sigma' in b.meta:
                     item["score_sigma"] = b.meta['score_sigma']
+                if 'pc_branch_label' in b.meta:
+                    item["pc_branch_label"] = b.meta['pc_branch_label']
+                    item["pc_branch_valid"] = b.meta['pc_branch_valid']
+                    item["pc_branch_normal"] = b.meta['pc_branch_normal']
+                if 'pc_branch_noise_fraction' in b.meta:
+                    item["pc_branch_noise_fraction"] = b.meta['pc_branch_noise_fraction']
                 res.append(item)
             else:
                 d = {

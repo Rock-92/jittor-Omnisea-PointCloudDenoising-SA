@@ -3,6 +3,7 @@ import csv
 import json
 import sys
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import matplotlib
@@ -468,11 +469,82 @@ def cluster_one_shape(rel_path, args, rng, out_dir):
     }
 
 
+def cache_one_shape(rel_path, args, rng):
+    output_path = Path(args.cache_root) / rel_path / args.cache_name
+    if output_path.exists() and not args.overwrite:
+        return {
+            "rel_path": rel_path,
+            "status": "skip",
+            "cache": str(output_path),
+        }
+    shape = load_shape(
+        rel_path,
+        args.clean_root,
+        args.mesh_root,
+        args.num_points,
+        rng,
+        args.sample_missing_clean,
+    )
+    points = shape["clean"].astype(np.float32, copy=False)
+    normals, curvature, _, _ = estimate_normals(points, args.normal_k)
+    _, _, _, graph_idx = estimate_normals(points, args.graph_k)
+    labels, used_plane_threshold = build_surface_edges(
+        points,
+        normals,
+        graph_idx,
+        args,
+    )
+    labels, branch_rows = relabel_and_filter(
+        points,
+        normals,
+        curvature,
+        labels,
+        args,
+    )
+    labels = split_thin_parallel_layers(points, normals, labels, args)
+    labels, branch_rows = relabel_and_filter(
+        points,
+        normals,
+        curvature,
+        labels,
+        args,
+    )
+    noise_label = int(labels.max())
+    noise_fraction = float((labels == noise_label).mean())
+    valid_mask = labels != noise_label
+    if noise_fraction > float(args.max_noise_fraction):
+        valid_mask[:] = False
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        output_path,
+        labels=labels.astype(np.int32, copy=False),
+        normals=normals.astype(np.float32, copy=False),
+        curvature=curvature.astype(np.float32, copy=False),
+        valid_mask=valid_mask.astype(np.bool_, copy=False),
+        noise_label=np.asarray([noise_label], dtype=np.int32),
+        noise_fraction=np.asarray([noise_fraction], dtype=np.float32),
+        branch_count=np.asarray([noise_label + 1], dtype=np.int32),
+        plane_threshold=np.asarray([used_plane_threshold], dtype=np.float32),
+    )
+    return {
+        "rel_path": rel_path,
+        "status": "write",
+        "cache": str(output_path),
+        "branch_count_including_noise": noise_label + 1,
+        "noise_fraction": noise_fraction,
+        "valid_fraction": float(valid_mask.mean()),
+        "small_valid_branch_count": int(
+            sum(row["is_small_valid"] for row in branch_rows)
+        ),
+    }
+
+
 def choose_paths(args, rng):
     if args.paths:
         return args.paths
     paths = usable_paths(
-        read_datalist(args.datalist),
+        read_datalists(args.datalist),
         args.clean_root,
         args.mesh_root,
         args.sample_missing_clean,
@@ -486,12 +558,47 @@ def choose_paths(args, rng):
     return selected[: args.max_shapes]
 
 
+def read_datalists(paths):
+    rel_paths = []
+    seen = set()
+    for path in paths:
+        for rel_path in read_datalist(path):
+            if rel_path in seen:
+                continue
+            seen.add(rel_path)
+            rel_paths.append(rel_path)
+    return rel_paths
+
+
+def process_one_cache(task):
+    index, total, rel_path, args = task
+    print(f"[{index + 1}/{total}] {rel_path}", flush=True)
+    rng = np.random.default_rng(int(args.seed) + index)
+    try:
+        return cache_one_shape(rel_path, args, rng)
+    except Exception as exc:
+        return {
+            "rel_path": rel_path,
+            "status": "error",
+            "error": repr(exc),
+        }
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--datalist", default="datalist/validate.txt")
+    parser.add_argument("--datalist", nargs="+", default=["datalist/validate.txt"])
     parser.add_argument("--clean-root", default="cache_clean_points")
     parser.add_argument("--mesh-root", default="dataset_clean")
     parser.add_argument("--out-dir", default="outputs/surface_branch_clusters")
+    parser.add_argument("--cache-root", default="cache_surface_branches")
+    parser.add_argument("--cache-name", default="surface_branches.npz")
+    parser.add_argument(
+        "--mode",
+        choices=["diagnose", "cache"],
+        default="diagnose",
+    )
+    parser.add_argument("--max-noise-fraction", type=float, default=0.35)
+    parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--paths", nargs="*", default=None)
     parser.add_argument("--max-shapes", type=int, default=5)
     parser.add_argument("--max-laptop-shapes", type=int, default=2)
@@ -517,6 +624,7 @@ def main():
     parser.add_argument("--thin-split-max-parts", type=int, default=8)
     parser.add_argument("--max-draw-clusters", type=int, default=20)
     parser.add_argument("--sample-missing-clean", action="store_true")
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=20260618)
     args = parser.parse_args()
 
@@ -525,11 +633,26 @@ def main():
     rng = np.random.default_rng(args.seed)
     paths = choose_paths(args, rng)
     rows = []
-    for index, rel_path in enumerate(paths):
-        print(f"[{index + 1}/{len(paths)}] {rel_path}", flush=True)
-        rows.append(cluster_one_shape(rel_path, args, rng, out_dir))
-    write_csv(out_dir / "summary.csv", rows)
-    write_json(out_dir / "summary.json", {"args": vars(args), "shapes": rows})
+    if args.mode == "cache" and int(args.workers) > 1:
+        tasks = [
+            (index, len(paths), rel_path, args)
+            for index, rel_path in enumerate(paths)
+        ]
+        with ProcessPoolExecutor(max_workers=int(args.workers)) as executor:
+            futures = [executor.submit(process_one_cache, task) for task in tasks]
+            for future in as_completed(futures):
+                rows.append(future.result())
+    else:
+        for index, rel_path in enumerate(paths):
+            print(f"[{index + 1}/{len(paths)}] {rel_path}", flush=True)
+            if args.mode == "cache":
+                rows.append(cache_one_shape(rel_path, args, rng))
+                continue
+            rows.append(cluster_one_shape(rel_path, args, rng, out_dir))
+    summary_dir = out_dir if args.mode == "diagnose" else Path(args.cache_root)
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    write_csv(summary_dir / "summary.csv", rows)
+    write_json(summary_dir / "summary.json", {"args": vars(args), "shapes": rows})
     print(json.dumps({"args": vars(args), "shapes": rows}, ensure_ascii=False, indent=2))
 
 

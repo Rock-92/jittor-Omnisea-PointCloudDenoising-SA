@@ -5,6 +5,7 @@ from scipy.spatial import cKDTree
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import os
 
 from .asset import Asset
 from .spec import ConfigSpec
@@ -249,6 +250,19 @@ class AugmentPatch(Augment):
         asset.meta['pc_noisy'] = pat_A
         asset.meta['pc_clean'] = pat_B
         asset.meta['patch_seed'] = patch_seed
+        if 'surface_branch_labels' in asset.meta:
+            labels = asset.meta['surface_branch_labels'][nn_idx]
+            valid = asset.meta['surface_branch_valid'][nn_idx]
+            normals = asset.meta['surface_branch_normals'][nn_idx]
+            noise_fraction = np.full(
+                (self.num_patches, 1),
+                asset.meta.get('surface_branch_noise_fraction', 1.0),
+                dtype=np.float32,
+            )
+            asset.meta['pc_branch_label'] = labels.astype(np.int32, copy=False)
+            asset.meta['pc_branch_valid'] = valid.astype(np.float32, copy=False)
+            asset.meta['pc_branch_normal'] = normals.astype(np.float32, copy=False)
+            asset.meta['pc_branch_noise_fraction'] = noise_fraction
         if 'noise_std' in asset.meta:
             asset.meta['score_sigma'] = np.full(
                 (self.num_patches, 1),
@@ -264,6 +278,75 @@ class AugmentPatch(Augment):
         if self.mix_with_clean:
             asset.meta['pc_mix'] = pat_t
 
+
+@dataclass(frozen=True)
+class AugmentSurfaceBranchCache(Augment):
+    cache_root: str = "cache_surface_branches"
+    cache_name: str = "surface_branches.npz"
+    required: bool = False
+
+    @classmethod
+    def parse(cls, **kwargs) -> 'AugmentSurfaceBranchCache':
+        cls.check_keys(kwargs)
+        return AugmentSurfaceBranchCache(**kwargs)
+
+    def _rel_path(self, asset: Asset):
+        if asset.path is None:
+            return None
+        normalized = asset.path.replace("\\", "/")
+        marker = "/shapenet/"
+        if marker in normalized:
+            rel = "shapenet/" + normalized.split(marker, maxsplit=1)[1]
+            suffix = "/models/model_normalized.obj"
+            if rel.endswith(suffix):
+                rel = rel[:-len(suffix)]
+            clean_suffix = "/clean.npy"
+            if rel.endswith(clean_suffix):
+                rel = rel[:-len(clean_suffix)]
+            return rel
+        marker = "shapenet/"
+        if marker in normalized:
+            rel = marker + normalized.split(marker, maxsplit=1)[1]
+            suffix = "/models/model_normalized.obj"
+            if rel.endswith(suffix):
+                rel = rel[:-len(suffix)]
+            clean_suffix = "/clean.npy"
+            if rel.endswith(clean_suffix):
+                rel = rel[:-len(clean_suffix)]
+            return rel
+        return None
+
+    def apply(self, asset: Asset, **kwargs):
+        if asset.meta is None:
+            asset.meta = {}
+        rel_path = self._rel_path(asset)
+        if rel_path is None:
+            if self.required:
+                raise ValueError(f"cannot infer relative path from {asset.path}")
+            return
+        cache_path = os.path.join(self.cache_root, rel_path, self.cache_name)
+        if not os.path.exists(cache_path):
+            if self.required:
+                raise FileNotFoundError(cache_path)
+            return
+        cache = np.load(cache_path)
+        labels = cache["labels"].astype(np.int32, copy=False)
+        normals = cache["normals"].astype(np.float32, copy=False)
+        valid = cache["valid_mask"].astype(np.bool_, copy=False)
+        if asset.sampled_vertices is None:
+            raise ValueError("surface branch cache requires sampled clean points")
+        if labels.shape[0] != asset.sampled_vertices.shape[0]:
+            raise ValueError(
+                "surface branch cache point count does not match sampled points: "
+                f"{labels.shape[0]} vs {asset.sampled_vertices.shape[0]}"
+            )
+        asset.meta['surface_branch_labels'] = labels
+        asset.meta['surface_branch_normals'] = normals
+        asset.meta['surface_branch_valid'] = valid
+        asset.meta['surface_branch_noise_fraction'] = np.float32(
+            cache["noise_fraction"][0]
+        )
+
 def get_augments(*args) -> List[Augment]:
     MAP = {
         "sample": AugmentSample,
@@ -271,6 +354,7 @@ def get_augments(*args) -> List[Augment]:
         "add_noise": AugmentAddNoise,
         "linear": AugmentLinear,
         "patch": AugmentPatch,
+        "surface_branch_cache": AugmentSurfaceBranchCache,
     }
     MAP: Dict[str, type[Augment]]
     augments = []
