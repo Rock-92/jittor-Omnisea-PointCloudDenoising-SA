@@ -31,12 +31,6 @@ surface_threshold_single_quantile: 0.25
 surface_threshold_single_factor: 1.10
 surface_threshold_min: 0.004
 surface_threshold_extra_weight: 8.0
-multi_surface_candidate_count: 4
-multi_surface_displacement_scale: 0.25
-candidate_diversity_margin: 0.006
-candidate_overlap_knn: 8
-candidate_overlap_top_m: 2
-candidate_overlap_normal_weight: 0.05
 
 # Complete-shape processor. Only region tokens condition the denoiser; the
 # processor's shape-global output is not computed or injected.
