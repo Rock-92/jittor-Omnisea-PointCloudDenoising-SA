@@ -414,9 +414,12 @@ class VelocityModule(ModelSpec):
         plane_dist = signed_plane_dist ** 2.0
         if self.use_surface_snap_loss and self.surface_snap_weight > 0.0:
             tau = max(self.surface_snap_tau, self.patch_scale_eps)
-            tau2 = tau ** 2.0
-            plane_dist = plane_dist + self.surface_snap_weight * tau2 * jt.atan(
-                plane_dist / tau2
+            abs_plane_dist = (
+                jt.sqrt(plane_dist + self.patch_scale_eps ** 2.0)
+                - self.patch_scale_eps
+            )
+            plane_dist = plane_dist + self.surface_snap_weight * tau * jt.log(
+                1.0 + abs_plane_dist / tau
             )
         sigma2 = self._loss_sigma2(sigma, pc_pred.shape[0])
         loss = plane_dist.mean(dim=1) / sigma2
