@@ -88,6 +88,19 @@ class VelocityModule(ModelSpec):
         )
         self.surface_snap_tau = float(cfg.get('surface_snap_tau', 0.001))
         self.surface_snap_weight = float(cfg.get('surface_snap_weight', 3.0))
+        self.use_surface_coherence_loss = bool(
+            cfg.get('use_surface_coherence_loss', False)
+        )
+        self.surface_coherence_k = int(cfg.get('surface_coherence_k', 8))
+        self.surface_coherence_cos = float(
+            cfg.get('surface_coherence_cos', 0.5)
+        )
+        self.surface_coherence_center_cos = float(
+            cfg.get('surface_coherence_center_cos', 0.5)
+        )
+        self.surface_outlier_margin = float(
+            cfg.get('surface_outlier_margin', self.surface_snap_tau)
+        )
         
         # patch-based prediction
         self.predict_rounds = cfg.get('predict_rounds', 1)
@@ -368,12 +381,10 @@ class VelocityModule(ModelSpec):
         )
         return normal
 
-    def get_nearest_surface_loss(
+    def get_nearest_surface_geometry(
         self,
         pc_pred,
         pc_clean,
-        sigma=None,
-        hard_weight=None,
     ):
         dist = ((pc_pred.unsqueeze(2) - pc_clean.unsqueeze(1)) ** 2.0).sum(dim=-1)
         _, idx = jt.topk(dist, k=1, dim=2, largest=False)
@@ -387,6 +398,19 @@ class VelocityModule(ModelSpec):
         anchors = jt.stack(anchors, dim=0)
         normals = jt.stack(normals, dim=0)
         signed_plane_dist = ((pc_pred - anchors) * normals).sum(dim=-1)
+        return anchors, normals, signed_plane_dist
+
+    def get_nearest_surface_loss(
+        self,
+        pc_pred,
+        pc_clean,
+        sigma=None,
+        hard_weight=None,
+    ):
+        _, _, signed_plane_dist = self.get_nearest_surface_geometry(
+            pc_pred=pc_pred,
+            pc_clean=pc_clean,
+        )
         plane_dist = signed_plane_dist ** 2.0
         if self.use_surface_snap_loss and self.surface_snap_weight > 0.0:
             tau = max(self.surface_snap_tau, self.patch_scale_eps)
@@ -400,10 +424,99 @@ class VelocityModule(ModelSpec):
             loss = loss * hard_weight.reshape(pc_pred.shape[0])
         return loss.mean()
 
+    def get_surface_coherence_losses(
+        self,
+        pc_pred,
+        pc_noisy,
+        pc_clean,
+        sigma=None,
+        hard_weight=None,
+    ):
+        if pc_pred.shape[1] <= 1:
+            zero = jt.array(0.0)
+            return zero, zero
+
+        k = min(max(self.surface_coherence_k, 1) + 1, pc_pred.shape[1])
+        _, normals, signed_plane_dist = self.get_nearest_surface_geometry(
+            pc_pred=pc_pred,
+            pc_clean=pc_clean,
+        )
+        dist = ((pc_noisy.unsqueeze(2) - pc_noisy.unsqueeze(1)) ** 2.0).sum(dim=-1)
+        _, idx = jt.topk(dist, k=k, dim=-1, largest=False)
+        idx = idx[:, :, 1:]
+
+        neigh_pred = []
+        neigh_noisy = []
+        neigh_normals = []
+        for b in range(pc_pred.shape[0]):
+            neigh_idx = idx[b]
+            neigh_pred.append(pc_pred[b][neigh_idx])
+            neigh_noisy.append(pc_noisy[b][neigh_idx])
+            neigh_normals.append(normals[b][neigh_idx])
+        neigh_pred = jt.stack(neigh_pred, dim=0)
+        neigh_noisy = jt.stack(neigh_noisy, dim=0)
+        neigh_normals = jt.stack(neigh_normals, dim=0)
+
+        pred_disp = pc_pred - pc_noisy
+        pred_len = jt.sqrt((pred_disp ** 2.0).sum(dim=-1, keepdims=True) + 1e-8)
+        pred_dir = pred_disp / pred_len
+        neigh_disp = neigh_pred - neigh_noisy
+        neigh_len = jt.sqrt((neigh_disp ** 2.0).sum(dim=-1, keepdims=True) + 1e-8)
+        neigh_dir = neigh_disp / neigh_len
+        dir_i = pred_dir.unsqueeze(2)
+        cos = (dir_i * neigh_dir).sum(dim=-1)
+
+        same_forward = jt.where(
+            cos > self.surface_coherence_cos,
+            jt.ones_like(cos),
+            jt.zeros_like(cos),
+        )
+        pair_vec = neigh_noisy - pc_noisy.unsqueeze(2)
+        pair_len = jt.sqrt((pair_vec ** 2.0).sum(dim=-1, keepdims=True) + 1e-8)
+        pair_dir = pair_vec / pair_len
+        inward_i = (dir_i * pair_dir).sum(dim=-1)
+        inward_j = (neigh_dir * (-pair_dir)).sum(dim=-1)
+        same_reverse = jt.where(
+            (cos < -self.surface_coherence_cos)
+            & (inward_i > self.surface_coherence_center_cos)
+            & (inward_j > self.surface_coherence_center_cos),
+            jt.ones_like(cos),
+            jt.zeros_like(cos),
+        )
+        same_surface = jt.minimum(same_forward + same_reverse, 1.0)
+
+        avg_normal = normals.unsqueeze(2) + neigh_normals
+        avg_normal = avg_normal / jt.sqrt(
+            (avg_normal ** 2.0).sum(dim=-1, keepdims=True) + 1e-8
+        )
+        normal_sep = ((neigh_pred - pc_pred.unsqueeze(2)) * avg_normal).sum(dim=-1)
+        denom = same_surface.sum(dim=-1) + 1e-6
+        coherence_point = ((normal_sep ** 2.0) * same_surface).sum(dim=-1) / denom
+
+        margin = max(self.surface_outlier_margin, self.patch_scale_eps)
+        plane_distance = jt.sqrt(signed_plane_dist ** 2.0 + 1e-12)
+        far_surface = jt.maximum(plane_distance - margin, 0.0) ** 2.0
+        grouped = jt.where(
+            same_surface.sum(dim=-1) > 0.5,
+            jt.ones_like(plane_distance),
+            jt.zeros_like(plane_distance),
+        )
+        outlier_point = far_surface * (1.0 - grouped)
+
+        sigma2 = self._loss_sigma2(sigma, pc_pred.shape[0])
+        coherence_loss = coherence_point.mean(dim=1) / sigma2
+        outlier_loss = outlier_point.mean(dim=1) / sigma2
+        if hard_weight is not None:
+            hard_weight = hard_weight.reshape(pc_pred.shape[0])
+            coherence_loss = coherence_loss * hard_weight
+            outlier_loss = outlier_loss * hard_weight
+        return coherence_loss.mean(), outlier_loss.mean()
+
     def get_surface_aligned_losses(
         self,
         pc_pred,
         pc_clean,
+        pc_noisy=None,
         sigma=None,
         hard_weight=None,
     ):
@@ -420,12 +533,25 @@ class VelocityModule(ModelSpec):
             sigma=sigma,
             hard_weight=hard_weight,
         )
-        return {
+        losses = {
             "nearest_clean_loss": nearest_clean_loss,
             "clean_coverage_loss": clean_coverage_loss,
             "patch_chamfer_loss": patch_chamfer_loss,
             "nearest_surface_loss": nearest_surface_loss,
         }
+        if self.use_surface_coherence_loss and pc_noisy is not None:
+            surface_coherence_loss, surface_outlier_loss = (
+                self.get_surface_coherence_losses(
+                    pc_pred=pc_pred,
+                    pc_noisy=pc_noisy,
+                    pc_clean=pc_clean,
+                    sigma=sigma,
+                    hard_weight=hard_weight,
+                )
+            )
+            losses["surface_coherence_loss"] = surface_coherence_loss
+            losses["surface_outlier_loss"] = surface_outlier_loss
+        return losses
 
     def get_length_projection_loss(
         self,
@@ -625,6 +751,7 @@ class VelocityModule(ModelSpec):
                 losses.update(
                     self.get_surface_aligned_losses(
                         pc_pred=pc_pred,
+                        pc_noisy=pc_noisy_for_loss,
                         pc_clean=pc_clean_for_loss,
                         sigma=score_sigma,
                         hard_weight=hard_weight,
@@ -679,6 +806,7 @@ class VelocityModule(ModelSpec):
             losses.update(
                 self.get_surface_aligned_losses(
                     pc_pred=pc_noisy_for_loss + pred_dir,
+                    pc_noisy=pc_noisy_for_loss,
                     pc_clean=pc_clean_for_loss,
                     sigma=score_sigma,
                 )

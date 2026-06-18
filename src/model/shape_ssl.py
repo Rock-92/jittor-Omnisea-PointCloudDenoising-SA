@@ -1086,6 +1086,7 @@ class ShapeContextVelocityModule(VelocityModule):
             losses.update(
                 self.get_surface_aligned_losses(
                     pc_pred=noisy_for_loss + prediction,
+                    pc_noisy=noisy_for_loss,
                     pc_clean=clean_for_loss,
                     sigma=None,
                 )

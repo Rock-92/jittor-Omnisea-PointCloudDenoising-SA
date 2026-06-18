@@ -43,10 +43,15 @@ length_projection_over_weight: 0.25
 hard_chamfer_weight: 0.08
 hard_normal_weight: 0.02
 use_surface_aligned_loss: true
-surface_normal_k: 3
+surface_normal_k: 6
 use_surface_snap_loss: true
 surface_snap_tau: 0.001
 surface_snap_weight: 3.0
+use_surface_coherence_loss: true
+surface_coherence_k: 8
+surface_coherence_cos: 0.5
+surface_coherence_center_cos: 0.5
+surface_outlier_margin: 0.001
 edm_sampler: heun
 edm_sigma_min: 0.0001
 edm_sigma_max: 0.025

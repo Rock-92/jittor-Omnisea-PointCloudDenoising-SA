@@ -4,6 +4,8 @@ loss:
   clean_coverage_loss: 0.0
   patch_chamfer_loss: 1.0
   nearest_surface_loss: 1.0
+  surface_coherence_loss: 0.5
+  surface_outlier_loss: 0.5
   normalized_surface_loss: 0.0
   length_projection_loss: 0.0
   sigma_loss: 0.0

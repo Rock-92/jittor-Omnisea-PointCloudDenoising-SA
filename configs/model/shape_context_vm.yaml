@@ -22,10 +22,15 @@ use_edgeconv_branch: false
 use_hard_aware_loss: false
 use_length_projection_loss: false
 use_surface_aligned_loss: true
-surface_normal_k: 3
+surface_normal_k: 6
 use_surface_snap_loss: true
 surface_snap_tau: 0.001
 surface_snap_weight: 3.0
+use_surface_coherence_loss: true
+surface_coherence_k: 8
+surface_coherence_cos: 0.5
+surface_coherence_center_cos: 0.5
+surface_outlier_margin: 0.001
 
 # Complete-shape processor. Only region tokens condition the denoiser; the
 # processor's shape-global output is not computed or injected.
