@@ -472,10 +472,19 @@ def cluster_one_shape(rel_path, args, rng, out_dir):
 def cache_one_shape(rel_path, args, rng):
     output_path = Path(args.cache_root) / rel_path / args.cache_name
     if output_path.exists() and not args.overwrite:
+        cache = np.load(output_path)
+        labels = cache["labels"].astype(np.int32, copy=False)
+        noise_label = int(cache["noise_label"][0])
+        valid_mask = cache["valid_mask"].astype(np.bool_, copy=False)
         return {
             "rel_path": rel_path,
             "status": "skip",
             "cache": str(output_path),
+            "branch_count_including_noise": int(cache["branch_count"][0]),
+            "noise_fraction": float(cache["noise_fraction"][0]),
+            "valid_fraction": float(valid_mask.mean()),
+            "point_count": int(labels.shape[0]),
+            "noise_label": noise_label,
         }
     shape = load_shape(
         rel_path,
@@ -601,7 +610,7 @@ def main():
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--paths", nargs="*", default=None)
     parser.add_argument("--max-shapes", type=int, default=5)
-    parser.add_argument("--max-laptop-shapes", type=int, default=2)
+    parser.add_argument("--max-laptop-shapes", type=int, default=999999)
     parser.add_argument("--laptop-category", default="03642806")
     parser.add_argument("--num-points", type=int, default=12000)
     parser.add_argument("--normal-k", type=int, default=24)

@@ -1157,10 +1157,29 @@ class ShapeContextVelocityModule(VelocityModule):
                     item["pc_branch_label"] = asset.meta["pc_branch_label"]
                     item["pc_branch_valid"] = asset.meta["pc_branch_valid"]
                     item["pc_branch_normal"] = asset.meta["pc_branch_normal"]
+                elif self.use_surface_branch_loss:
+                    patch_shape = asset.meta["pc_clean"].shape[:2]
+                    item["pc_branch_label"] = np.zeros(
+                        patch_shape,
+                        dtype=np.int32,
+                    )
+                    item["pc_branch_valid"] = np.zeros(
+                        patch_shape,
+                        dtype=np.float32,
+                    )
+                    item["pc_branch_normal"] = np.zeros(
+                        (*patch_shape, 3),
+                        dtype=np.float32,
+                    )
                 if "pc_branch_noise_fraction" in asset.meta:
                     item["pc_branch_noise_fraction"] = asset.meta[
                         "pc_branch_noise_fraction"
                     ]
+                elif self.use_surface_branch_loss:
+                    item["pc_branch_noise_fraction"] = np.ones(
+                        (asset.meta["pc_clean"].shape[0], 1),
+                        dtype=np.float32,
+                    )
                 result.append(item)
             else:
                 noisy = asset.sampled_vertices_noisy

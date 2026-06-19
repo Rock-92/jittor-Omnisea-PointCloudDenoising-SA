@@ -1084,8 +1084,27 @@ class VelocityModule(ModelSpec):
                     item["pc_branch_label"] = b.meta['pc_branch_label']
                     item["pc_branch_valid"] = b.meta['pc_branch_valid']
                     item["pc_branch_normal"] = b.meta['pc_branch_normal']
+                elif self.use_surface_branch_loss:
+                    patch_shape = b.meta['pc_clean'].shape[:2]
+                    item["pc_branch_label"] = np.zeros(
+                        patch_shape,
+                        dtype=np.int32,
+                    )
+                    item["pc_branch_valid"] = np.zeros(
+                        patch_shape,
+                        dtype=np.float32,
+                    )
+                    item["pc_branch_normal"] = np.zeros(
+                        (*patch_shape, 3),
+                        dtype=np.float32,
+                    )
                 if 'pc_branch_noise_fraction' in b.meta:
                     item["pc_branch_noise_fraction"] = b.meta['pc_branch_noise_fraction']
+                elif self.use_surface_branch_loss:
+                    item["pc_branch_noise_fraction"] = np.ones(
+                        (b.meta['pc_clean'].shape[0], 1),
+                        dtype=np.float32,
+                    )
                 res.append(item)
             else:
                 d = {
