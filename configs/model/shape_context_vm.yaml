@@ -27,6 +27,8 @@ use_surface_snap_loss: true
 surface_snap_tau: 0.001
 surface_snap_weight: 3.0
 use_surface_coherence_loss: true
+use_surface_distribution_loss: true
+surface_distribution_repulsion_weight: 0.2
 surface_coherence_k: 8
 surface_coherence_cos: 0.5
 surface_coherence_center_cos: 0.5

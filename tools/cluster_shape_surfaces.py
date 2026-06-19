@@ -228,34 +228,341 @@ def relabel_and_filter(points, normals, curvature, labels, args):
     return new_labels, rows
 
 
-def split_cluster_by_height(points, normals, indices, args):
-    if indices.size < max(args.min_cluster_size * 2, 2):
-        return [indices]
-    mean_normal = normals[indices].mean(axis=0)
-    mean_normal /= max(float(np.linalg.norm(mean_normal)), 1e-12)
-    heights = points[indices] @ mean_normal
+def candidate_split_normals(points, normals, indices):
+    local = points[indices]
+    local_normals = normals[indices]
+    candidates = []
+
+    centered = local - local.mean(axis=0, keepdims=True)
+    cov = centered.T @ centered / max(local.shape[0] - 1, 1)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    pca_normal = eigvecs[:, int(np.argmin(eigvals))]
+    candidates.append(pca_normal)
+
+    normal_tensor = local_normals.T @ local_normals / max(local_normals.shape[0], 1)
+    _, normal_vecs = np.linalg.eigh(normal_tensor)
+    candidates.append(normal_vecs[:, -1])
+
+    mean_normal = local_normals.mean(axis=0)
+    if np.linalg.norm(mean_normal) > 1e-6:
+        candidates.append(mean_normal)
+
+    unique = []
+    for normal in candidates:
+        norm = float(np.linalg.norm(normal))
+        if norm < 1e-12:
+            continue
+        normal = normal / norm
+        duplicate = False
+        for existing in unique:
+            if abs(float(np.dot(existing, normal))) > 0.98:
+                duplicate = True
+                break
+        if not duplicate:
+            unique.append(normal.astype(np.float32, copy=False))
+    return unique
+
+
+def best_height_gap_split(points, indices, normal, args):
+    heights = points[indices] @ normal
     order = np.argsort(heights)
     sorted_heights = heights[order]
     gaps = np.diff(sorted_heights)
     if gaps.size == 0:
-        return [indices]
+        return None
 
-    best = int(np.argmax(gaps))
-    best_gap = float(gaps[best])
-    left_count = best + 1
-    right_count = indices.size - left_count
     min_side = max(
         int(args.min_cluster_size),
         int(round(indices.size * float(args.thin_split_min_fraction))),
     )
-    if left_count < min_side or right_count < min_side:
-        return [indices]
+    if indices.size < 2 * min_side:
+        return None
+
+    lo = min_side - 1
+    hi = gaps.size - min_side + 1
+    if hi <= lo:
+        return None
+    valid_gaps = gaps[lo:hi]
+    if valid_gaps.size == 0:
+        return None
+
+    local_best = int(np.argmax(valid_gaps))
+    best = lo + local_best
+    best_gap = float(gaps[best])
     if best_gap < float(args.thin_split_min_gap):
+        return None
+
+    left_count = best + 1
+    right_count = indices.size - left_count
+    if left_count < min_side or right_count < min_side:
+        return None
+
+    # Reject splits that only find a normal sampling gap inside one thick cloud.
+    left_heights = sorted_heights[:left_count]
+    right_heights = sorted_heights[left_count:]
+    left_iqr = float(np.percentile(left_heights, 75) - np.percentile(left_heights, 25))
+    right_iqr = float(np.percentile(right_heights, 75) - np.percentile(right_heights, 25))
+    width = max(left_iqr + right_iqr, 1e-12)
+    score = best_gap / width
+    if score < float(args.thin_split_min_gap_score):
+        return None
+
+    return {
+        "score": score,
+        "gap": best_gap,
+        "left": indices[order[:left_count]],
+        "right": indices[order[left_count:]],
+    }
+
+
+def best_patch_height_gap_split(points, indices, args, reference_normal=None):
+    if indices.size < max(2 * int(args.branch_refine_min_side), int(args.branch_refine_min_points)):
+        return None
+    local = points[indices]
+    centered = local - local.mean(axis=0, keepdims=True)
+    cov = centered.T @ centered / max(local.shape[0] - 1, 1)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    normal = eigvecs[:, int(np.argmin(eigvals))]
+    norm = float(np.linalg.norm(normal))
+    if norm < 1e-12:
+        return None
+    normal = normal / norm
+    if reference_normal is not None and float(np.dot(normal, reference_normal)) < 0.0:
+        normal = -normal
+
+    heights = local @ normal
+    order = np.argsort(heights)
+    sorted_heights = heights[order]
+    gaps = np.diff(sorted_heights)
+    if gaps.size == 0:
+        return None
+
+    min_side = max(
+        int(args.branch_refine_min_side),
+        int(round(indices.size * float(args.branch_refine_min_fraction))),
+    )
+    if indices.size < 2 * min_side:
+        return None
+    lo = min_side - 1
+    hi = gaps.size - min_side + 1
+    if hi <= lo:
+        return None
+
+    best = lo + int(np.argmax(gaps[lo:hi]))
+    best_gap = float(gaps[best])
+    if best_gap < float(args.branch_refine_min_gap):
+        return None
+
+    left_heights = sorted_heights[: best + 1]
+    right_heights = sorted_heights[best + 1:]
+    left_iqr = float(np.percentile(left_heights, 75) - np.percentile(left_heights, 25))
+    right_iqr = float(np.percentile(right_heights, 75) - np.percentile(right_heights, 25))
+    score = best_gap / max(left_iqr + right_iqr, 1e-12)
+    if score < float(args.branch_refine_min_gap_score):
+        return None
+
+    return {
+        "score": score,
+        "gap": best_gap,
+        "normal": normal.astype(np.float32, copy=False),
+        "left": indices[order[: best + 1]],
+        "right": indices[order[best + 1:]],
+    }
+
+
+def refine_labels_by_local_patch_splits(points, normals, labels, valid_mask, args):
+    if not bool(args.enable_cache_local_refine):
+        return labels
+
+    noise_label = int(labels.max())
+    refined = labels.copy()
+    next_label = noise_label + 1
+    full_tree = cKDTree(points)
+    min_points = max(
+        int(args.branch_refine_min_points),
+        2 * int(args.branch_refine_min_side),
+    )
+
+    for label in range(noise_label):
+        branch_indices = np.flatnonzero((labels == label) & valid_mask).astype(np.int64)
+        if branch_indices.size < max(min_points, int(args.cache_refine_patch_size)):
+            continue
+
+        reference_normal = normals[branch_indices].mean(axis=0)
+        ref_norm = float(np.linalg.norm(reference_normal))
+        if ref_norm > 1e-12:
+            reference_normal = reference_normal / ref_norm
+        else:
+            reference_normal = None
+
+        sample_count = min(int(args.cache_refine_samples), branch_indices.size)
+        sample_positions = np.linspace(
+            0,
+            branch_indices.size - 1,
+            num=sample_count,
+            dtype=np.int64,
+        )
+        vote = np.zeros((branch_indices.size,), dtype=np.float32)
+        local_pos = {int(point_index): pos for pos, point_index in enumerate(branch_indices)}
+        accepted = 0
+        patch_size = min(int(args.cache_refine_patch_size), points.shape[0])
+        for position in sample_positions:
+            center_index = int(branch_indices[position])
+            _, nn_idx = full_tree.query(points[center_index], k=patch_size)
+            nn_idx = np.asarray(nn_idx, dtype=np.int64).reshape(-1)
+            same_branch = nn_idx[(labels[nn_idx] == label) & valid_mask[nn_idx]]
+            split = best_patch_height_gap_split(
+                points,
+                same_branch.astype(np.int64, copy=False),
+                args,
+                reference_normal=reference_normal,
+            )
+            if split is None:
+                continue
+            accepted += 1
+            for point_index in split["left"]:
+                pos = local_pos.get(int(point_index))
+                if pos is not None:
+                    vote[pos] -= float(split["score"])
+            for point_index in split["right"]:
+                pos = local_pos.get(int(point_index))
+                if pos is not None:
+                    vote[pos] += float(split["score"])
+
+        vote_rate = accepted / max(sample_count, 1)
+        if vote_rate < float(args.cache_refine_vote_fraction):
+            continue
+        voted = np.abs(vote) >= float(args.cache_refine_min_vote)
+        if voted.sum() < 2 * int(args.branch_refine_min_side):
+            continue
+
+        side = np.zeros((branch_indices.size,), dtype=np.int8)
+        side[vote > 0.0] = 1
+        side[vote < 0.0] = -1
+
+        if np.any(side == 0):
+            voted_points = branch_indices[side != 0]
+            voted_side = side[side != 0]
+            tree = cKDTree(points[voted_points])
+            _, nearest = tree.query(points[branch_indices[side == 0]], k=1)
+            side[side == 0] = voted_side[np.asarray(nearest, dtype=np.int64)]
+
+        left = branch_indices[side < 0]
+        right = branch_indices[side > 0]
+        min_side = max(
+            int(args.branch_refine_min_side),
+            int(round(branch_indices.size * float(args.branch_refine_min_fraction))),
+        )
+        if left.size < min_side or right.size < min_side:
+            continue
+
+        refined[left] = next_label
+        next_label += 1
+        refined[right] = next_label
+        next_label += 1
+
+    if next_label == noise_label + 1:
+        return labels
+
+    relabeled = np.full_like(refined, next_label)
+    out_label = 0
+    for old_label in sorted(np.unique(refined).tolist()):
+        if old_label == noise_label:
+            continue
+        mask = refined == old_label
+        if not np.any(mask):
+            continue
+        relabeled[mask] = out_label
+        out_label += 1
+    relabeled[labels == noise_label] = out_label
+    return relabeled
+
+
+def split_cluster_by_height(points, normals, indices, args):
+    if indices.size < max(args.min_cluster_size * 2, 2):
+        return [indices]
+    candidates = candidate_split_normals(points, normals, indices)
+    splits = [
+        split
+        for normal in candidates
+        for split in [best_height_gap_split(points, indices, normal, args)]
+        if split is not None
+    ]
+    if not splits:
+        return [indices]
+    split = max(splits, key=lambda item: (item["score"], item["gap"]))
+    return [split["left"], split["right"]]
+
+
+def split_cluster_by_local_layers(points, normals, indices, args):
+    if not args.enable_local_thin_split:
+        return [indices]
+    if indices.size < max(args.min_cluster_size * 2, 2):
         return [indices]
 
-    left = indices[order[:left_count]]
-    right = indices[order[left_count:]]
-    return [left, right]
+    local = points[indices]
+    candidates = candidate_split_normals(points, normals, indices)
+    best = None
+    for normal in candidates:
+        heights = local @ normal
+        tangent = local - heights[:, None] * normal[None, :]
+        tree = cKDTree(tangent)
+        sample_count = min(
+            int(args.local_thin_split_samples),
+            indices.size,
+        )
+        if sample_count <= 0:
+            continue
+        if sample_count < indices.size:
+            sample_idx = np.linspace(
+                0,
+                indices.size - 1,
+                num=sample_count,
+                dtype=np.int64,
+            )
+        else:
+            sample_idx = np.arange(indices.size, dtype=np.int64)
+
+        votes = []
+        local_k = min(int(args.local_thin_split_k), indices.size)
+        for center_idx in sample_idx:
+            _, nn_idx = tree.query(tangent[center_idx], k=local_k)
+            nn_idx = np.asarray(nn_idx, dtype=np.int64).reshape(-1)
+            if nn_idx.size < max(2 * int(args.min_small_cluster_size), 8):
+                continue
+            split = best_height_gap_split(
+                points,
+                indices[nn_idx],
+                normal,
+                args,
+            )
+            if split is None:
+                continue
+            votes.append(split["gap"])
+        vote_rate = len(votes) / max(sample_count, 1)
+        if vote_rate < float(args.local_thin_split_vote_fraction):
+            continue
+
+        global_split = best_height_gap_split(points, indices, normal, args)
+        if global_split is None:
+            continue
+        score = global_split["score"] * vote_rate
+        if best is None or score > best["score"]:
+            best = {
+                "score": score,
+                "left": global_split["left"],
+                "right": global_split["right"],
+            }
+    if best is None:
+        return [indices]
+    return [best["left"], best["right"]]
+
+
+def split_one_part(points, normals, part, args):
+    local_split = split_cluster_by_local_layers(points, normals, part, args)
+    if len(local_split) > 1:
+        return local_split
+    return split_cluster_by_height(points, normals, part, args)
 
 
 def split_thin_parallel_layers(points, normals, labels, args):
@@ -277,7 +584,7 @@ def split_thin_parallel_layers(points, normals, labels, args):
             changed = False
             updated = []
             for part in parts:
-                split = split_cluster_by_height(points, normals, part, args)
+                split = split_one_part(points, normals, part, args)
                 if len(split) > 1:
                     changed = True
                 updated.extend(split)
@@ -511,6 +818,13 @@ def cache_one_shape(rel_path, args, rng):
         args,
     )
     labels = split_thin_parallel_layers(points, normals, labels, args)
+    labels = refine_labels_by_local_patch_splits(
+        points,
+        normals,
+        labels,
+        labels != int(labels.max()),
+        args,
+    )
     labels, branch_rows = relabel_and_filter(
         points,
         normals,
@@ -546,6 +860,101 @@ def cache_one_shape(rel_path, args, rng):
         "small_valid_branch_count": int(
             sum(row["is_small_valid"] for row in branch_rows)
         ),
+    }
+
+
+def refine_one_cache(task):
+    index, total, rel_path, args = task
+    print(f"[{index + 1}/{total}] refine {rel_path}", flush=True)
+    try:
+        return refine_cache_file(rel_path, args)
+    except Exception as exc:
+        return {
+            "rel_path": rel_path,
+            "status": "error",
+            "error": repr(exc),
+        }
+
+
+def refine_cache_file(rel_path, args):
+    output_path = Path(args.cache_root) / rel_path / args.cache_name
+    if not output_path.exists():
+        return {
+            "rel_path": rel_path,
+            "status": "missing_cache",
+            "cache": str(output_path),
+        }
+    clean_path = Path(args.clean_root) / rel_path / "clean.npy"
+    if not clean_path.exists():
+        return {
+            "rel_path": rel_path,
+            "status": "missing_clean",
+            "cache": str(output_path),
+            "clean": str(clean_path),
+        }
+
+    cache = np.load(output_path)
+    labels = cache["labels"].astype(np.int32, copy=False)
+    normals = cache["normals"].astype(np.float32, copy=False)
+    curvature = cache["curvature"].astype(np.float32, copy=False)
+    valid_mask = cache["valid_mask"].astype(np.bool_, copy=False)
+    points = np.load(clean_path).astype(np.float32, copy=False)
+    if points.shape[0] != labels.shape[0]:
+        return {
+            "rel_path": rel_path,
+            "status": "shape_mismatch",
+            "cache": str(output_path),
+            "clean": str(clean_path),
+            "point_count": int(points.shape[0]),
+            "label_count": int(labels.shape[0]),
+        }
+
+    old_branch_count = int(cache["branch_count"][0])
+    old_noise_fraction = float(cache["noise_fraction"][0])
+    refined = refine_labels_by_local_patch_splits(
+        points,
+        normals,
+        labels,
+        valid_mask,
+        args,
+    )
+    if np.array_equal(refined, labels) and not args.overwrite:
+        return {
+            "rel_path": rel_path,
+            "status": "unchanged",
+            "cache": str(output_path),
+            "old_branch_count": old_branch_count,
+            "new_branch_count": old_branch_count,
+            "noise_fraction": old_noise_fraction,
+            "valid_fraction": float(valid_mask.mean()),
+        }
+
+    noise_label = int(refined.max())
+    noise_fraction = float((refined == noise_label).mean())
+    valid_mask = refined != noise_label
+    if noise_fraction > float(args.max_noise_fraction):
+        valid_mask[:] = False
+
+    np.savez_compressed(
+        output_path,
+        labels=refined.astype(np.int32, copy=False),
+        normals=normals.astype(np.float32, copy=False),
+        curvature=curvature.astype(np.float32, copy=False),
+        valid_mask=valid_mask.astype(np.bool_, copy=False),
+        noise_label=np.asarray([noise_label], dtype=np.int32),
+        noise_fraction=np.asarray([noise_fraction], dtype=np.float32),
+        branch_count=np.asarray([noise_label + 1], dtype=np.int32),
+        plane_threshold=cache["plane_threshold"],
+    )
+    return {
+        "rel_path": rel_path,
+        "status": "write",
+        "cache": str(output_path),
+        "old_branch_count": old_branch_count,
+        "new_branch_count": noise_label + 1,
+        "noise_fraction": noise_fraction,
+        "valid_fraction": float(valid_mask.mean()),
+        "changed_points": int(np.sum(refined != labels)),
     }
 
 
@@ -603,7 +1012,7 @@ def main():
     parser.add_argument("--cache-name", default="surface_branches.npz")
     parser.add_argument(
         "--mode",
-        choices=["diagnose", "cache"],
+        choices=["diagnose", "cache", "refine-cache"],
         default="diagnose",
     )
     parser.add_argument("--max-noise-fraction", type=float, default=0.35)
@@ -628,21 +1037,54 @@ def main():
     parser.add_argument("--small-branch-mid-ratio-max", type=float, default=0.45)
     parser.add_argument("--enable-thin-split", action="store_true")
     parser.add_argument("--thin-split-min-gap", type=float, default=0.006)
+    parser.add_argument("--thin-split-min-gap-score", type=float, default=0.35)
     parser.add_argument("--thin-split-min-fraction", type=float, default=0.08)
     parser.add_argument("--thin-split-max-depth", type=int, default=2)
     parser.add_argument("--thin-split-max-parts", type=int, default=8)
+    parser.add_argument("--disable-local-thin-split", action="store_true")
+    parser.add_argument("--local-thin-split-k", type=int, default=384)
+    parser.add_argument("--local-thin-split-samples", type=int, default=96)
+    parser.add_argument("--local-thin-split-vote-fraction", type=float, default=0.15)
+    parser.add_argument("--enable-cache-local-refine", action="store_true")
+    parser.add_argument("--cache-refine-patch-size", type=int, default=1000)
+    parser.add_argument("--cache-refine-samples", type=int, default=256)
+    parser.add_argument("--cache-refine-vote-fraction", type=float, default=0.15)
+    parser.add_argument("--cache-refine-min-vote", type=float, default=0.35)
+    parser.add_argument("--branch-refine-min-points", type=int, default=80)
+    parser.add_argument("--branch-refine-min-side", type=int, default=20)
+    parser.add_argument("--branch-refine-min-fraction", type=float, default=0.08)
+    parser.add_argument("--branch-refine-min-gap", type=float, default=0.001)
+    parser.add_argument("--branch-refine-min-gap-score", type=float, default=0.35)
     parser.add_argument("--max-draw-clusters", type=int, default=20)
     parser.add_argument("--sample-missing-clean", action="store_true")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=20260618)
     args = parser.parse_args()
+    args.enable_local_thin_split = (
+        bool(args.enable_thin_split) and not bool(args.disable_local_thin_split)
+    )
+    if args.mode == "refine-cache":
+        args.enable_cache_local_refine = True
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
     paths = choose_paths(args, rng)
     rows = []
-    if args.mode == "cache" and int(args.workers) > 1:
+    if args.mode == "refine-cache":
+        tasks = [
+            (index, len(paths), rel_path, args)
+            for index, rel_path in enumerate(paths)
+        ]
+        if int(args.workers) > 1:
+            with ProcessPoolExecutor(max_workers=int(args.workers)) as executor:
+                futures = [executor.submit(refine_one_cache, task) for task in tasks]
+                for future in as_completed(futures):
+                    rows.append(future.result())
+        else:
+            for task in tasks:
+                rows.append(refine_one_cache(task))
+    elif args.mode == "cache" and int(args.workers) > 1:
         tasks = [
             (index, len(paths), rel_path, args)
             for index, rel_path in enumerate(paths)

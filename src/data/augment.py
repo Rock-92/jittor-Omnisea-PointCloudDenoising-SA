@@ -181,11 +181,86 @@ class AugmentPatch(Augment):
     bridge_t_max: float=1.0
 
     bridge_noise_std: float=0.0
+
+    refine_surface_branches: bool=True
+
+    branch_refine_min_points: int=80
+
+    branch_refine_min_side: int=20
+
+    branch_refine_min_fraction: float=0.08
+
+    branch_refine_min_gap: float=0.001
+
+    branch_refine_min_gap_score: float=0.35
     
     @classmethod
     def parse(cls, **kwargs) -> 'AugmentPatch':
         cls.check_keys(kwargs)
         return AugmentPatch(**kwargs)
+
+    def _split_branch_by_patch_height(self, clean_patch, indices):
+        if indices.size < max(2 * self.branch_refine_min_side, self.branch_refine_min_points):
+            return None
+        local = clean_patch[indices]
+        centered = local - local.mean(axis=0, keepdims=True)
+        cov = centered.T @ centered / max(local.shape[0] - 1, 1)
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        normal = eigvecs[:, int(np.argmin(eigvals))]
+        heights = local @ normal
+        order = np.argsort(heights)
+        sorted_heights = heights[order]
+        gaps = np.diff(sorted_heights)
+        if gaps.size == 0:
+            return None
+
+        min_side = max(
+            int(self.branch_refine_min_side),
+            int(round(indices.size * float(self.branch_refine_min_fraction))),
+        )
+        if indices.size < 2 * min_side:
+            return None
+        lo = min_side - 1
+        hi = gaps.size - min_side + 1
+        if hi <= lo:
+            return None
+        local_best = int(np.argmax(gaps[lo:hi]))
+        best = lo + local_best
+        best_gap = float(gaps[best])
+        if best_gap < float(self.branch_refine_min_gap):
+            return None
+
+        left_heights = sorted_heights[: best + 1]
+        right_heights = sorted_heights[best + 1:]
+        left_iqr = float(np.percentile(left_heights, 75) - np.percentile(left_heights, 25))
+        right_iqr = float(np.percentile(right_heights, 75) - np.percentile(right_heights, 25))
+        score = best_gap / max(left_iqr + right_iqr, 1e-12)
+        if score < float(self.branch_refine_min_gap_score):
+            return None
+
+        left = indices[order[: best + 1]]
+        right = indices[order[best + 1:]]
+        return left, right
+
+    def _refine_patch_branch_labels(self, clean_patch, labels, valid):
+        if not self.refine_surface_branches:
+            return labels
+        refined = labels.copy()
+        next_label = int(refined.max()) + 1 if refined.size else 0
+        for label in np.unique(labels[valid > 0.5]):
+            mask = (labels == label) & (valid > 0.5)
+            indices = np.flatnonzero(mask).astype(np.int64)
+            split = self._split_branch_by_patch_height(clean_patch, indices)
+            if split is None:
+                continue
+            left, right = split
+            if left.size < self.branch_refine_min_side or right.size < self.branch_refine_min_side:
+                continue
+            refined[left] = next_label
+            next_label += 1
+            refined[right] = next_label
+            next_label += 1
+        return refined
     
     def apply(self, asset: Asset, **kwargs):
         pc = asset.sampled_vertices
@@ -254,6 +329,17 @@ class AugmentPatch(Augment):
             labels = asset.meta['surface_branch_labels'][nn_idx]
             valid = asset.meta['surface_branch_valid'][nn_idx]
             normals = asset.meta['surface_branch_normals'][nn_idx]
+            if self.refine_surface_branches:
+                refined_labels = []
+                for patch_id in range(labels.shape[0]):
+                    refined_labels.append(
+                        self._refine_patch_branch_labels(
+                            pat_B[patch_id],
+                            labels[patch_id],
+                            valid[patch_id],
+                        )
+                    )
+                labels = np.stack(refined_labels, axis=0)
             noise_fraction = np.full(
                 (self.num_patches, 1),
                 asset.meta.get('surface_branch_noise_fraction', 1.0),

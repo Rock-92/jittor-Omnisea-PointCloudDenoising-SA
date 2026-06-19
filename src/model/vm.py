@@ -91,6 +91,12 @@ class VelocityModule(ModelSpec):
         self.use_surface_coherence_loss = bool(
             cfg.get('use_surface_coherence_loss', False)
         )
+        self.use_surface_distribution_loss = bool(
+            cfg.get('use_surface_distribution_loss', False)
+        )
+        self.surface_distribution_repulsion_weight = float(
+            cfg.get('surface_distribution_repulsion_weight', 0.2)
+        )
         self.surface_coherence_k = int(cfg.get('surface_coherence_k', 8))
         self.surface_coherence_cos = float(
             cfg.get('surface_coherence_cos', 0.5)
@@ -369,6 +375,34 @@ class VelocityModule(ModelSpec):
         )
         return pred_loss + cover_loss
 
+    def get_surface_distribution_loss(
+        self,
+        pc_pred,
+        pc_clean,
+        sigma=None,
+        hard_weight=None,
+    ):
+        dist = ((pc_pred.unsqueeze(2) - pc_clean.unsqueeze(1)) ** 2.0).sum(dim=-1)
+        clean_to_pred = dist.min(dim=1)
+
+        clean_pair = ((pc_clean.unsqueeze(2) - pc_clean.unsqueeze(1)) ** 2.0).sum(dim=-1)
+        clean_nn, _ = jt.topk(clean_pair, k=2, dim=-1, largest=False)
+        clean_spacing = jt.sqrt(clean_nn[:, :, 1] + self.patch_scale_eps ** 2.0)
+        target_spacing = clean_spacing.mean(dim=1, keepdims=True)
+
+        pred_pair = ((pc_pred.unsqueeze(2) - pc_pred.unsqueeze(1)) ** 2.0).sum(dim=-1)
+        pred_nn, _ = jt.topk(pred_pair, k=2, dim=-1, largest=False)
+        pred_spacing = jt.sqrt(pred_nn[:, :, 1] + self.patch_scale_eps ** 2.0)
+        repulsion = jt.maximum(target_spacing - pred_spacing, 0.0) ** 2.0
+
+        sigma2 = self._loss_sigma2(sigma, pc_pred.shape[0])
+        coverage_loss = clean_to_pred.mean(dim=1) / sigma2
+        repulsion_loss = repulsion.mean(dim=1) / sigma2
+        loss = coverage_loss + self.surface_distribution_repulsion_weight * repulsion_loss
+        if hard_weight is not None:
+            loss = loss * hard_weight.reshape(pc_pred.shape[0])
+        return loss.mean()
+
     def get_clean_point_normals(self, pc_clean):
         k = min(max(self.surface_normal_k, 3), pc_clean.shape[1])
         dist = ((pc_clean.unsqueeze(2) - pc_clean.unsqueeze(1)) ** 2.0).sum(dim=-1)
@@ -632,6 +666,13 @@ class VelocityModule(ModelSpec):
             )
             losses["surface_coherence_loss"] = surface_coherence_loss
             losses["surface_outlier_loss"] = surface_outlier_loss
+        if self.use_surface_distribution_loss:
+            losses["surface_distribution_loss"] = self.get_surface_distribution_loss(
+                pc_pred=pc_pred,
+                pc_clean=pc_clean,
+                sigma=sigma,
+                hard_weight=hard_weight,
+            )
         return losses
 
     def get_length_projection_loss(
