@@ -176,6 +176,11 @@ class DummySystem():
         self.dataset_module = dataset_module
         self.model = model
         self.loss_config = loss_config
+        self.loss_warmup_config = {}
+        if isinstance(self.loss_config, dict):
+            self.loss_warmup_config = dict(
+                self.loss_config.pop("warmup", {}) or {}
+            )
         self.ckpt_save_dir = ckpt_save_dir
         self.ckpt_save_name = ckpt_save_name
         self.writer = writer
@@ -207,6 +212,25 @@ class DummySystem():
 
     def set_run_dir(self, run_dir: str):
         self.run_dir = run_dir
+
+    def _loss_weight(self, name):
+        assert self.loss_config is not None, "do not have loss_confing"
+        base_weight = float(self.loss_config[name])
+        warmup = self.loss_warmup_config.get(name)
+        if warmup is None:
+            return base_weight
+        start_epoch = int(warmup.get("start_epoch", 0))
+        end_epoch = int(warmup.get("end_epoch", start_epoch))
+        start_scale = float(warmup.get("start_scale", 0.0))
+        end_scale = float(warmup.get("end_scale", 1.0))
+        if self._current_epoch < start_epoch:
+            return base_weight * start_scale
+        if self._current_epoch >= end_epoch:
+            return base_weight * end_scale
+        span = max(end_epoch - start_epoch, 1)
+        progress = (self._current_epoch - start_epoch) / span
+        scale = start_scale + (end_scale - start_scale) * progress
+        return base_weight * scale
     
     def forward(self, batch, validate: bool=False): # return loss sum
         batch = _to_jittor(batch)
@@ -220,15 +244,16 @@ class DummySystem():
             for name in loss_dict:
                 assert name in self.loss_config, f'unspecified loss {name}'
                 self._validation_loss[f"val/{cls}_{name}"].append(_get_item(loss_dict[name]))
-                loss_sum += self.loss_config[name] * loss_dict[name]
+                loss_sum += self._loss_weight(name) * loss_dict[name]
             self._validation_loss[f"val/{cls}_loss_sum"].append(_get_item(loss_sum))
             # TODO: log
             # self.log('val/loss_sum', loss_sum, prog_bar=True, logger=True, sync_dist=True, batch_size=len(assets))
         else:
             for name in loss_dict:
                 assert name in self.loss_config, f"unspecified loss name: `{name}`"
-                if self.loss_config[name] > 0:
-                    loss_sum += self.loss_config[name] * loss_dict[name]
+                weight = self._loss_weight(name)
+                if weight > 0:
+                    loss_sum += weight * loss_dict[name]
             loss_dict['loss_sum'] = loss_sum
             self._last_train_loss_dict = loss_dict.copy()
             # TODO: log

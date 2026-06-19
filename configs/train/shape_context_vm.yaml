@@ -10,6 +10,17 @@ loss:
   region_context_gate: 0.0
   region_crease_mean: 0.0
   region_prior_delta: 0.0
+  warmup:
+    branch_snap_loss:
+      start_epoch: 1
+      end_epoch: 3
+      start_scale: 0.0
+      end_scale: 1.0
+    branch_separation_loss:
+      start_epoch: 1
+      end_epoch: 3
+      start_scale: 0.0
+      end_scale: 1.0
 
 optimizer:
   __target__: adam
