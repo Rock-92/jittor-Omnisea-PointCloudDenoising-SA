@@ -33,7 +33,7 @@ def write_json(path, value):
 def write_csv(path, rows):
     if not rows:
         return
-    fields = list(rows[0].keys())
+    fields = sorted({key for row in rows for key in row})
     with Path(path).open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=fields)
         writer.writeheader()
