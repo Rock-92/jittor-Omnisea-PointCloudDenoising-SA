@@ -190,9 +190,15 @@ class AugmentPatch(Augment):
 
     branch_refine_min_fraction: float=0.08
 
-    branch_refine_min_gap: float=0.001
+    branch_refine_min_gap: float=0.0075
 
     branch_refine_min_gap_score: float=0.35
+
+    branch_refine_min_count_ratio: float=0.3
+
+    branch_refine_neighbor_k: int=12
+
+    branch_refine_min_same_neighbor_ratio: float=0.85
     
     @classmethod
     def parse(cls, **kwargs) -> 'AugmentPatch':
@@ -240,6 +246,19 @@ class AugmentPatch(Augment):
 
         left = indices[order[: best + 1]]
         right = indices[order[best + 1:]]
+        count_ratio = min(left.size, right.size) / max(left.size, right.size)
+        if count_ratio < float(self.branch_refine_min_count_ratio):
+            return None
+
+        layer = np.zeros(indices.size, dtype=np.int8)
+        layer[order[best + 1:]] = 1
+        neighbor_k = min(int(self.branch_refine_neighbor_k) + 1, indices.size)
+        if neighbor_k > 1:
+            _, nn_idx = cKDTree(local).query(local, k=neighbor_k)
+            nn_idx = np.asarray(nn_idx, dtype=np.int64)
+            same_ratio = (layer[nn_idx[:, 1:]] == layer[:, None]).mean()
+            if same_ratio < float(self.branch_refine_min_same_neighbor_ratio):
+                return None
         return left, right
 
     def _refine_patch_branch_labels(self, clean_patch, labels, valid):

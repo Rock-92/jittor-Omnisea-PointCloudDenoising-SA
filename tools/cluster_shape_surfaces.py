@@ -361,12 +361,28 @@ def best_patch_height_gap_split(points, indices, args, reference_normal=None):
     if score < float(args.branch_refine_min_gap_score):
         return None
 
+    left = indices[order[: best + 1]]
+    right = indices[order[best + 1:]]
+    count_ratio = min(left.size, right.size) / max(left.size, right.size)
+    if count_ratio < float(args.branch_refine_min_count_ratio):
+        return None
+
+    layer = np.zeros(indices.size, dtype=np.int8)
+    layer[order[best + 1:]] = 1
+    neighbor_k = min(int(args.branch_refine_neighbor_k) + 1, indices.size)
+    if neighbor_k > 1:
+        _, nn_idx = cKDTree(local).query(local, k=neighbor_k)
+        nn_idx = np.asarray(nn_idx, dtype=np.int64)
+        same_ratio = (layer[nn_idx[:, 1:]] == layer[:, None]).mean()
+        if same_ratio < float(args.branch_refine_min_same_neighbor_ratio):
+            return None
+
     return {
         "score": score,
         "gap": best_gap,
         "normal": normal.astype(np.float32, copy=False),
-        "left": indices[order[: best + 1]],
-        "right": indices[order[best + 1:]],
+        "left": left,
+        "right": right,
     }
 
 
@@ -1053,8 +1069,11 @@ def main():
     parser.add_argument("--branch-refine-min-points", type=int, default=80)
     parser.add_argument("--branch-refine-min-side", type=int, default=20)
     parser.add_argument("--branch-refine-min-fraction", type=float, default=0.08)
-    parser.add_argument("--branch-refine-min-gap", type=float, default=0.001)
+    parser.add_argument("--branch-refine-min-gap", type=float, default=0.0075)
     parser.add_argument("--branch-refine-min-gap-score", type=float, default=0.35)
+    parser.add_argument("--branch-refine-min-count-ratio", type=float, default=0.3)
+    parser.add_argument("--branch-refine-neighbor-k", type=int, default=12)
+    parser.add_argument("--branch-refine-min-same-neighbor-ratio", type=float, default=0.85)
     parser.add_argument("--max-draw-clusters", type=int, default=20)
     parser.add_argument("--sample-missing-clean", action="store_true")
     parser.add_argument("--workers", type=int, default=1)
