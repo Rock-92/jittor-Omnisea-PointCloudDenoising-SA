@@ -12,7 +12,7 @@ train_transform:
     - __target__: patch
       patch_size: 1000
       num_patches: 1
-      refine_surface_branches: true
+      refine_surface_branches: false
 
 validate_transform:
   augments:
@@ -28,6 +28,6 @@ validate_transform:
     - __target__: patch
       patch_size: 1000
       num_patches: 1
-      refine_surface_branches: true
+      refine_surface_branches: false
 
 predict_transform: {}

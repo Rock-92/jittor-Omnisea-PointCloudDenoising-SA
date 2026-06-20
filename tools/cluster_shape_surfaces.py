@@ -228,6 +228,85 @@ def relabel_and_filter(points, normals, curvature, labels, args):
     return new_labels, rows
 
 
+def split_broad_clusters_by_primitives(points, normals, curvature, labels, args):
+    if not bool(args.enable_primitive_refine):
+        return labels
+
+    noise_label = int(labels.max())
+    new_labels = np.full_like(labels, noise_label)
+    next_label = 0
+    tree = cKDTree(points)
+    _, global_neighbors = tree.query(
+        points,
+        k=min(int(args.primitive_graph_k) + 1, points.shape[0]),
+    )
+    global_neighbors = np.asarray(global_neighbors, dtype=np.int64)
+
+    for label in range(noise_label + 1):
+        indices = np.flatnonzero(labels == label).astype(np.int64)
+        if indices.size == 0:
+            continue
+        if label == noise_label:
+            continue
+
+        stats = cluster_shape_stats(points, normals, curvature, labels == label)
+        should_split = (
+            stats is not None
+            and indices.size >= int(args.primitive_min_points)
+            and (
+                stats["normal_var"] > float(args.primitive_normal_var)
+                or stats["scattering"] > float(args.primitive_scattering)
+                or stats["bbox_ratio_min"] > float(args.primitive_bbox_ratio_min)
+            )
+        )
+        if not should_split:
+            new_labels[indices] = next_label
+            next_label += 1
+            continue
+
+        local_pos = {int(point_index): pos for pos, point_index in enumerate(indices)}
+        uf = UnionFind(indices.size)
+        for local_i, point_i in enumerate(indices):
+            pi = points[point_i]
+            ni = normals[point_i]
+            for point_j in global_neighbors[point_i, 1:]:
+                local_j = local_pos.get(int(point_j))
+                if local_j is None or local_j <= local_i:
+                    continue
+                pj = points[point_j]
+                nj = normals[point_j]
+                normal_sim = abs(float(np.dot(ni, nj)))
+                if normal_sim < float(args.primitive_normal_cos):
+                    continue
+                delta = pj - pi
+                plane_i = abs(float(np.dot(delta, ni)))
+                plane_j = abs(float(np.dot(delta, nj)))
+                if max(plane_i, plane_j) > float(args.primitive_plane_threshold):
+                    continue
+                uf.union(local_i, local_j)
+
+        roots = np.asarray([uf.find(i) for i in range(indices.size)], dtype=np.int32)
+        counts = Counter(roots.tolist())
+        small_roots = {
+            root for root, count in counts.items()
+            if count < int(args.primitive_min_component)
+        }
+        for root in sorted(counts):
+            part = indices[roots == root]
+            if root in small_roots:
+                continue
+            new_labels[part] = next_label
+            next_label += 1
+        for root in sorted(small_roots):
+            part = indices[roots == root]
+            new_labels[part] = noise_label
+
+    new_labels[labels == noise_label] = noise_label
+    noise_mask = new_labels == noise_label
+    new_labels[noise_mask] = next_label
+    return new_labels
+
+
 def candidate_split_normals(points, normals, indices):
     local = points[indices]
     local_normals = normals[indices]
@@ -617,6 +696,413 @@ def split_thin_parallel_layers(points, normals, labels, args):
     return new_labels
 
 
+def _normalized(values, eps=1e-12):
+    norm = np.linalg.norm(values, axis=-1, keepdims=True)
+    return values / np.maximum(norm, eps)
+
+
+def mesh_face_geometry(vertices, faces):
+    triangles = vertices[faces]
+    v0 = triangles[:, 0]
+    v1 = triangles[:, 1]
+    v2 = triangles[:, 2]
+    normals = np.cross(v1 - v0, v2 - v0)
+    area2 = np.linalg.norm(normals, axis=1)
+    normals = normals / np.maximum(area2[:, None], 1e-12)
+    centroids = triangles.mean(axis=1)
+    areas = 0.5 * area2
+    return triangles, centroids.astype(np.float32), normals.astype(np.float32), areas.astype(np.float32)
+
+
+def point_triangle_squared_distance(point, triangles):
+    p = point[None, :]
+    a = triangles[:, 0]
+    b = triangles[:, 1]
+    c = triangles[:, 2]
+    ab = b - a
+    ac = c - a
+    ap = p - a
+
+    d1 = np.einsum("ij,ij->i", ab, ap)
+    d2 = np.einsum("ij,ij->i", ac, ap)
+    closest = a.copy()
+    done = (d1 <= 0.0) & (d2 <= 0.0)
+
+    bp = p - b
+    d3 = np.einsum("ij,ij->i", ab, bp)
+    d4 = np.einsum("ij,ij->i", ac, bp)
+    mask = (~done) & (d3 >= 0.0) & (d4 <= d3)
+    closest[mask] = b[mask]
+    done |= mask
+
+    vc = d1 * d4 - d3 * d2
+    mask = (~done) & (vc <= 0.0) & (d1 >= 0.0) & (d3 <= 0.0)
+    denom = np.maximum(d1 - d3, 1e-12)
+    v = d1 / denom
+    closest[mask] = a[mask] + v[mask, None] * ab[mask]
+    done |= mask
+
+    cp = p - c
+    d5 = np.einsum("ij,ij->i", ab, cp)
+    d6 = np.einsum("ij,ij->i", ac, cp)
+    mask = (~done) & (d6 >= 0.0) & (d5 <= d6)
+    closest[mask] = c[mask]
+    done |= mask
+
+    vb = d5 * d2 - d1 * d6
+    mask = (~done) & (vb <= 0.0) & (d2 >= 0.0) & (d6 <= 0.0)
+    denom = np.maximum(d2 - d6, 1e-12)
+    w = d2 / denom
+    closest[mask] = a[mask] + w[mask, None] * ac[mask]
+    done |= mask
+
+    va = d3 * d6 - d5 * d4
+    mask = (~done) & (va <= 0.0) & ((d4 - d3) >= 0.0) & ((d5 - d6) >= 0.0)
+    denom = np.maximum((d4 - d3) + (d5 - d6), 1e-12)
+    w = (d4 - d3) / denom
+    closest[mask] = b[mask] + w[mask, None] * (c[mask] - b[mask])
+    done |= mask
+
+    mask = ~done
+    denom = np.maximum(va + vb + vc, 1e-12)
+    v = vb / denom
+    w = vc / denom
+    closest[mask] = a[mask] + ab[mask] * v[mask, None] + ac[mask] * w[mask, None]
+
+    return ((closest - p) ** 2.0).sum(axis=1)
+
+
+def parse_obj_face_groups(obj_path):
+    groups = []
+    materials = []
+    current_group = "__default__"
+    current_material = "__none__"
+    with Path(obj_path).open("r", encoding="utf-8", errors="ignore") as file:
+        for line in file:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            parts = stripped.split()
+            if not parts:
+                continue
+            key = parts[0]
+            if key == "g":
+                current_group = " ".join(parts[1:]) if len(parts) > 1 else "__default__"
+            elif key == "usemtl":
+                current_material = parts[1] if len(parts) > 1 else "__none__"
+            elif key == "f":
+                vertex_count = len(parts) - 1
+                if vertex_count < 3:
+                    continue
+                # Match triangulation used by most OBJ loaders: fan triangulate n-gons.
+                for _ in range(vertex_count - 2):
+                    groups.append(current_group)
+                    materials.append(current_material)
+    return groups, materials
+
+
+def encode_face_metadata(values, face_count):
+    if values is None or len(values) != face_count:
+        return None
+    mapping = {}
+    encoded = np.empty((face_count,), dtype=np.int32)
+    for index, value in enumerate(values):
+        encoded[index] = mapping.setdefault(value, len(mapping))
+    return encoded
+
+
+def should_union_faces(
+    face_i,
+    face_j,
+    centroids,
+    face_normals,
+    normal_cos,
+    plane_threshold,
+):
+    normal_i = face_normals[face_i]
+    normal_j = face_normals[face_j]
+    if abs(float(np.dot(normal_i, normal_j))) < normal_cos:
+        return False
+    delta = centroids[face_j] - centroids[face_i]
+    plane_i = abs(float(np.dot(delta, normal_i)))
+    plane_j = abs(float(np.dot(delta, normal_j)))
+    return max(plane_i, plane_j) <= plane_threshold
+
+
+def build_mesh_face_labels(vertices, faces, args, face_groups=None, face_materials=None):
+    triangles, centroids, face_normals, areas = mesh_face_geometry(vertices, faces)
+    face_count = faces.shape[0]
+    uf = UnionFind(face_count)
+    group_ids = encode_face_metadata(face_groups, face_count)
+    material_ids = encode_face_metadata(face_materials, face_count)
+    weld_tol = max(float(args.mesh_weld_tol), 0.0)
+    if weld_tol > 0.0:
+        quantized = np.round(vertices / weld_tol).astype(np.int64)
+        canonical = {}
+        welded_vertices = np.empty((vertices.shape[0],), dtype=np.int64)
+        for vertex_index, key_values in enumerate(quantized):
+            key = tuple(int(v) for v in key_values)
+            welded_vertices[vertex_index] = canonical.setdefault(key, len(canonical))
+    else:
+        welded_vertices = np.arange(vertices.shape[0], dtype=np.int64)
+    edge_to_faces = {}
+    for face_index, face in enumerate(faces):
+        welded_face = welded_vertices[face]
+        for a, b in (
+            (int(welded_face[0]), int(welded_face[1])),
+            (int(welded_face[1]), int(welded_face[2])),
+            (int(welded_face[2]), int(welded_face[0])),
+        ):
+            if a > b:
+                a, b = b, a
+            edge_to_faces.setdefault((a, b), []).append(face_index)
+
+    normal_cos = float(args.mesh_normal_cos)
+    plane_threshold = float(args.mesh_plane_threshold)
+    if plane_threshold <= 0.0:
+        bbox_diag = float(np.linalg.norm(vertices.max(axis=0) - vertices.min(axis=0)))
+        plane_threshold = max(float(args.min_plane_threshold), bbox_diag * 0.001)
+
+    if bool(args.mesh_use_groups) and group_ids is not None:
+        group_normal_cos = float(args.mesh_group_normal_cos)
+        group_plane_threshold = float(args.mesh_group_plane_threshold)
+        group_to_faces = {}
+        for face_index, group_id in enumerate(group_ids.tolist()):
+            group_to_faces.setdefault(group_id, []).append(face_index)
+        for group_faces in group_to_faces.values():
+            if len(group_faces) < 2:
+                continue
+            group_faces = np.asarray(group_faces, dtype=np.int64)
+            local_k = min(max(int(args.mesh_group_spatial_k), 1) + 1, group_faces.size)
+            if local_k <= 1:
+                continue
+            _, local_idx = cKDTree(centroids[group_faces]).query(
+                centroids[group_faces],
+                k=local_k,
+            )
+            local_idx = np.asarray(local_idx, dtype=np.int64)
+            for local_i, face_i in enumerate(group_faces):
+                for local_j in local_idx[local_i, 1:]:
+                    face_j = int(group_faces[int(local_j)])
+                    if face_j <= face_i:
+                        continue
+                    if should_union_faces(
+                        int(face_i),
+                        face_j,
+                        centroids,
+                        face_normals,
+                        group_normal_cos,
+                        group_plane_threshold,
+                    ):
+                        uf.union(int(face_i), face_j)
+
+    for adjacent_faces in edge_to_faces.values():
+        if len(adjacent_faces) < 2:
+            continue
+        for pos, face_i in enumerate(adjacent_faces[:-1]):
+            for face_j in adjacent_faces[pos + 1:]:
+                if bool(args.mesh_group_boundary) and group_ids is not None:
+                    same_group = group_ids[face_i] == group_ids[face_j]
+                    same_material = (
+                        material_ids is not None
+                        and material_ids[face_i] == material_ids[face_j]
+                    )
+                    if not same_group and not same_material:
+                        continue
+                if should_union_faces(
+                    face_i,
+                    face_j,
+                    centroids,
+                    face_normals,
+                    normal_cos,
+                    plane_threshold,
+                ):
+                    uf.union(face_i, face_j)
+
+    spatial_k = min(max(int(args.mesh_spatial_k), 0) + 1, face_count)
+    spatial_radius = float(args.mesh_spatial_radius)
+    if spatial_k > 1 and spatial_radius > 0.0:
+        _, neighbor_idx = cKDTree(centroids).query(centroids, k=spatial_k)
+        neighbor_idx = np.asarray(neighbor_idx, dtype=np.int64)
+        for face_i in range(face_count):
+            normal_i = face_normals[face_i]
+            center_i = centroids[face_i]
+            for face_j in neighbor_idx[face_i, 1:]:
+                face_j = int(face_j)
+                if face_j <= face_i:
+                    continue
+                delta = centroids[face_j] - center_i
+                if float(np.linalg.norm(delta)) > spatial_radius:
+                    continue
+                if bool(args.mesh_group_boundary) and group_ids is not None:
+                    same_group = group_ids[face_i] == group_ids[face_j]
+                    same_material = (
+                        material_ids is not None
+                        and material_ids[face_i] == material_ids[face_j]
+                    )
+                    if not same_group and not same_material:
+                        continue
+                if should_union_faces(
+                    face_i,
+                    face_j,
+                    centroids,
+                    face_normals,
+                    normal_cos,
+                    plane_threshold,
+                ):
+                    uf.union(face_i, face_j)
+
+    roots = np.asarray([uf.find(i) for i in range(face_count)], dtype=np.int32)
+    area_by_root = Counter()
+    for root, area in zip(roots.tolist(), areas.tolist()):
+        area_by_root[root] += float(area)
+    min_area = float(args.mesh_min_branch_area)
+    ordered_roots = [
+        root for root, _ in sorted(area_by_root.items())
+        if area_by_root[root] >= min_area
+    ]
+    root_to_label = {root: label for label, root in enumerate(ordered_roots)}
+    noise_label = len(root_to_label)
+    labels = np.asarray(
+        [root_to_label.get(int(root), noise_label) for root in roots],
+        dtype=np.int32,
+    )
+    return labels, face_normals, centroids, triangles, plane_threshold
+
+
+def assign_points_to_mesh_faces(points, face_labels, face_normals, centroids, triangles, args):
+    k = min(max(int(args.mesh_assign_k), 1), centroids.shape[0])
+    _, candidate_idx = cKDTree(centroids).query(points, k=k)
+    candidate_idx = np.asarray(candidate_idx, dtype=np.int64)
+    if candidate_idx.ndim == 1:
+        candidate_idx = candidate_idx[:, None]
+
+    labels = np.empty((points.shape[0],), dtype=np.int32)
+    normals = np.empty_like(points, dtype=np.float32)
+    for point_index, candidates in enumerate(candidate_idx):
+        d2 = point_triangle_squared_distance(points[point_index], triangles[candidates])
+        best_face = int(candidates[int(np.argmin(d2))])
+        labels[point_index] = int(face_labels[best_face])
+        normals[point_index] = face_normals[best_face]
+    return labels, normals
+
+
+def build_mesh_surface_branches(shape, args):
+    points = shape["clean"].astype(np.float32, copy=False)
+    vertices = shape["mesh_vertices"].astype(np.float32, copy=False)
+    faces = shape["mesh_faces"].astype(np.int32, copy=False)
+    obj_path = Path(args.mesh_root) / shape["rel_path"] / "models/model_normalized.obj"
+    face_groups, face_materials = parse_obj_face_groups(obj_path)
+    face_labels, face_normals, centroids, triangles, used_plane_threshold = (
+        build_mesh_face_labels(
+            vertices,
+            faces,
+            args,
+            face_groups=face_groups,
+            face_materials=face_materials,
+        )
+    )
+    labels, normals = assign_points_to_mesh_faces(
+        points,
+        face_labels,
+        face_normals,
+        centroids,
+        triangles,
+        args,
+    )
+    curvature = np.zeros((points.shape[0],), dtype=np.float32)
+    labels, branch_rows = relabel_mesh_labels(points, normals, curvature, labels)
+    if bool(args.enable_mesh_layer_split):
+        original_enable_thin_split = bool(args.enable_thin_split)
+        args.enable_thin_split = True
+        labels = split_thin_parallel_layers(points, normals, labels, args)
+        args.enable_thin_split = original_enable_thin_split
+        labels, branch_rows = relabel_mesh_labels(points, normals, curvature, labels)
+    return labels, normals, curvature, branch_rows, used_plane_threshold
+
+
+def relabel_mesh_labels(points, normals, curvature, labels):
+    valid = sorted(np.unique(labels).tolist())
+    label_map = {int(old_label): new_label for new_label, old_label in enumerate(valid)}
+    new_labels = np.asarray([label_map[int(label)] for label in labels], dtype=np.int32)
+    rows = []
+    for label in range(len(valid)):
+        mask = new_labels == label
+        stats = cluster_shape_stats(points, normals, curvature, mask)
+        rows.append(
+            {
+                "branch_id": int(label),
+                "is_noise": 0,
+                "is_small_valid": int(mask.sum() < 80),
+                "old_label": int(valid[label]),
+                "count": int(mask.sum()),
+                "fraction": float(mask.mean()),
+                "curvature_mean": float(stats["curvature_mean"]),
+                "normal_var": float(stats["normal_var"]),
+                "linearity": float(stats["linearity"]),
+                "planarity": float(stats["planarity"]),
+                "scattering": float(stats["scattering"]),
+                "bbox_ratio_min": float(stats["bbox_ratio_min"]),
+                "bbox_ratio_mid": float(stats["bbox_ratio_mid"]),
+                "normal_x": float(stats["normal"][0]),
+                "normal_y": float(stats["normal"][1]),
+                "normal_z": float(stats["normal"][2]),
+                "center_x": float(stats["center"][0]),
+                "center_y": float(stats["center"][1]),
+                "center_z": float(stats["center"][2]),
+            }
+        )
+    return new_labels, rows
+
+
+def build_point_surface_branches(points, args):
+    normals, curvature, _, _ = estimate_normals(points, args.normal_k)
+    _, _, _, graph_idx = estimate_normals(points, args.graph_k)
+    labels, used_plane_threshold = build_surface_edges(
+        points,
+        normals,
+        graph_idx,
+        args,
+    )
+    labels, branch_rows = relabel_and_filter(
+        points,
+        normals,
+        curvature,
+        labels,
+        args,
+    )
+    labels = split_broad_clusters_by_primitives(
+        points,
+        normals,
+        curvature,
+        labels,
+        args,
+    )
+    labels, branch_rows = relabel_and_filter(
+        points,
+        normals,
+        curvature,
+        labels,
+        args,
+    )
+    labels = split_thin_parallel_layers(points, normals, labels, args)
+    labels = refine_labels_by_local_patch_splits(
+        points,
+        normals,
+        labels,
+        labels != int(labels.max()),
+        args,
+    )
+    labels, branch_rows = relabel_and_filter(
+        points,
+        normals,
+        curvature,
+        labels,
+        args,
+    )
+    return labels, normals, curvature, branch_rows, used_plane_threshold
+
+
 def project(points, view):
     if view == "xy":
         return points[:, [0, 1]]
@@ -647,12 +1133,14 @@ def equal_axes_3d(ax, points):
     ax.set_zlim(center[2] - radius * 1.06, center[2] + radius * 1.06)
 
 
-def draw_clusters(path, points, labels, title, max_clusters):
+def draw_clusters(path, points, labels, title, max_clusters, noise_label=None):
     cmap = plt.get_cmap("tab20")
     colors = np.asarray([cmap(i % 20) for i in range(max(labels.max() + 1, 1))])
     point_colors = colors[np.clip(labels, 0, colors.shape[0] - 1)]
-    noise_label = int(labels.max())
-    point_colors[labels == noise_label] = (0.45, 0.45, 0.45, 0.25)
+    if noise_label is None:
+        noise_label = int(labels.max())
+    if 0 <= int(noise_label) <= int(labels.max()):
+        point_colors[labels == int(noise_label)] = (0.45, 0.45, 0.45, 0.25)
 
     fig = plt.figure(figsize=(14, 11), constrained_layout=True)
     grid = fig.add_gridspec(2, 2)
@@ -704,29 +1192,14 @@ def cluster_one_shape(rel_path, args, rng, out_dir):
         args.sample_missing_clean,
     )
     points = shape["clean"].astype(np.float32, copy=False)
-    normals, curvature, _, nn_idx = estimate_normals(points, args.normal_k)
-    _, _, _, graph_idx = estimate_normals(points, args.graph_k)
-    labels, used_plane_threshold = build_surface_edges(
-        points,
-        normals,
-        graph_idx,
-        args,
-    )
-    labels, branch_rows = relabel_and_filter(
-        points,
-        normals,
-        curvature,
-        labels,
-        args,
-    )
-    labels = split_thin_parallel_layers(points, normals, labels, args)
-    labels, branch_rows = relabel_and_filter(
-        points,
-        normals,
-        curvature,
-        labels,
-        args,
-    )
+    if args.branch_source == "mesh":
+        labels, normals, curvature, branch_rows, used_plane_threshold = (
+            build_mesh_surface_branches(shape, args)
+        )
+    else:
+        labels, normals, curvature, branch_rows, used_plane_threshold = (
+            build_point_surface_branches(points, args)
+        )
     slug = shape_slug(rel_path)
     npz_path = out_dir / f"{slug}_surface_clusters.npz"
     image_path = out_dir / f"{slug}_surface_clusters.png"
@@ -747,37 +1220,37 @@ def cluster_one_shape(rel_path, args, rng, out_dir):
         labels,
         (
             f"{rel_path}\n"
+            f"source={args.branch_source}, "
             f"branches={int(labels.max()) + 1}, "
             f"plane_thr={used_plane_threshold:.6f}, "
-            f"normal_cos={args.normal_cos}"
+            f"normal_cos={args.mesh_normal_cos if args.branch_source == 'mesh' else args.normal_cos}"
         ),
         args.max_draw_clusters,
+        noise_label=(int(labels.max()) + 1 if args.branch_source == "mesh" else None),
     )
     top_counts = Counter(labels.tolist()).most_common(12)
+    noise_label = int(labels.max()) + 1 if args.branch_source == "mesh" else int(labels.max())
+    noise_fraction = 0.0 if args.branch_source == "mesh" else float((labels == labels.max()).mean())
     return {
         "rel_path": rel_path,
         "point_count": int(points.shape[0]),
-        "branch_count_including_noise": int(labels.max()) + 1,
-        "noise_label": int(labels.max()),
-        "noise_fraction": float((labels == labels.max()).mean()),
+        "branch_count_including_noise": noise_label + 1,
+        "noise_label": noise_label,
+        "noise_fraction": noise_fraction,
         "small_valid_branch_count": int(
             sum(row["is_small_valid"] for row in branch_rows)
         ),
         "mean_branch_curvature": float(
             np.mean(
                 [
-                    row["curvature_mean"]
-                    for row in branch_rows
-                    if not row["is_noise"]
+                    row["curvature_mean"] for row in branch_rows if not row["is_noise"]
                 ]
             )
         ),
         "mean_branch_normal_var": float(
             np.mean(
                 [
-                    row["normal_var"]
-                    for row in branch_rows
-                    if not row["is_noise"]
+                    row["normal_var"] for row in branch_rows if not row["is_noise"]
                 ]
             )
         ),
@@ -818,39 +1291,22 @@ def cache_one_shape(rel_path, args, rng):
         args.sample_missing_clean,
     )
     points = shape["clean"].astype(np.float32, copy=False)
-    normals, curvature, _, _ = estimate_normals(points, args.normal_k)
-    _, _, _, graph_idx = estimate_normals(points, args.graph_k)
-    labels, used_plane_threshold = build_surface_edges(
-        points,
-        normals,
-        graph_idx,
-        args,
-    )
-    labels, branch_rows = relabel_and_filter(
-        points,
-        normals,
-        curvature,
-        labels,
-        args,
-    )
-    labels = split_thin_parallel_layers(points, normals, labels, args)
-    labels = refine_labels_by_local_patch_splits(
-        points,
-        normals,
-        labels,
-        labels != int(labels.max()),
-        args,
-    )
-    labels, branch_rows = relabel_and_filter(
-        points,
-        normals,
-        curvature,
-        labels,
-        args,
-    )
-    noise_label = int(labels.max())
-    noise_fraction = float((labels == noise_label).mean())
-    valid_mask = labels != noise_label
+    if args.branch_source == "mesh":
+        labels, normals, curvature, branch_rows, used_plane_threshold = (
+            build_mesh_surface_branches(shape, args)
+        )
+    else:
+        labels, normals, curvature, branch_rows, used_plane_threshold = (
+            build_point_surface_branches(points, args)
+        )
+    if args.branch_source == "mesh":
+        noise_label = int(labels.max()) + 1
+        noise_fraction = 0.0
+        valid_mask = np.ones((labels.shape[0],), dtype=np.bool_)
+    else:
+        noise_label = int(labels.max())
+        noise_fraction = float((labels == noise_label).mean())
+        valid_mask = labels != noise_label
     if noise_fraction > float(args.max_noise_fraction):
         valid_mask[:] = False
 
@@ -865,6 +1321,7 @@ def cache_one_shape(rel_path, args, rng):
         noise_fraction=np.asarray([noise_fraction], dtype=np.float32),
         branch_count=np.asarray([noise_label + 1], dtype=np.int32),
         plane_threshold=np.asarray([used_plane_threshold], dtype=np.float32),
+        branch_source=np.asarray([args.branch_source]),
     )
     return {
         "rel_path": rel_path,
@@ -1027,6 +1484,12 @@ def main():
     parser.add_argument("--cache-root", default="cache_surface_branches")
     parser.add_argument("--cache-name", default="surface_branches.npz")
     parser.add_argument(
+        "--branch-source",
+        choices=["mesh", "point"],
+        default="mesh",
+        help="Generate surface branches from OBJ face adjacency or clean point kNN.",
+    )
+    parser.add_argument(
         "--mode",
         choices=["diagnose", "cache", "refine-cache"],
         default="diagnose",
@@ -1044,6 +1507,20 @@ def main():
     parser.add_argument("--plane-threshold", type=float, default=0.0)
     parser.add_argument("--plane-threshold-scale", type=float, default=0.55)
     parser.add_argument("--min-plane-threshold", type=float, default=0.0012)
+    parser.add_argument("--mesh-normal-cos", type=float, default=0.965)
+    parser.add_argument("--mesh-plane-threshold", type=float, default=0.0015)
+    parser.add_argument("--mesh-assign-k", type=int, default=24)
+    parser.add_argument("--mesh-min-branch-area", type=float, default=0.0)
+    parser.add_argument("--mesh-weld-tol", type=float, default=1e-5)
+    parser.add_argument("--mesh-spatial-k", type=int, default=12)
+    parser.add_argument("--mesh-spatial-radius", type=float, default=0.04)
+    parser.add_argument("--enable-mesh-groups", action="store_true")
+    parser.add_argument("--disable-mesh-groups", action="store_true")
+    parser.add_argument("--mesh-group-boundary", action="store_true")
+    parser.add_argument("--mesh-group-normal-cos", type=float, default=0.86)
+    parser.add_argument("--mesh-group-plane-threshold", type=float, default=0.006)
+    parser.add_argument("--mesh-group-spatial-k", type=int, default=24)
+    parser.add_argument("--disable-mesh-layer-split", action="store_true")
     parser.add_argument("--min-cluster-size", type=int, default=80)
     parser.add_argument("--min-small-cluster-size", type=int, default=20)
     parser.add_argument("--small-branch-normal-var-max", type=float, default=0.22)
@@ -1051,9 +1528,18 @@ def main():
     parser.add_argument("--small-branch-planarity-min", type=float, default=0.18)
     parser.add_argument("--small-branch-linearity-min", type=float, default=0.45)
     parser.add_argument("--small-branch-mid-ratio-max", type=float, default=0.45)
+    parser.add_argument("--disable-primitive-refine", action="store_true")
+    parser.add_argument("--primitive-normal-var", type=float, default=0.28)
+    parser.add_argument("--primitive-scattering", type=float, default=0.12)
+    parser.add_argument("--primitive-bbox-ratio-min", type=float, default=0.35)
+    parser.add_argument("--primitive-normal-cos", type=float, default=0.985)
+    parser.add_argument("--primitive-plane-threshold", type=float, default=0.0018)
+    parser.add_argument("--primitive-graph-k", type=int, default=16)
+    parser.add_argument("--primitive-min-points", type=int, default=600)
+    parser.add_argument("--primitive-min-component", type=int, default=80)
     parser.add_argument("--enable-thin-split", action="store_true")
-    parser.add_argument("--thin-split-min-gap", type=float, default=0.006)
-    parser.add_argument("--thin-split-min-gap-score", type=float, default=0.35)
+    parser.add_argument("--thin-split-min-gap", type=float, default=0.004)
+    parser.add_argument("--thin-split-min-gap-score", type=float, default=0.5)
     parser.add_argument("--thin-split-min-fraction", type=float, default=0.08)
     parser.add_argument("--thin-split-max-depth", type=int, default=2)
     parser.add_argument("--thin-split-max-parts", type=int, default=8)
@@ -1082,6 +1568,11 @@ def main():
     args.enable_local_thin_split = (
         bool(args.enable_thin_split) and not bool(args.disable_local_thin_split)
     )
+    args.enable_primitive_refine = not bool(args.disable_primitive_refine)
+    args.mesh_use_groups = bool(args.enable_mesh_groups) and not bool(
+        args.disable_mesh_groups
+    )
+    args.enable_mesh_layer_split = not bool(args.disable_mesh_layer_split)
     if args.mode == "refine-cache":
         args.enable_cache_local_refine = True
 

@@ -116,6 +116,9 @@ class VelocityModule(ModelSpec):
         self.surface_branch_min_valid = float(
             cfg.get('surface_branch_min_valid', 0.5)
         )
+        self.surface_branch_snap_k = int(
+            cfg.get('surface_branch_snap_k', 16)
+        )
         self.surface_branch_separation_k = int(
             cfg.get('surface_branch_separation_k', 8)
         )
@@ -579,12 +582,48 @@ class VelocityModule(ModelSpec):
             jt.ones_like(valid_sum),
             jt.zeros_like(valid_sum),
         )
-
-        signed = ((pc_pred - pc_clean) * branch_normal).sum(dim=-1)
-        abs_dist = jt.sqrt(signed ** 2.0 + self.patch_scale_eps ** 2.0) - self.patch_scale_eps
         tau = max(self.surface_branch_tau, self.patch_scale_eps)
-        snap_point = tau * jt.log(1.0 + abs_dist / tau)
-        snap_loss = (snap_point * valid).sum(dim=1) / (valid_sum + 1e-6)
+        snap_k = min(max(self.surface_branch_snap_k, 1), pc_clean.shape[1])
+        pred_clean_dist = (
+            (pc_pred.unsqueeze(2) - pc_clean.unsqueeze(1)) ** 2.0
+        ).sum(dim=-1)
+        _, snap_idx = jt.topk(
+            pred_clean_dist,
+            k=snap_k,
+            dim=-1,
+            largest=False,
+        )
+        cand_clean = []
+        cand_normal = []
+        cand_valid = []
+        for b in range(pc_pred.shape[0]):
+            cand_idx = snap_idx[b]
+            cand_clean.append(pc_clean[b][cand_idx])
+            cand_normal.append(branch_normal[b][cand_idx])
+            cand_valid.append(valid[b][cand_idx])
+        cand_clean = jt.stack(cand_clean, dim=0)
+        cand_normal = jt.stack(cand_normal, dim=0)
+        cand_valid = jt.stack(cand_valid, dim=0)
+        signed = ((pc_pred.unsqueeze(2) - cand_clean) * cand_normal).sum(dim=-1)
+        abs_dist = (
+            jt.sqrt(signed ** 2.0 + self.patch_scale_eps ** 2.0)
+            - self.patch_scale_eps
+        )
+        snap_candidates = tau * jt.log(1.0 + abs_dist / tau)
+        snap_candidates = jt.where(
+            cand_valid > 0.5,
+            snap_candidates,
+            jt.ones_like(snap_candidates) * 1e3,
+        )
+        snap_point = snap_candidates.min(dim=2)
+        snap_valid = jt.where(
+            cand_valid.max(dim=2) > 0.5,
+            jt.ones_like(snap_point),
+            jt.zeros_like(snap_point),
+        )
+        snap_loss = (snap_point * snap_valid).sum(dim=1) / (
+            snap_valid.sum(dim=1) + 1e-6
+        )
 
         k = min(max(self.surface_branch_separation_k, 1) + 1, pc_clean.shape[1])
         dist = ((pc_clean.unsqueeze(2) - pc_clean.unsqueeze(1)) ** 2.0).sum(dim=-1)

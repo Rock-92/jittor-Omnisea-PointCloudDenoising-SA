@@ -36,6 +36,7 @@ surface_outlier_margin: 0.001
 use_surface_branch_loss: true
 surface_branch_tau: 0.001
 surface_branch_min_valid: 0.5
+surface_branch_snap_k: 16
 surface_branch_separation_k: 8
 surface_branch_separation_margin: 0.8
 
