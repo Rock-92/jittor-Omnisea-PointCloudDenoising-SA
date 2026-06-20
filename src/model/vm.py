@@ -119,6 +119,24 @@ class VelocityModule(ModelSpec):
         self.surface_branch_snap_k = int(
             cfg.get('surface_branch_snap_k', 16)
         )
+        self.nearest_surface_branch_k = int(
+            cfg.get('nearest_surface_branch_k', self.surface_branch_snap_k)
+        )
+        self.nearest_surface_branch_margin = float(
+            cfg.get('nearest_surface_branch_margin', 0.02)
+        )
+        self.use_branch_coverage_loss = bool(
+            cfg.get('use_branch_coverage_loss', False)
+        )
+        self.branch_coverage_tau = float(
+            cfg.get('branch_coverage_tau', self.surface_snap_tau)
+        )
+        self.branch_coverage_tangent_weight = float(
+            cfg.get('branch_coverage_tangent_weight', 0.1)
+        )
+        self.branch_coverage_exclusive_ratio = float(
+            cfg.get('branch_coverage_exclusive_ratio', 2.0)
+        )
         self.surface_branch_separation_k = int(
             cfg.get('surface_branch_separation_k', 8)
         )
@@ -437,7 +455,25 @@ class VelocityModule(ModelSpec):
         self,
         pc_pred,
         pc_clean,
+        pc_noisy=None,
+        branch_label=None,
+        branch_valid=None,
+        branch_normal=None,
     ):
+        if (
+            pc_noisy is not None
+            and branch_label is not None
+            and branch_valid is not None
+            and branch_normal is not None
+        ):
+            return self.get_branch_limited_surface_geometry(
+                pc_pred=pc_pred,
+                pc_clean=pc_clean,
+                pc_noisy=pc_noisy,
+                branch_label=branch_label,
+                branch_valid=branch_valid,
+                branch_normal=branch_normal,
+            )
         dist = ((pc_pred.unsqueeze(2) - pc_clean.unsqueeze(1)) ** 2.0).sum(dim=-1)
         _, idx = jt.topk(dist, k=1, dim=2, largest=False)
         clean_normals = self.get_clean_point_normals(pc_clean)
@@ -452,16 +488,164 @@ class VelocityModule(ModelSpec):
         signed_plane_dist = ((pc_pred - anchors) * normals).sum(dim=-1)
         return anchors, normals, signed_plane_dist
 
+    def get_branch_limited_surface_geometry(
+        self,
+        pc_pred,
+        pc_clean,
+        pc_noisy,
+        branch_label,
+        branch_valid,
+        branch_normal,
+    ):
+        valid = branch_valid
+        if len(valid.shape) == 3:
+            valid = valid.squeeze(-1)
+        margin = max(self.nearest_surface_branch_margin, self.patch_scale_eps)
+        candidate_k = min(
+            max(self.nearest_surface_branch_k, 1),
+            pc_clean.shape[1],
+        )
+
+        noisy_clean_dist = (
+            (pc_noisy.unsqueeze(2) - pc_clean.unsqueeze(1)) ** 2.0
+        ).sum(dim=-1)
+        _, local_idx = jt.topk(
+            noisy_clean_dist,
+            k=candidate_k,
+            dim=-1,
+            largest=False,
+        )
+        local_clean = []
+        local_normal = []
+        local_valid = []
+        for b in range(pc_pred.shape[0]):
+            idx = local_idx[b]
+            local_clean.append(pc_clean[b][idx])
+            local_normal.append(branch_normal[b][idx])
+            local_valid.append(valid[b][idx])
+        local_clean = jt.stack(local_clean, dim=0)
+        local_normal = jt.stack(local_normal, dim=0)
+        local_valid = jt.stack(local_valid, dim=0)
+
+        local_delta = pc_pred.unsqueeze(2) - local_clean
+        local_signed = (local_delta * local_normal).sum(dim=-1)
+        local_tangent = local_delta - local_signed.unsqueeze(-1) * local_normal
+        local_tangent_dist = jt.sqrt(
+            (local_tangent ** 2.0).sum(dim=-1) + self.patch_scale_eps ** 2.0
+        )
+        local_ok = (local_valid > 0.5) & (local_tangent_dist <= margin)
+        local_score = jt.abs(local_signed)
+        local_score = jt.where(
+            local_ok,
+            local_score,
+            jt.ones_like(local_score) * 1e6,
+        )
+        local_best_score, local_best_pos = local_score.min(dim=2)
+
+        full_delta = pc_pred.unsqueeze(2) - pc_clean.unsqueeze(1)
+        full_normal = branch_normal.unsqueeze(1)
+        full_signed = (full_delta * full_normal).sum(dim=-1)
+        full_tangent = full_delta - full_signed.unsqueeze(-1) * full_normal
+        full_tangent_dist = jt.sqrt(
+            (full_tangent ** 2.0).sum(dim=-1) + self.patch_scale_eps ** 2.0
+        )
+        full_ok = (valid.unsqueeze(1) > 0.5) & (full_tangent_dist <= margin)
+        full_score = jt.abs(full_signed)
+        full_score = jt.where(
+            full_ok,
+            full_score,
+            jt.ones_like(full_score) * 1e6,
+        )
+        full_best_score, full_best_idx = full_score.min(dim=2)
+
+        fallback_score = jt.abs(full_signed)
+        fallback_score = jt.where(
+            valid.unsqueeze(1) > 0.5,
+            fallback_score,
+            jt.ones_like(fallback_score) * 1e6,
+        )
+        _, fallback_idx = fallback_score.min(dim=2)
+
+        local_has_match = jt.where(
+            local_best_score < 1e5,
+            jt.ones_like(local_best_score),
+            jt.zeros_like(local_best_score),
+        )
+        full_has_match = jt.where(
+            full_best_score < 1e5,
+            jt.ones_like(full_best_score),
+            jt.zeros_like(full_best_score),
+        )
+        use_local = local_has_match > 0.5
+        use_full = ((1.0 - local_has_match) * full_has_match) > 0.5
+
+        anchors = []
+        normals = []
+        signed_plane_dist = []
+        for b in range(pc_pred.shape[0]):
+            local_anchor = local_clean[b][local_best_pos[b]]
+            local_n = local_normal[b][local_best_pos[b]]
+            local_s = local_signed[b][
+                jt.arange(pc_pred.shape[1]),
+                local_best_pos[b],
+            ]
+
+            full_anchor = pc_clean[b][full_best_idx[b]]
+            full_n = branch_normal[b][full_best_idx[b]]
+            full_s = full_signed[b][
+                jt.arange(pc_pred.shape[1]),
+                full_best_idx[b],
+            ]
+
+            fallback_anchor = pc_clean[b][fallback_idx[b]]
+            fallback_n = branch_normal[b][fallback_idx[b]]
+            fallback_s = full_signed[b][
+                jt.arange(pc_pred.shape[1]),
+                fallback_idx[b],
+            ]
+
+            anchor = jt.where(
+                use_local[b].unsqueeze(-1),
+                local_anchor,
+                jt.where(use_full[b].unsqueeze(-1), full_anchor, fallback_anchor),
+            )
+            normal = jt.where(
+                use_local[b].unsqueeze(-1),
+                local_n,
+                jt.where(use_full[b].unsqueeze(-1), full_n, fallback_n),
+            )
+            signed = jt.where(
+                use_local[b],
+                local_s,
+                jt.where(use_full[b], full_s, fallback_s),
+            )
+            anchors.append(anchor)
+            normals.append(normal)
+            signed_plane_dist.append(signed)
+        return (
+            jt.stack(anchors, dim=0),
+            jt.stack(normals, dim=0),
+            jt.stack(signed_plane_dist, dim=0),
+        )
+
     def get_nearest_surface_loss(
         self,
         pc_pred,
         pc_clean,
+        pc_noisy=None,
+        branch_label=None,
+        branch_valid=None,
+        branch_normal=None,
         sigma=None,
         hard_weight=None,
     ):
         _, _, signed_plane_dist = self.get_nearest_surface_geometry(
             pc_pred=pc_pred,
             pc_clean=pc_clean,
+            pc_noisy=pc_noisy,
+            branch_label=branch_label,
+            branch_valid=branch_valid,
+            branch_normal=branch_normal,
         )
         plane_dist = signed_plane_dist ** 2.0
         if self.use_surface_snap_loss and self.surface_snap_weight > 0.0:
@@ -472,6 +656,104 @@ class VelocityModule(ModelSpec):
             )
         sigma2 = self._loss_sigma2(sigma, pc_pred.shape[0])
         loss = plane_dist.mean(dim=1) / sigma2
+        if hard_weight is not None:
+            loss = loss * hard_weight.reshape(pc_pred.shape[0])
+        return loss.mean()
+
+    def get_branch_coverage_loss(
+        self,
+        pc_pred,
+        pc_clean,
+        branch_label,
+        branch_valid,
+        branch_normal,
+        sigma=None,
+        hard_weight=None,
+    ):
+        valid = branch_valid
+        if len(valid.shape) == 3:
+            valid = valid.squeeze(-1)
+        margin = max(self.nearest_surface_branch_margin, self.patch_scale_eps)
+        tau = max(self.branch_coverage_tau, self.patch_scale_eps)
+        tangent_weight = self.branch_coverage_tangent_weight
+        exclusive_ratio = self.branch_coverage_exclusive_ratio
+        batch_losses = []
+        for b in range(pc_pred.shape[0]):
+            labels_np = np.asarray(branch_label[b].numpy()).reshape(-1)
+            valid_np = np.asarray(valid[b].numpy()).reshape(-1) > 0.5
+            branch_ids = [
+                int(label)
+                for label in np.unique(labels_np[valid_np])
+                if label >= 0
+            ]
+            if not branch_ids:
+                batch_losses.append(jt.array(0.0))
+                continue
+
+            branch_data = []
+            pred_to_branch = []
+            for label in branch_ids:
+                idx_np = np.where((labels_np == label) & valid_np)[0]
+                idx = jt.array(idx_np).int32()
+                clean_b = pc_clean[b][idx]
+                normal_b = branch_normal[b][idx]
+                delta = pc_pred[b].unsqueeze(1) - clean_b.unsqueeze(0)
+                signed = (delta * normal_b.unsqueeze(0)).sum(dim=-1)
+                normal_dist = jt.abs(signed)
+                tangent = delta - signed.unsqueeze(-1) * normal_b.unsqueeze(0)
+                tangent_dist = jt.sqrt(
+                    (tangent ** 2.0).sum(dim=-1) + self.patch_scale_eps ** 2.0
+                )
+                in_range = tangent_dist <= margin
+                branch_score = jt.where(
+                    in_range,
+                    normal_dist,
+                    jt.ones_like(normal_dist) * 1e6,
+                )
+                best_to_branch = branch_score.min(dim=1)
+                branch_data.append(
+                    (clean_b, normal_b, normal_dist, tangent_dist, in_range)
+                )
+                pred_to_branch.append(best_to_branch)
+
+            branch_stack = jt.stack(pred_to_branch, dim=1)
+            branch_losses = []
+            for branch_pos, (_, _, normal_dist, tangent_dist, in_range) in enumerate(
+                branch_data
+            ):
+                if len(branch_ids) > 1:
+                    other_scores = []
+                    for other_pos in range(len(branch_ids)):
+                        if other_pos == branch_pos:
+                            continue
+                        other_scores.append(branch_stack[:, other_pos])
+                    other_min = jt.stack(other_scores, dim=1).min(dim=1)
+                else:
+                    other_min = jt.ones_like(branch_stack[:, branch_pos]) * 1e6
+                own_min = branch_stack[:, branch_pos]
+                ambiguity_penalty = jt.maximum(
+                    exclusive_ratio * own_min - other_min,
+                    0.0,
+                )
+                cover_cost = (
+                    normal_dist
+                    + tangent_weight * tangent_dist
+                    + ambiguity_penalty.unsqueeze(1)
+                )
+                cover_cost = jt.where(
+                    in_range,
+                    cover_cost,
+                    jt.ones_like(cover_cost) * margin,
+                )
+                cover_dist = cover_cost.min(dim=0)
+                branch_loss = tau * jt.log(1.0 + cover_dist / tau)
+                branch_losses.append(branch_loss.mean())
+            batch_loss = jt.stack(branch_losses).mean()
+            batch_losses.append(batch_loss)
+
+        loss = jt.stack(batch_losses)
+        sigma2 = self._loss_sigma2(sigma, pc_pred.shape[0])
+        loss = loss / sigma2
         if hard_weight is not None:
             loss = loss * hard_weight.reshape(pc_pred.shape[0])
         return loss.mean()
@@ -671,6 +953,9 @@ class VelocityModule(ModelSpec):
         pc_pred,
         pc_clean,
         pc_noisy=None,
+        branch_label=None,
+        branch_valid=None,
+        branch_normal=None,
         sigma=None,
         hard_weight=None,
     ):
@@ -684,6 +969,10 @@ class VelocityModule(ModelSpec):
         nearest_surface_loss = self.get_nearest_surface_loss(
             pc_pred=pc_pred,
             pc_clean=pc_clean,
+            pc_noisy=pc_noisy,
+            branch_label=branch_label,
+            branch_valid=branch_valid,
+            branch_normal=branch_normal,
             sigma=sigma,
             hard_weight=hard_weight,
         )
@@ -709,6 +998,21 @@ class VelocityModule(ModelSpec):
             losses["surface_distribution_loss"] = self.get_surface_distribution_loss(
                 pc_pred=pc_pred,
                 pc_clean=pc_clean,
+                sigma=sigma,
+                hard_weight=hard_weight,
+            )
+        if (
+            self.use_branch_coverage_loss
+            and branch_label is not None
+            and branch_valid is not None
+            and branch_normal is not None
+        ):
+            losses["branch_coverage_loss"] = self.get_branch_coverage_loss(
+                pc_pred=pc_pred,
+                pc_clean=pc_clean,
+                branch_label=branch_label,
+                branch_valid=branch_valid,
+                branch_normal=branch_normal,
                 sigma=sigma,
                 hard_weight=hard_weight,
             )
@@ -928,6 +1232,9 @@ class VelocityModule(ModelSpec):
                         pc_pred=pc_pred,
                         pc_noisy=pc_noisy_for_loss,
                         pc_clean=pc_clean_for_loss,
+                        branch_label=branch_label,
+                        branch_valid=branch_valid,
+                        branch_normal=branch_normal,
                         sigma=score_sigma,
                         hard_weight=hard_weight,
                     )
@@ -1001,6 +1308,9 @@ class VelocityModule(ModelSpec):
                     pc_pred=pc_noisy_for_loss + pred_dir,
                     pc_noisy=pc_noisy_for_loss,
                     pc_clean=pc_clean_for_loss,
+                    branch_label=branch_label,
+                    branch_valid=branch_valid,
+                    branch_normal=branch_normal,
                     sigma=score_sigma,
                 )
             )

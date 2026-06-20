@@ -26,17 +26,23 @@ surface_normal_k: 6
 use_surface_snap_loss: true
 surface_snap_tau: 0.001
 surface_snap_weight: 3.0
-use_surface_coherence_loss: true
-use_surface_distribution_loss: true
+use_surface_coherence_loss: false
+use_surface_distribution_loss: false
 surface_distribution_repulsion_weight: 0.2
 surface_coherence_k: 8
 surface_coherence_cos: 0.5
 surface_coherence_center_cos: 0.5
 surface_outlier_margin: 0.001
-use_surface_branch_loss: true
+use_surface_branch_loss: false
 surface_branch_tau: 0.001
 surface_branch_min_valid: 0.5
 surface_branch_snap_k: 16
+nearest_surface_branch_k: 16
+nearest_surface_branch_margin: 0.02
+use_branch_coverage_loss: true
+branch_coverage_tau: 0.001
+branch_coverage_tangent_weight: 0.1
+branch_coverage_exclusive_ratio: 2.0
 surface_branch_separation_k: 8
 surface_branch_separation_margin: 0.8
 

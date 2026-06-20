@@ -3,30 +3,15 @@ loss:
   clean_coverage_loss: 0.0
   patch_chamfer_loss: 1.0
   nearest_surface_loss: 1.0
-  surface_coherence_loss: 0.5
-  surface_outlier_loss: 0.5
-  branch_snap_loss: 0.5
-  branch_separation_loss: 0.2
-  surface_distribution_loss: 0.3
+  surface_coherence_loss: 0.0
+  surface_outlier_loss: 0.0
+  branch_snap_loss: 0.0
+  branch_separation_loss: 0.0
+  branch_coverage_loss: 0.5
+  surface_distribution_loss: 0.0
   region_context_gate: 0.0
   region_crease_mean: 0.0
   region_prior_delta: 0.0
-  warmup:
-    branch_snap_loss:
-      start_epoch: 1
-      end_epoch: 3
-      start_scale: 0.0
-      end_scale: 1.0
-    branch_separation_loss:
-      start_epoch: 1
-      end_epoch: 3
-      start_scale: 0.0
-      end_scale: 1.0
-    surface_distribution_loss:
-      start_epoch: 1
-      end_epoch: 3
-      start_scale: 0.0
-      end_scale: 1.0
 
 optimizer:
   __target__: adam
