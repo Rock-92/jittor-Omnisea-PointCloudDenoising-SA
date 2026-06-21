@@ -149,6 +149,9 @@ class VelocityModule(ModelSpec):
         self.surface_halo_normal_tau = float(
             cfg.get('surface_halo_normal_tau', 0.004)
         )
+        self.surface_halo_margin = float(
+            cfg.get('surface_halo_margin', self.nearest_surface_branch_margin)
+        )
         self.surface_halo_tangent_tau = float(
             cfg.get('surface_halo_tangent_tau', self.surface_halo_normal_tau)
         )
@@ -515,7 +518,7 @@ class VelocityModule(ModelSpec):
         valid = branch_valid
         if len(valid.shape) == 3:
             valid = valid.squeeze(-1)
-        margin = max(self.nearest_surface_branch_margin, self.patch_scale_eps)
+        margin = max(self.surface_halo_margin, self.patch_scale_eps)
         candidate_k = min(
             max(self.nearest_surface_branch_k, 1),
             pc_clean.shape[1],
