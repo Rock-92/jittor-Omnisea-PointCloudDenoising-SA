@@ -128,6 +128,12 @@ class VelocityModule(ModelSpec):
         self.use_branch_coverage_loss = bool(
             cfg.get('use_branch_coverage_loss', False)
         )
+        self.use_surface_thinness_loss = bool(
+            cfg.get('use_surface_thinness_loss', False)
+        )
+        self.use_surface_halo_loss = bool(
+            cfg.get('use_surface_halo_loss', False)
+        )
         self.branch_coverage_tau = float(
             cfg.get('branch_coverage_tau', self.surface_snap_tau)
         )
@@ -136,6 +142,15 @@ class VelocityModule(ModelSpec):
         )
         self.branch_coverage_exclusive_ratio = float(
             cfg.get('branch_coverage_exclusive_ratio', 2.0)
+        )
+        self.surface_thinness_tau = float(
+            cfg.get('surface_thinness_tau', self.branch_coverage_tau)
+        )
+        self.surface_halo_normal_tau = float(
+            cfg.get('surface_halo_normal_tau', 0.004)
+        )
+        self.surface_halo_tangent_tau = float(
+            cfg.get('surface_halo_tangent_tau', self.surface_halo_normal_tau)
         )
         self.surface_branch_separation_k = int(
             cfg.get('surface_branch_separation_k', 8)
@@ -758,6 +773,156 @@ class VelocityModule(ModelSpec):
             loss = loss * hard_weight.reshape(pc_pred.shape[0])
         return loss.mean()
 
+    def get_surface_thinness_loss(
+        self,
+        pc_pred,
+        pc_clean,
+        branch_label,
+        branch_valid,
+        branch_normal,
+        sigma=None,
+        hard_weight=None,
+    ):
+        valid = branch_valid
+        if len(valid.shape) == 3:
+            valid = valid.squeeze(-1)
+        margin = max(self.nearest_surface_branch_margin, self.patch_scale_eps)
+        tau = max(self.surface_thinness_tau, self.patch_scale_eps)
+        batch_losses = []
+        for b in range(pc_pred.shape[0]):
+            labels_np = np.asarray(branch_label[b].numpy()).reshape(-1)
+            valid_np = np.asarray(valid[b].numpy()).reshape(-1) > 0.5
+            branch_ids = [
+                int(label)
+                for label in np.unique(labels_np[valid_np])
+                if label >= 0
+            ]
+            if not branch_ids:
+                batch_losses.append(jt.array(0.0))
+                continue
+
+            signed_by_branch = []
+            score_by_branch = []
+            for label in branch_ids:
+                idx_np = np.where((labels_np == label) & valid_np)[0]
+                idx = jt.array(idx_np).int32()
+                clean_b = pc_clean[b][idx]
+                normal_b = branch_normal[b][idx]
+                delta = pc_pred[b].unsqueeze(1) - clean_b.unsqueeze(0)
+                signed = (delta * normal_b.unsqueeze(0)).sum(dim=-1)
+                normal_dist = jt.abs(signed)
+                tangent = delta - signed.unsqueeze(-1) * normal_b.unsqueeze(0)
+                tangent_dist = jt.sqrt(
+                    (tangent ** 2.0).sum(dim=-1) + self.patch_scale_eps ** 2.0
+                )
+                in_range = tangent_dist <= margin
+                score = jt.where(
+                    in_range,
+                    normal_dist,
+                    jt.ones_like(normal_dist) * 1e6,
+                )
+                best_pos, best_score = jt.argmin(score, dim=1)
+                best_signed = signed[jt.arange(pc_pred.shape[1]), best_pos]
+                signed_by_branch.append(best_signed)
+                score_by_branch.append(best_score)
+
+            score_stack = jt.stack(score_by_branch, dim=1)
+            signed_stack = jt.stack(signed_by_branch, dim=1)
+            soft_score = jt.exp(-score_stack / tau)
+            soft_score = jt.where(
+                score_stack < 1e5,
+                soft_score,
+                jt.zeros_like(soft_score),
+            )
+            denom = soft_score.sum(dim=1, keepdims=True) + 1e-6
+            assign = soft_score / denom
+
+            branch_losses = []
+            for branch_pos in range(len(branch_ids)):
+                weight = assign[:, branch_pos]
+                weight_sum = weight.sum() + 1e-6
+                signed = signed_stack[:, branch_pos]
+                mean_signed = (weight * signed).sum() / weight_sum
+                variance = (weight * ((signed - mean_signed) ** 2.0)).sum()
+                variance = variance / weight_sum
+                branch_losses.append(variance)
+            batch_losses.append(jt.stack(branch_losses).mean())
+
+        loss = jt.stack(batch_losses)
+        sigma2 = self._loss_sigma2(sigma, pc_pred.shape[0])
+        loss = loss / sigma2
+        if hard_weight is not None:
+            loss = loss * hard_weight.reshape(pc_pred.shape[0])
+        return loss.mean()
+
+    def get_surface_halo_loss(
+        self,
+        pc_pred,
+        pc_clean,
+        branch_label,
+        branch_valid,
+        branch_normal,
+        sigma=None,
+        hard_weight=None,
+    ):
+        valid = branch_valid
+        if len(valid.shape) == 3:
+            valid = valid.squeeze(-1)
+        margin = max(self.nearest_surface_branch_margin, self.patch_scale_eps)
+        normal_tau = max(self.surface_halo_normal_tau, self.patch_scale_eps)
+        tangent_tau = max(self.surface_halo_tangent_tau, self.patch_scale_eps)
+        tangent_tau2 = tangent_tau ** 2.0
+        batch_losses = []
+        for b in range(pc_pred.shape[0]):
+            labels_np = np.asarray(branch_label[b].numpy()).reshape(-1)
+            valid_np = np.asarray(valid[b].numpy()).reshape(-1) > 0.5
+            branch_ids = [
+                int(label)
+                for label in np.unique(labels_np[valid_np])
+                if label >= 0
+            ]
+            if not branch_ids:
+                batch_losses.append(jt.array(0.0))
+                continue
+
+            pred_normal_dist = []
+            pred_tangent_dist = []
+            for label in branch_ids:
+                idx_np = np.where((labels_np == label) & valid_np)[0]
+                idx = jt.array(idx_np).int32()
+                clean_b = pc_clean[b][idx]
+                normal_b = branch_normal[b][idx]
+                delta = pc_pred[b].unsqueeze(1) - clean_b.unsqueeze(0)
+                signed = (delta * normal_b.unsqueeze(0)).sum(dim=-1)
+                normal_dist = jt.abs(signed)
+                tangent = delta - signed.unsqueeze(-1) * normal_b.unsqueeze(0)
+                tangent_dist = jt.sqrt(
+                    (tangent ** 2.0).sum(dim=-1) + self.patch_scale_eps ** 2.0
+                )
+                best_pos, best_normal = jt.argmin(normal_dist, dim=1)
+                best_tangent = tangent_dist[jt.arange(pc_pred.shape[1]), best_pos]
+                pred_normal_dist.append(best_normal)
+                pred_tangent_dist.append(best_tangent)
+
+            normal_stack = jt.stack(pred_normal_dist, dim=1)
+            tangent_stack = jt.stack(pred_tangent_dist, dim=1)
+            best_branch, best_normal = jt.argmin(normal_stack, dim=1)
+            best_tangent = tangent_stack[jt.arange(pc_pred.shape[1]), best_branch]
+            tangent_excess = jt.maximum(best_tangent - margin, 0.0)
+            normal_weight = jt.exp(-best_normal / normal_tau)
+            robust_excess = tangent_tau2 * jt.atan(
+                (tangent_excess ** 2.0) / tangent_tau2
+            )
+            batch_loss = (normal_weight * robust_excess).mean()
+            batch_losses.append(batch_loss)
+
+        loss = jt.stack(batch_losses)
+        sigma2 = self._loss_sigma2(sigma, pc_pred.shape[0])
+        loss = loss / sigma2
+        if hard_weight is not None:
+            loss = loss * hard_weight.reshape(pc_pred.shape[0])
+        return loss.mean()
+
     def get_surface_coherence_losses(
         self,
         pc_pred,
@@ -1008,6 +1173,36 @@ class VelocityModule(ModelSpec):
             and branch_normal is not None
         ):
             losses["branch_coverage_loss"] = self.get_branch_coverage_loss(
+                pc_pred=pc_pred,
+                pc_clean=pc_clean,
+                branch_label=branch_label,
+                branch_valid=branch_valid,
+                branch_normal=branch_normal,
+                sigma=sigma,
+                hard_weight=hard_weight,
+            )
+        if (
+            self.use_surface_thinness_loss
+            and branch_label is not None
+            and branch_valid is not None
+            and branch_normal is not None
+        ):
+            losses["surface_thinness_loss"] = self.get_surface_thinness_loss(
+                pc_pred=pc_pred,
+                pc_clean=pc_clean,
+                branch_label=branch_label,
+                branch_valid=branch_valid,
+                branch_normal=branch_normal,
+                sigma=sigma,
+                hard_weight=hard_weight,
+            )
+        if (
+            self.use_surface_halo_loss
+            and branch_label is not None
+            and branch_valid is not None
+            and branch_normal is not None
+        ):
+            losses["surface_halo_loss"] = self.get_surface_halo_loss(
                 pc_pred=pc_pred,
                 pc_clean=pc_clean,
                 branch_label=branch_label,
