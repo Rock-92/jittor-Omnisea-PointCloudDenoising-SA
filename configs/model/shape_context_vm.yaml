@@ -43,12 +43,8 @@ use_branch_coverage_loss: true
 branch_coverage_tau: 0.001
 branch_coverage_tangent_weight: 0.1
 branch_coverage_exclusive_ratio: 2.0
-use_surface_thinness_loss: true
-use_surface_halo_loss: true
-surface_thinness_tau: 0.001
-surface_halo_normal_tau: 0.004
-surface_halo_margin: 0.02
-surface_halo_tangent_tau: 0.004
+use_surface_thinness_loss: false
+use_surface_halo_loss: false
 surface_branch_separation_k: 8
 surface_branch_separation_margin: 0.8
 
