@@ -318,21 +318,7 @@ class ShapeContextVMSystem(VMSystem):
                 gradient.update(gradient * self.shape_lr_scale)
 
     def train_progress_postfix(self):
-        values = getattr(self, "_last_train_loss_dict", None)
-        if not values:
-            return {}
-
-        def value(name, default=float("nan")):
-            item = values.get(name)
-            if item is None:
-                return default
-            return float(_get_item(item))
-
-        return {
-            "gate": f"{value('region_context_gate'):.3f}",
-            "crease": f"{value('region_crease_mean'):.3f}",
-            "prior": f"{value('region_prior_delta'):.3f}",
-        }
+        return {}
 
     def log_epoch_metrics(
         self,
@@ -350,15 +336,6 @@ class ShapeContextVMSystem(VMSystem):
             "epoch": epoch,
             "lr": get_optimizer_lr(self.optimizer),
             "train_loss": train_loss,
-            "region_context_gate": mean_metric(
-                self._train_loss.get("train/region_context_gate", [])
-            ),
-            "region_crease_mean": mean_metric(
-                self._train_loss.get("train/region_crease_mean", [])
-            ),
-            "region_prior_delta": mean_metric(
-                self._train_loss.get("train/region_prior_delta", [])
-            ),
             "val_loss": validation_loss,
             "cd_score": score_summary.get("cd_score"),
             "p2s_score": score_summary.get("p2s_score"),
@@ -373,19 +350,6 @@ class ShapeContextVMSystem(VMSystem):
             )
             writer.writeheader()
             writer.writerows(self._epoch_metric_records)
-
-        def fmt(name, digits=3):
-            value = record.get(name)
-            if value is None:
-                return "nan"
-            return f"{value:.{digits}f}"
-
-        print(
-            "Shape-context train diagnostics: "
-            f"gate={fmt('region_context_gate')}, "
-            f"crease={fmt('region_crease_mean')}, "
-            f"prior_delta={fmt('region_prior_delta')}"
-        )
 
     def on_train_end(self):
         self._set_shape_grad(True)

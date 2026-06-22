@@ -1084,19 +1084,7 @@ class ShapeContextVelocityModule(VelocityModule):
                 branch_valid = branch_valid[:, point_idx]
             if branch_normal is not None:
                 branch_normal = branch_normal[:, point_idx, :]
-        losses = {
-            "region_context_gate": gate,
-            "region_crease_mean": getattr(
-                self,
-                "_last_region_crease_mean",
-                jt.array(0.0),
-            ),
-            "region_prior_delta": getattr(
-                self,
-                "_last_region_prior_delta",
-                jt.array(0.0),
-            ),
-        }
+        losses = {}
         if self.use_surface_aligned_loss:
             losses.update(
                 self.get_surface_aligned_losses(
