@@ -1185,10 +1185,10 @@ class ShapeContextVelocityModule(VelocityModule):
         ).sum() / active_sum
 
         cover_weight = nn.softmax(-surface_distance / surface_tau, dim=2)
-        branch_cover_distance = (cover_weight * surface_distance).sum(dim=2)
+        branch_cover_distance = cover_weight * surface_distance
         active_branch_cover = (
             branch_cover_distance * active.unsqueeze(3)
-        ).sum(dim=2) / (active.sum(dim=2, keepdims=True) + 1e-6)
+        ).sum(dim=2) / (active.sum(dim=2).unsqueeze(-1) + 1e-6)
         reason_sum = branch_reason.sum() + 1e-6
         candidate_cover_loss = (
             branch_reason * active_branch_cover
