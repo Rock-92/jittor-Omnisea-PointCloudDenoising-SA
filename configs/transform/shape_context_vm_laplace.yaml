@@ -4,7 +4,7 @@ train_transform:
     - __target__: surface_branch_cache
       cache_root: cache_surface_branches
       cache_name: surface_branches.npz
-      required: false
+      required: true
     - __target__: add_noise
       noise_std_min: 0.005
       noise_std_max: 0.020
@@ -20,7 +20,7 @@ validate_transform:
     - __target__: surface_branch_cache
       cache_root: cache_surface_branches
       cache_name: surface_branches.npz
-      required: false
+      required: true
     - __target__: add_noise
       noise_std_min: 0.005
       noise_std_max: 0.020

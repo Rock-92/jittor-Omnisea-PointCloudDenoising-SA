@@ -43,6 +43,15 @@ use_branch_coverage_loss: true
 branch_coverage_tau: 0.001
 branch_coverage_tangent_weight: 0.1
 branch_coverage_exclusive_ratio: 2.0
+use_multi_candidate_displacement: true
+candidate_count: 4
+candidate_conf_threshold: 0.2
+candidate_branch_k: 16
+candidate_branch_margin: 0.04
+candidate_surface_tau: 0.0005
+candidate_reason_tau: 0.008
+candidate_conf_tau: 0.001
+candidate_diversity_tau: 0.002
 use_surface_thinness_loss: false
 use_surface_halo_loss: false
 surface_branch_separation_k: 8

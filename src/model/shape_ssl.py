@@ -8,6 +8,7 @@ from jittor import nn
 from scipy.spatial import cKDTree
 
 from .feature import (
+    Decoder,
     MultiScaleLocalSelfAttentionBlock,
     PointLayerNorm,
     apply_edge_linear,
@@ -799,6 +800,42 @@ class ShapeContextVelocityModule(VelocityModule):
             cfg.get("shape_surface_prior_scale", 0.1)
         )
         self.shape_context_knn = int(cfg.get("shape_context_knn", 4))
+        self.use_multi_candidate_displacement = bool(
+            cfg.get("use_multi_candidate_displacement", False)
+        )
+        self.candidate_count = int(cfg.get("candidate_count", 4))
+        self.candidate_conf_threshold = float(
+            cfg.get("candidate_conf_threshold", 0.2)
+        )
+        self.candidate_branch_k = int(
+            cfg.get("candidate_branch_k", self.nearest_surface_branch_k)
+        )
+        self.candidate_branch_margin = float(
+            cfg.get("candidate_branch_margin", self.nearest_surface_branch_margin)
+        )
+        self.candidate_surface_tau = float(
+            cfg.get("candidate_surface_tau", self.surface_snap_tau)
+        )
+        self.candidate_reason_tau = float(
+            cfg.get("candidate_reason_tau", 0.008)
+        )
+        self.candidate_conf_tau = float(
+            cfg.get("candidate_conf_tau", self.surface_snap_tau)
+        )
+        self.candidate_diversity_tau = float(
+            cfg.get("candidate_diversity_tau", self.surface_snap_tau)
+        )
+        self.candidate_decoder_output_dim = (
+            self.candidate_count * 4
+            if self.use_multi_candidate_displacement
+            else 3
+        )
+        if self.use_multi_candidate_displacement:
+            self.decoder = Decoder(
+                z_dim=self.encoder.embedding_dim,
+                out_dim=self.candidate_decoder_output_dim,
+                hidden_dims=self.decoder_hidden_dims,
+            )
         self.region_cross_blocks = []
         for block_index in range(self.attention_blocks):
             cross_block = RegionCrossAttentionModulation(
@@ -1034,10 +1071,178 @@ class ShapeContextVelocityModule(VelocityModule):
             region_centers,
             point_idx=point_idx,
         )
-        displacement = self.decoder(
+        raw = self.decoder(
             feature.reshape(-1, feature.shape[-1])
-        ).reshape(feature.shape[0], feature.shape[1], 3)
+        ).reshape(feature.shape[0], feature.shape[1], -1)
+        displacement, candidate_displacement, candidate_confidence = (
+            self.decode_context_prediction(raw)
+        )
+        self._last_candidate_displacement = candidate_displacement
+        self._last_candidate_confidence = candidate_confidence
         return displacement, gate
+
+    def decode_context_prediction(self, raw):
+        if not self.use_multi_candidate_displacement:
+            return raw, None, None
+        batch_size, point_count, _ = raw.shape
+        raw = raw.reshape(batch_size, point_count, self.candidate_count, 4)
+        displacement = raw[:, :, :, :3]
+        confidence = jt.sigmoid(raw[:, :, :, 3])
+        best_pos, _ = jt.argmax(confidence, dim=2)
+        selected = []
+        point_arange = jt.arange(point_count)
+        for batch_index in range(batch_size):
+            selected.append(
+                displacement[batch_index][
+                    point_arange,
+                    best_pos[batch_index],
+                ]
+            )
+        return jt.stack(selected, dim=0), displacement, confidence
+
+    def get_multi_candidate_branch_losses(
+        self,
+        pc_noisy,
+        candidate_displacement,
+        candidate_confidence,
+        pc_clean,
+        branch_valid,
+        branch_normal,
+    ):
+        valid = branch_valid
+        if len(valid.shape) == 3:
+            valid = valid.squeeze(-1)
+        batch_size, point_count, _ = pc_noisy.shape
+        candidate_count = candidate_displacement.shape[2]
+        branch_k = min(max(self.candidate_branch_k, 1), pc_clean.shape[1])
+        margin = max(self.candidate_branch_margin, self.patch_scale_eps)
+
+        clean_dist = (
+            (pc_noisy.unsqueeze(2) - pc_clean.unsqueeze(1)) ** 2.0
+        ).sum(dim=-1)
+        _, local_idx = jt.topk(
+            clean_dist,
+            k=branch_k,
+            dim=-1,
+            largest=False,
+        )
+        local_clean = []
+        local_normal = []
+        local_valid = []
+        for batch_index in range(batch_size):
+            idx = local_idx[batch_index]
+            local_clean.append(pc_clean[batch_index][idx])
+            local_normal.append(branch_normal[batch_index][idx])
+            local_valid.append(valid[batch_index][idx])
+        local_clean = jt.stack(local_clean, dim=0)
+        local_normal = jt.stack(local_normal, dim=0)
+        local_valid = jt.stack(local_valid, dim=0)
+        local_normal = local_normal / jt.sqrt(
+            (local_normal ** 2.0).sum(dim=-1, keepdims=True) + 1e-8
+        )
+
+        pc_candidate = pc_noisy.unsqueeze(2) + candidate_displacement
+        delta = pc_candidate.unsqueeze(3) - local_clean.unsqueeze(2)
+        signed = (delta * local_normal.unsqueeze(2)).sum(dim=-1)
+        tangent = delta - signed.unsqueeze(-1) * local_normal.unsqueeze(2)
+        tangent_dist = jt.sqrt(
+            (tangent ** 2.0).sum(dim=-1) + self.patch_scale_eps ** 2.0
+        )
+        tangent_excess = jt.maximum(tangent_dist - margin, 0.0)
+        raw_distance = jt.abs(signed) + tangent_excess
+        surface_tau = max(self.candidate_surface_tau, self.patch_scale_eps)
+        surface_distance = surface_tau * jt.log(
+            1.0 + raw_distance / surface_tau
+        )
+        surface_distance = jt.where(
+            local_valid.unsqueeze(2) > 0.5,
+            surface_distance,
+            jt.ones_like(surface_distance) * 0.05,
+        )
+
+        noisy_delta = pc_noisy.unsqueeze(2) - local_clean
+        noisy_signed = (noisy_delta * local_normal).sum(dim=-1)
+        noisy_tangent = noisy_delta - noisy_signed.unsqueeze(-1) * local_normal
+        noisy_tangent_dist = jt.sqrt(
+            (noisy_tangent ** 2.0).sum(dim=-1) + self.patch_scale_eps ** 2.0
+        )
+        noisy_near = (local_valid > 0.5) & (noisy_tangent_dist <= margin)
+        reason_tau = max(self.candidate_reason_tau, self.patch_scale_eps)
+        branch_reason = (
+            jt.exp(-jt.abs(noisy_signed) / reason_tau) * noisy_near.float()
+        )
+
+        branch_assignment = nn.softmax(-surface_distance / surface_tau, dim=3)
+        candidate_surface_distance = (
+            branch_assignment * surface_distance
+        ).sum(dim=3)
+        active = (candidate_confidence >= self.candidate_conf_threshold).float()
+        active = active.detach()
+        active_sum = active.sum() + 1e-6
+
+        candidate_surface_loss = (
+            active * candidate_surface_distance
+        ).sum() / active_sum
+
+        cover_weight = nn.softmax(-surface_distance / surface_tau, dim=2)
+        branch_cover_distance = (cover_weight * surface_distance).sum(dim=2)
+        active_branch_cover = (
+            branch_cover_distance * active.unsqueeze(3)
+        ).sum(dim=2) / (active.sum(dim=2, keepdims=True) + 1e-6)
+        reason_sum = branch_reason.sum() + 1e-6
+        candidate_cover_loss = (
+            branch_reason * active_branch_cover
+        ).sum() / reason_sum
+
+        diversity_terms = []
+        diversity_tau = max(self.candidate_diversity_tau, self.patch_scale_eps)
+        for first in range(candidate_count):
+            for second in range(first + 1, candidate_count):
+                assignment_similarity = (
+                    branch_assignment[:, :, first, :]
+                    * branch_assignment[:, :, second, :]
+                ).sum(dim=2)
+                pair_active = active[:, :, first] * active[:, :, second]
+                candidate_gap = jt.sqrt(
+                    (
+                        (
+                            pc_candidate[:, :, first, :]
+                            - pc_candidate[:, :, second, :]
+                        ) ** 2.0
+                    ).sum(dim=-1)
+                    + self.patch_scale_eps ** 2.0
+                )
+                close_penalty = jt.exp(-candidate_gap / diversity_tau)
+                diversity_terms.append(
+                    (pair_active * assignment_similarity * close_penalty).sum()
+                    / (pair_active.sum() + 1e-6)
+                )
+        if diversity_terms:
+            candidate_diversity_loss = jt.stack(diversity_terms).mean()
+        else:
+            candidate_diversity_loss = jt.array(0.0)
+
+        branch_quality = (
+            branch_assignment * branch_reason.unsqueeze(2)
+        ).sum(dim=3)
+        conf_tau = max(self.candidate_conf_tau, self.patch_scale_eps)
+        surface_quality = jt.exp(-candidate_surface_distance / conf_tau)
+        target_confidence = (branch_quality * surface_quality).detach()
+        confidence = jt.minimum(
+            jt.maximum(candidate_confidence, jt.ones_like(candidate_confidence) * 1e-6),
+            jt.ones_like(candidate_confidence) * (1.0 - 1e-6),
+        )
+        candidate_conf_loss = -(
+            target_confidence * jt.log(confidence)
+            + (1.0 - target_confidence) * jt.log(1.0 - confidence)
+        ).mean()
+
+        return {
+            "candidate_surface_loss": candidate_surface_loss,
+            "candidate_cover_loss": candidate_cover_loss,
+            "candidate_diversity_loss": candidate_diversity_loss,
+            "candidate_conf_loss": candidate_conf_loss,
+        }
 
     def training_step(self, batch: Dict) -> Dict:
         patch_size = batch["pc_noisy"].shape[-2]
@@ -1085,33 +1290,28 @@ class ShapeContextVelocityModule(VelocityModule):
             if branch_normal is not None:
                 branch_normal = branch_normal[:, point_idx, :]
         losses = {}
-        if self.use_surface_aligned_loss:
-            losses.update(
-                self.get_surface_aligned_losses(
-                    pc_pred=noisy_for_loss + prediction,
-                    pc_noisy=noisy_for_loss,
-                    pc_clean=clean_for_loss,
-                    sigma=None,
-                )
-            )
         if (
-            self.use_surface_branch_loss
-            and branch_label is not None
+            self.use_multi_candidate_displacement
             and branch_valid is not None
             and branch_normal is not None
+            and getattr(self, "_last_candidate_displacement", None) is not None
+            and getattr(self, "_last_candidate_confidence", None) is not None
         ):
-            branch_snap_loss, branch_separation_loss = (
-                self.get_surface_branch_losses(
-                    pc_pred=noisy_for_loss + prediction,
+            losses.update(
+                self.get_multi_candidate_branch_losses(
+                    pc_noisy=noisy_for_loss,
+                    candidate_displacement=self._last_candidate_displacement,
+                    candidate_confidence=self._last_candidate_confidence,
                     pc_clean=clean_for_loss,
-                    branch_label=branch_label,
                     branch_valid=branch_valid,
                     branch_normal=branch_normal,
-                    sigma=None,
                 )
             )
-            losses["branch_snap_loss"] = branch_snap_loss
-            losses["branch_separation_loss"] = branch_separation_loss
+        else:
+            raise ValueError(
+                "multi-candidate training requires pc_branch_valid and "
+                "pc_branch_normal from surface_branch_cache"
+            )
         return losses
 
     def process_fn(self, batch: List[Asset]) -> List[Dict]:

@@ -1,7 +1,8 @@
 loss:
-  patch_chamfer_loss: 1.0
-  nearest_surface_loss: 1.0
-  branch_coverage_loss: 0.5
+  candidate_surface_loss: 1.0
+  candidate_cover_loss: 1.0
+  candidate_diversity_loss: 0.1
+  candidate_conf_loss: 0.5
 
 optimizer:
   __target__: adam
