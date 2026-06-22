@@ -1145,8 +1145,6 @@ class VelocityModule(ModelSpec):
             hard_weight=hard_weight,
         )
         losses = {
-            "nearest_clean_loss": nearest_clean_loss,
-            "clean_coverage_loss": clean_coverage_loss,
             "patch_chamfer_loss": patch_chamfer_loss,
             "nearest_surface_loss": nearest_surface_loss,
         }
