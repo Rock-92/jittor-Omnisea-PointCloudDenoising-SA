@@ -359,6 +359,12 @@ class ShapeContextVMSystem(VMSystem):
             "candidate_enabled_heads_mean": score_summary.get(
                 "candidate_enabled_heads_mean"
             ),
+            "target_multi_enable_ratio": score_summary.get(
+                "target_multi_enable_ratio"
+            ),
+            "target_enabled_heads_mean": score_summary.get(
+                "target_enabled_heads_mean"
+            ),
         }
         self._epoch_metric_records.append(record)
         path = os.path.join(self.run_dir, "epoch_log.csv")

@@ -288,6 +288,14 @@ class VMSystem(DummySystem):
             enabled_count = (enable_np >= enable_threshold).sum(axis=2)
             candidate_multi_enable_ratio = float((enabled_count > 1).mean())
             candidate_enabled_heads_mean = float(enabled_count.mean())
+        target_multi_enable_ratio = None
+        target_enabled_heads_mean = None
+        target_enable = getattr(self.model, "_last_target_enable", None)
+        if target_enable is not None:
+            target_np = target_enable.detach().numpy()
+            target_count = (target_np >= 0.5).sum(axis=2)
+            target_multi_enable_ratio = float((target_count > 1).mean())
+            target_enabled_heads_mean = float(target_count.mean())
         
         metrics = []
         for i in range(pred_np.shape[0]):
@@ -309,6 +317,9 @@ class VMSystem(DummySystem):
                 item["candidate_enabled_heads_mean"] = (
                     candidate_enabled_heads_mean
                 )
+            if target_multi_enable_ratio is not None:
+                item["target_multi_enable_ratio"] = target_multi_enable_ratio
+                item["target_enabled_heads_mean"] = target_enabled_heads_mean
             
             asset_idx = asset_indices[i]
             if asset_idx < len(assets):

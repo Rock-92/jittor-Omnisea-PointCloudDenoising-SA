@@ -1393,6 +1393,7 @@ class ShapeContextVelocityModule(VelocityModule):
             local_label,
             local_valid,
         )
+        self._last_target_enable = target_enable
 
         branch_assignment = nn.softmax(-surface_distance / surface_tau, dim=3)
         assigned_surface_distance = self._gather_assigned_surface_distance(
