@@ -819,6 +819,12 @@ class ShapeContextVelocityModule(VelocityModule):
         self.candidate_warmstart_enable_logit = float(
             cfg.get("candidate_warmstart_enable_logit", 6.0)
         )
+        self.candidate_warmstart_other_conf_logit = float(
+            cfg.get("candidate_warmstart_other_conf_logit", -6.0)
+        )
+        self.candidate_warmstart_other_enable_logit = float(
+            cfg.get("candidate_warmstart_other_enable_logit", -6.0)
+        )
         self.candidate_branch_k = int(
             cfg.get("candidate_branch_k", self.nearest_surface_branch_k)
         )
@@ -1000,6 +1006,13 @@ class ShapeContextVelocityModule(VelocityModule):
 
         new_weight = np.asarray(self.decoder.lin_3.weight.numpy()).copy()
         new_bias = np.asarray(self.decoder.lin_3.bias.numpy()).copy()
+        for candidate_index in range(1, self.candidate_count):
+            conf_index = candidate_index * 5 + 3
+            enable_index = candidate_index * 5 + 4
+            new_weight[conf_index] = 0.0
+            new_bias[conf_index] = self.candidate_warmstart_other_conf_logit
+            new_weight[enable_index] = 0.0
+            new_bias[enable_index] = self.candidate_warmstart_other_enable_logit
         new_weight[0:3] = old_weight
         new_bias[0:3] = old_bias
         new_weight[3] = 0.0
@@ -1012,7 +1025,9 @@ class ShapeContextVelocityModule(VelocityModule):
             f"Loaded single-channel warm-start: {path} "
             f"(compatible={len(compatible)}, skipped={len(skipped)}, "
             f"candidate0_conf_logit={self.candidate_warmstart_conf_logit}, "
-            f"candidate0_enable_logit={self.candidate_warmstart_enable_logit})"
+            f"candidate0_enable_logit={self.candidate_warmstart_enable_logit}, "
+            f"other_conf_logit={self.candidate_warmstart_other_conf_logit}, "
+            f"other_enable_logit={self.candidate_warmstart_other_enable_logit})"
         )
 
     def apply_surface_prior(self, region_tokens):
