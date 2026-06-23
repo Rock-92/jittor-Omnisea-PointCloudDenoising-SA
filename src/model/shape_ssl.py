@@ -820,10 +820,10 @@ class ShapeContextVelocityModule(VelocityModule):
             cfg.get("candidate_warmstart_enable_logit", 6.0)
         )
         self.candidate_warmstart_other_conf_logit = float(
-            cfg.get("candidate_warmstart_other_conf_logit", -6.0)
+            cfg.get("candidate_warmstart_other_conf_logit", -0.04)
         )
         self.candidate_warmstart_other_enable_logit = float(
-            cfg.get("candidate_warmstart_other_enable_logit", -6.0)
+            cfg.get("candidate_warmstart_other_enable_logit", -0.04)
         )
         self.candidate_branch_k = int(
             cfg.get("candidate_branch_k", self.nearest_surface_branch_k)
@@ -1467,8 +1467,35 @@ class ShapeContextVelocityModule(VelocityModule):
             target_enable * jt.log(enable)
             + (1.0 - target_enable) * jt.log(1.0 - enable)
         ).mean()
+        selected_score = candidate_confidence * candidate_enable
+        selected_pos, _ = jt.argmax(selected_score, dim=2)
+        point_arange = jt.arange(point_count)
+        selected_displacement = []
+        for batch_index in range(batch_size):
+            selected_displacement.append(
+                candidate_displacement[batch_index][
+                    point_arange,
+                    selected_pos[batch_index],
+                ]
+            )
+        selected_displacement = jt.stack(selected_displacement, dim=0)
+        max_enable = candidate_enable.max(dim=2).reshape(
+            batch_size,
+            point_count,
+            1,
+        )
+        selected_displacement = jt.where(
+            max_enable >= self.candidate_enable_threshold,
+            selected_displacement,
+            jt.zeros_like(selected_displacement),
+        )
+        candidate_chamfer_loss = self.get_patch_chamfer_loss(
+            pc_noisy + selected_displacement,
+            pc_clean,
+        )
 
         return {
+            "candidate_chamfer_loss": candidate_chamfer_loss,
             "candidate_surface_loss": candidate_surface_loss,
             "candidate_cover_loss": candidate_cover_loss,
             "candidate_diversity_loss": candidate_diversity_loss,
