@@ -825,6 +825,9 @@ class ShapeContextVelocityModule(VelocityModule):
         self.candidate_warmstart_other_enable_logit = float(
             cfg.get("candidate_warmstart_other_enable_logit", -0.04)
         )
+        self.candidate_enable_pos_weight = float(
+            cfg.get("candidate_enable_pos_weight", 20.0)
+        )
         self.candidate_branch_k = int(
             cfg.get("candidate_branch_k", self.nearest_surface_branch_k)
         )
@@ -1463,8 +1466,9 @@ class ShapeContextVelocityModule(VelocityModule):
             jt.maximum(candidate_enable, jt.ones_like(candidate_enable) * 1e-6),
             jt.ones_like(candidate_enable) * (1.0 - 1e-6),
         )
+        pos_weight = max(self.candidate_enable_pos_weight, 1.0)
         candidate_enable_loss = -(
-            target_enable * jt.log(enable)
+            pos_weight * target_enable * jt.log(enable)
             + (1.0 - target_enable) * jt.log(1.0 - enable)
         ).mean()
         selected_score = candidate_confidence * candidate_enable

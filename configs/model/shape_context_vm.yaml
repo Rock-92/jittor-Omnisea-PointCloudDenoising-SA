@@ -52,6 +52,7 @@ candidate_warmstart_conf_logit: 2.0
 candidate_warmstart_enable_logit: 6.0
 candidate_warmstart_other_conf_logit: -0.04
 candidate_warmstart_other_enable_logit: -0.04
+candidate_enable_pos_weight: 20.0
 candidate_branch_k: 16
 candidate_branch_margin: 0.04
 candidate_surface_tau: 0.0005
