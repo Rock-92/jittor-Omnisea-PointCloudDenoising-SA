@@ -366,7 +366,9 @@ class DummySystem():
             f"CD pred={score_summary.get('cd_pred', 0.0):.8f}, "
             f"CD noisy={score_summary.get('cd_noisy', 0.0):.8f}, "
             f"P2S pred={score_summary.get('p2s_pred', 0.0):.8f}, "
-            f"P2S noisy={score_summary.get('p2s_noisy', 0.0):.8f}"
+            f"P2S noisy={score_summary.get('p2s_noisy', 0.0):.8f}, "
+            f"Multi-enable={score_summary.get('candidate_multi_enable_ratio', 0.0):.4f}, "
+            f"Enabled-heads={score_summary.get('candidate_enabled_heads_mean', 0.0):.4f}"
         )
 
     def log_epoch_metrics(self, epoch, train_loss=None, validation_loss=None, score_summary=None):

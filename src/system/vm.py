@@ -277,6 +277,17 @@ class VMSystem(DummySystem):
         noisy_np = pc_noisy_abs.detach().numpy()
         clean_np = pc_clean_abs.detach().numpy()
         assets = list(batch.get("asset", []))
+        candidate_multi_enable_ratio = None
+        candidate_enabled_heads_mean = None
+        candidate_enable = getattr(self.model, "_last_candidate_enable", None)
+        if candidate_enable is not None:
+            enable_threshold = float(
+                getattr(self.model, "candidate_enable_threshold", 0.5)
+            )
+            enable_np = candidate_enable.detach().numpy()
+            enabled_count = (enable_np >= enable_threshold).sum(axis=2)
+            candidate_multi_enable_ratio = float((enabled_count > 1).mean())
+            candidate_enabled_heads_mean = float(enabled_count.mean())
         
         metrics = []
         for i in range(pred_np.shape[0]):
@@ -291,6 +302,13 @@ class VMSystem(DummySystem):
                 "cd_noisy": cd_noisy,
                 "cd_score": metric_to_score(cd_pred, cd_noisy),
             }
+            if candidate_multi_enable_ratio is not None:
+                item["candidate_multi_enable_ratio"] = (
+                    candidate_multi_enable_ratio
+                )
+                item["candidate_enabled_heads_mean"] = (
+                    candidate_enabled_heads_mean
+                )
             
             asset_idx = asset_indices[i]
             if asset_idx < len(assets):
