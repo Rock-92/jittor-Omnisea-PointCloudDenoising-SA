@@ -1,6 +1,6 @@
 mode: predict
 debug: false
-load_ckpt: outputs/shape_context_vm/checkpoints/checkpoint_best.pkl
+load_ckpt: outputs/shape_context_vm_4branch_warmstart/checkpoints/checkpoint_best.pkl
 
 components:
   data: shape_context_predict
@@ -10,6 +10,6 @@ components:
 
 writer:
   __target__: vm
-  save_dir: outputs/shape_context_vm/result/test_noisy
+  save_dir: outputs/shape_context_vm_4branch_warmstart/result/test_noisy
   save_name: denoised
-  result_zip: outputs/shape_context_vm/result/result.zip
+  result_zip: outputs/shape_context_vm_4branch_warmstart/result/result.zip

@@ -45,7 +45,11 @@ branch_coverage_tangent_weight: 0.1
 branch_coverage_exclusive_ratio: 2.0
 use_multi_candidate_displacement: true
 candidate_count: 4
-candidate_conf_threshold: 0.2
+candidate_enable_threshold: 0.5
+candidate_multi_ratio_min: 0.7
+candidate_multi_ratio_max: 1.3
+candidate_warmstart_conf_logit: 2.0
+candidate_warmstart_enable_logit: 6.0
 candidate_branch_k: 16
 candidate_branch_margin: 0.04
 candidate_surface_tau: 0.0005
@@ -60,6 +64,7 @@ surface_branch_separation_margin: 0.8
 # Complete-shape processor. Only region tokens condition the denoiser; the
 # processor's shape-global output is not computed or injected.
 shape_pretrained_ckpt: outputs/shape_pretrain/checkpoints/processor_best.pkl
+single_channel_warmstart_ckpt: outputs/shape_context_vm/checkpoints/checkpoint_best.pkl
 shape_region_count: 256
 shape_points_per_region: 64
 shape_region_fps_candidates: 8192

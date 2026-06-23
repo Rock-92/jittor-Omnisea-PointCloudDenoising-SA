@@ -1,6 +1,7 @@
 __target__: shape_context_vm
 
-ckpt_save_dir: outputs/shape_context_vm/checkpoints
+ckpt_save_dir: outputs/shape_context_vm_4branch_warmstart/checkpoints
 ckpt_save_name: checkpoint
-freeze_shape_epochs: 5
+freeze_shape_epochs: 0
 shape_lr_scale: 0.1
+freeze_encoder_epochs: 2

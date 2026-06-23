@@ -285,17 +285,27 @@ class ShapeContextVMSystem(VMSystem):
         *args,
         freeze_shape_epochs=5,
         shape_lr_scale=0.1,
+        freeze_encoder_epochs=0,
         **kwargs,
     ):
         self.freeze_shape_epochs = int(freeze_shape_epochs)
         self.shape_lr_scale = float(shape_lr_scale)
+        self.freeze_encoder_epochs = int(freeze_encoder_epochs)
         super().__init__(*args, **kwargs)
         self._shape_parameters = list(
             self.model.get_shape_train_parameters()
         )
+        self._encoder_parameters = list(self.model.encoder.parameters())
 
     def _set_shape_grad(self, enabled):
         for parameter in self._shape_parameters:
+            if enabled:
+                parameter.start_grad()
+            else:
+                parameter.stop_grad()
+
+    def _set_encoder_grad(self, enabled):
+        for parameter in self._encoder_parameters:
             if enabled:
                 parameter.start_grad()
             else:
@@ -305,6 +315,9 @@ class ShapeContextVMSystem(VMSystem):
         super().on_train_epoch_start()
         self._set_shape_grad(
             self._current_epoch >= self.freeze_shape_epochs
+        )
+        self._set_encoder_grad(
+            self._current_epoch >= self.freeze_encoder_epochs
         )
 
     def on_before_optimizer_step(self, optimizer):
@@ -352,5 +365,6 @@ class ShapeContextVMSystem(VMSystem):
             writer.writerows(self._epoch_metric_records)
 
     def on_train_end(self):
+        self._set_encoder_grad(True)
         self._set_shape_grad(True)
         super().on_train_end()

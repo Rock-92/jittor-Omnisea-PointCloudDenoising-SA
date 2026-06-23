@@ -3,6 +3,7 @@ loss:
   candidate_cover_loss: 1.0
   candidate_diversity_loss: 0.1
   candidate_conf_loss: 0.5
+  candidate_enable_loss: 0.5
 
 optimizer:
   __target__: adam

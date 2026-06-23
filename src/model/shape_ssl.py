@@ -804,8 +804,20 @@ class ShapeContextVelocityModule(VelocityModule):
             cfg.get("use_multi_candidate_displacement", False)
         )
         self.candidate_count = int(cfg.get("candidate_count", 4))
-        self.candidate_conf_threshold = float(
-            cfg.get("candidate_conf_threshold", 0.2)
+        self.candidate_enable_threshold = float(
+            cfg.get("candidate_enable_threshold", 0.5)
+        )
+        self.candidate_multi_ratio_min = float(
+            cfg.get("candidate_multi_ratio_min", 0.7)
+        )
+        self.candidate_multi_ratio_max = float(
+            cfg.get("candidate_multi_ratio_max", 1.3)
+        )
+        self.candidate_warmstart_conf_logit = float(
+            cfg.get("candidate_warmstart_conf_logit", 2.0)
+        )
+        self.candidate_warmstart_enable_logit = float(
+            cfg.get("candidate_warmstart_enable_logit", 6.0)
         )
         self.candidate_branch_k = int(
             cfg.get("candidate_branch_k", self.nearest_surface_branch_k)
@@ -826,7 +838,7 @@ class ShapeContextVelocityModule(VelocityModule):
             cfg.get("candidate_diversity_tau", self.surface_snap_tau)
         )
         self.candidate_decoder_output_dim = (
-            self.candidate_count * 4
+            self.candidate_count * 5
             if self.use_multi_candidate_displacement
             else 3
         )
@@ -858,6 +870,14 @@ class ShapeContextVelocityModule(VelocityModule):
         )
         if self.shape_pretrained_ckpt:
             self.load_shape_pretrained(self.shape_pretrained_ckpt)
+        self.single_channel_warmstart_ckpt = cfg.get(
+            "single_channel_warmstart_ckpt",
+            None,
+        )
+        if self.single_channel_warmstart_ckpt:
+            self.load_single_channel_warmstart(
+                self.single_channel_warmstart_ckpt
+            )
         self.shape_processor.mask_token.stop_grad()
         for parameter in self.shape_processor.reconstruction_head.parameters():
             parameter.stop_grad()
@@ -924,6 +944,75 @@ class ShapeContextVelocityModule(VelocityModule):
         print(
             f"Loaded pretrained shape processor: {path} "
             f"(normal_head={normal_count}, crease_head={crease_count})"
+        )
+
+    def load_single_channel_warmstart(self, path):
+        if not self.use_multi_candidate_displacement:
+            raise ValueError(
+                "single_channel_warmstart_ckpt requires "
+                "use_multi_candidate_displacement=true"
+            )
+        if not Path(path).exists():
+            raise FileNotFoundError(
+                f"single_channel_warmstart_ckpt not found: {path}"
+            )
+        state = jt.load(path)
+        if not isinstance(state, dict):
+            raise ValueError(
+                f"expected state_dict checkpoint, got {type(state)}: {path}"
+            )
+        required = ["decoder.lin_3.weight", "decoder.lin_3.bias"]
+        for key in required:
+            if key not in state:
+                raise ValueError(
+                    f"single-channel checkpoint missing {key}: {path}"
+                )
+        old_weight = np.asarray(state["decoder.lin_3.weight"])
+        old_bias = np.asarray(state["decoder.lin_3.bias"])
+        if old_weight.shape != (3, self.decoder.lin_3.weight.shape[1]):
+            raise ValueError(
+                "single-channel decoder weight shape mismatch: "
+                f"{old_weight.shape} vs expected "
+                f"(3, {self.decoder.lin_3.weight.shape[1]})"
+            )
+        if old_bias.shape != (3,):
+            raise ValueError(
+                "single-channel decoder bias shape mismatch: "
+                f"{old_bias.shape} vs expected (3,)"
+            )
+
+        current = self.state_dict()
+        compatible = {}
+        skipped = []
+        for key, value in state.items():
+            if key in required:
+                skipped.append(key)
+                continue
+            if key not in current:
+                skipped.append(key)
+                continue
+            if tuple(value.shape) != tuple(current[key].shape):
+                skipped.append(key)
+                continue
+            compatible[key] = value
+        if compatible:
+            self.load_state_dict(compatible)
+
+        new_weight = np.asarray(self.decoder.lin_3.weight.numpy()).copy()
+        new_bias = np.asarray(self.decoder.lin_3.bias.numpy()).copy()
+        new_weight[0:3] = old_weight
+        new_bias[0:3] = old_bias
+        new_weight[3] = 0.0
+        new_bias[3] = self.candidate_warmstart_conf_logit
+        new_weight[4] = 0.0
+        new_bias[4] = self.candidate_warmstart_enable_logit
+        self.decoder.lin_3.weight.update(jt.array(new_weight))
+        self.decoder.lin_3.bias.update(jt.array(new_bias))
+        print(
+            f"Loaded single-channel warm-start: {path} "
+            f"(compatible={len(compatible)}, skipped={len(skipped)}, "
+            f"candidate0_conf_logit={self.candidate_warmstart_conf_logit}, "
+            f"candidate0_enable_logit={self.candidate_warmstart_enable_logit})"
         )
 
     def apply_surface_prior(self, region_tokens):
@@ -1074,21 +1163,27 @@ class ShapeContextVelocityModule(VelocityModule):
         raw = self.decoder(
             feature.reshape(-1, feature.shape[-1])
         ).reshape(feature.shape[0], feature.shape[1], -1)
-        displacement, candidate_displacement, candidate_confidence = (
-            self.decode_context_prediction(raw)
-        )
+        (
+            displacement,
+            candidate_displacement,
+            candidate_confidence,
+            candidate_enable,
+        ) = self.decode_context_prediction(raw)
         self._last_candidate_displacement = candidate_displacement
         self._last_candidate_confidence = candidate_confidence
+        self._last_candidate_enable = candidate_enable
         return displacement, gate
 
     def decode_context_prediction(self, raw):
         if not self.use_multi_candidate_displacement:
-            return raw, None, None
+            return raw, None, None, None
         batch_size, point_count, _ = raw.shape
-        raw = raw.reshape(batch_size, point_count, self.candidate_count, 4)
+        raw = raw.reshape(batch_size, point_count, self.candidate_count, 5)
         displacement = raw[:, :, :, :3]
         confidence = jt.sigmoid(raw[:, :, :, 3])
-        best_pos, _ = jt.argmax(confidence, dim=2)
+        enable = jt.sigmoid(raw[:, :, :, 4])
+        selection_score = confidence * enable
+        best_pos, _ = jt.argmax(selection_score, dim=2)
         selected = []
         point_arange = jt.arange(point_count)
         for batch_index in range(batch_size):
@@ -1098,14 +1193,114 @@ class ShapeContextVelocityModule(VelocityModule):
                     best_pos[batch_index],
                 ]
             )
-        return jt.stack(selected, dim=0), displacement, confidence
+        selected = jt.stack(selected, dim=0)
+        max_enable = enable.max(dim=2).reshape(batch_size, point_count, 1)
+        selected = jt.where(
+            max_enable >= self.candidate_enable_threshold,
+            selected,
+            jt.zeros_like(selected),
+        )
+        return selected, displacement, confidence, enable
+
+    def _gather_local_candidate_values(self, values, order):
+        batch_size, point_count, _ = order.shape
+        point_arange = jt.arange(point_count)
+        gathered = []
+        for batch_index in range(batch_size):
+            point_index = point_arange.reshape(point_count, 1).broadcast(
+                order[batch_index].shape
+            )
+            gathered.append(
+                values[batch_index][point_index, order[batch_index]]
+            )
+        return jt.stack(gathered, dim=0)
+
+    def _gather_assigned_surface_distance(self, surface_distance, target_order):
+        assigned = []
+        for candidate_index in range(self.candidate_count):
+            gathered = self._gather_local_candidate_values(
+                surface_distance[:, :, candidate_index, :],
+                target_order[:, :, candidate_index:candidate_index + 1],
+            )
+            assigned.append(gathered.reshape(gathered.shape[0], gathered.shape[1]))
+        return jt.stack(assigned, dim=2)
+
+    def _build_candidate_enable_targets(
+        self,
+        noisy_branch_distance,
+        local_label,
+        local_valid,
+    ):
+        candidate_count = self.candidate_count
+        top_count = min(candidate_count, noisy_branch_distance.shape[2])
+        safe_distance = jt.where(
+            local_valid > 0.5,
+            noisy_branch_distance,
+            jt.ones_like(noisy_branch_distance) * 1e6,
+        )
+        top_distance, top_order = jt.topk(
+            safe_distance,
+            k=top_count,
+            dim=2,
+            largest=False,
+        )
+        top_label = self._gather_local_candidate_values(local_label, top_order)
+        top_valid = top_distance < 1e5
+        if top_count < candidate_count:
+            pad_shape = (
+                top_distance.shape[0],
+                top_distance.shape[1],
+                candidate_count - top_count,
+            )
+            top_distance = jt.concat(
+                [top_distance, jt.ones(pad_shape) * 1e6],
+                dim=2,
+            )
+            top_label = jt.concat(
+                [top_label, jt.ones(pad_shape).int32() * -1],
+                dim=2,
+            )
+            top_valid = jt.concat(
+                [top_valid, jt.zeros(pad_shape) > 0.5],
+                dim=2,
+            )
+            top_order = jt.concat(
+                [top_order, jt.zeros(pad_shape).int32()],
+                dim=2,
+            )
+
+        nearest = top_distance[:, :, 0:1]
+        ratio = (top_distance + 1e-6) / (nearest + 1e-6)
+        enable_parts = [top_valid[:, :, 0:1]]
+        for candidate_index in range(1, candidate_count):
+            distinct = top_valid[:, :, candidate_index]
+            for previous in range(candidate_index):
+                distinct = distinct & (
+                    top_label[:, :, candidate_index]
+                    != top_label[:, :, previous]
+                )
+            near_ratio = (
+                (ratio[:, :, candidate_index] >= self.candidate_multi_ratio_min)
+                & (ratio[:, :, candidate_index] <= self.candidate_multi_ratio_max)
+            )
+            enable_parts.append(
+                (
+                    top_valid[:, :, candidate_index]
+                    & distinct
+                    & near_ratio
+                ).unsqueeze(-1)
+            )
+        target_enable = jt.concat(enable_parts, dim=2).float()
+        return target_enable.detach(), top_order.detach()
 
     def get_multi_candidate_branch_losses(
         self,
         pc_noisy,
         candidate_displacement,
         candidate_confidence,
+        candidate_enable,
         pc_clean,
+        branch_label,
         branch_valid,
         branch_normal,
     ):
@@ -1127,14 +1322,17 @@ class ShapeContextVelocityModule(VelocityModule):
             largest=False,
         )
         local_clean = []
+        local_label = []
         local_normal = []
         local_valid = []
         for batch_index in range(batch_size):
             idx = local_idx[batch_index]
             local_clean.append(pc_clean[batch_index][idx])
+            local_label.append(branch_label[batch_index][idx])
             local_normal.append(branch_normal[batch_index][idx])
             local_valid.append(valid[batch_index][idx])
         local_clean = jt.stack(local_clean, dim=0)
+        local_label = jt.stack(local_label, dim=0)
         local_normal = jt.stack(local_normal, dim=0)
         local_valid = jt.stack(local_valid, dim=0)
         local_normal = local_normal / jt.sqrt(
@@ -1167,21 +1365,30 @@ class ShapeContextVelocityModule(VelocityModule):
             (noisy_tangent ** 2.0).sum(dim=-1) + self.patch_scale_eps ** 2.0
         )
         noisy_near = (local_valid > 0.5) & (noisy_tangent_dist <= margin)
+        noisy_branch_distance = jt.abs(noisy_signed) + jt.maximum(
+            noisy_tangent_dist - margin,
+            0.0,
+        )
         reason_tau = max(self.candidate_reason_tau, self.patch_scale_eps)
         branch_reason = (
             jt.exp(-jt.abs(noisy_signed) / reason_tau) * noisy_near.float()
         )
+        target_enable, target_order = self._build_candidate_enable_targets(
+            noisy_branch_distance,
+            local_label,
+            local_valid,
+        )
 
         branch_assignment = nn.softmax(-surface_distance / surface_tau, dim=3)
-        candidate_surface_distance = (
-            branch_assignment * surface_distance
-        ).sum(dim=3)
-        active = (candidate_confidence >= self.candidate_conf_threshold).float()
-        active = active.detach()
+        assigned_surface_distance = self._gather_assigned_surface_distance(
+            surface_distance,
+            target_order,
+        )
+        active = target_enable
         active_sum = active.sum() + 1e-6
 
         candidate_surface_loss = (
-            active * candidate_surface_distance
+            active * assigned_surface_distance
         ).sum() / active_sum
 
         cover_weight = nn.softmax(-surface_distance / surface_tau, dim=2)
@@ -1222,19 +1429,27 @@ class ShapeContextVelocityModule(VelocityModule):
         else:
             candidate_diversity_loss = jt.array(0.0)
 
-        branch_quality = (
-            branch_assignment * branch_reason.unsqueeze(2)
-        ).sum(dim=3)
         conf_tau = max(self.candidate_conf_tau, self.patch_scale_eps)
-        surface_quality = jt.exp(-candidate_surface_distance / conf_tau)
-        target_confidence = (branch_quality * surface_quality).detach()
+        surface_quality = jt.exp(-assigned_surface_distance / conf_tau)
+        target_confidence = surface_quality.detach()
         confidence = jt.minimum(
             jt.maximum(candidate_confidence, jt.ones_like(candidate_confidence) * 1e-6),
             jt.ones_like(candidate_confidence) * (1.0 - 1e-6),
         )
         candidate_conf_loss = -(
-            target_confidence * jt.log(confidence)
-            + (1.0 - target_confidence) * jt.log(1.0 - confidence)
+            active
+            * (
+                target_confidence * jt.log(confidence)
+                + (1.0 - target_confidence) * jt.log(1.0 - confidence)
+            )
+        ).sum() / active_sum
+        enable = jt.minimum(
+            jt.maximum(candidate_enable, jt.ones_like(candidate_enable) * 1e-6),
+            jt.ones_like(candidate_enable) * (1.0 - 1e-6),
+        )
+        candidate_enable_loss = -(
+            target_enable * jt.log(enable)
+            + (1.0 - target_enable) * jt.log(1.0 - enable)
         ).mean()
 
         return {
@@ -1242,6 +1457,7 @@ class ShapeContextVelocityModule(VelocityModule):
             "candidate_cover_loss": candidate_cover_loss,
             "candidate_diversity_loss": candidate_diversity_loss,
             "candidate_conf_loss": candidate_conf_loss,
+            "candidate_enable_loss": candidate_enable_loss,
         }
 
     def training_step(self, batch: Dict) -> Dict:
@@ -1292,17 +1508,21 @@ class ShapeContextVelocityModule(VelocityModule):
         losses = {}
         if (
             self.use_multi_candidate_displacement
+            and branch_label is not None
             and branch_valid is not None
             and branch_normal is not None
             and getattr(self, "_last_candidate_displacement", None) is not None
             and getattr(self, "_last_candidate_confidence", None) is not None
+            and getattr(self, "_last_candidate_enable", None) is not None
         ):
             losses.update(
                 self.get_multi_candidate_branch_losses(
                     pc_noisy=noisy_for_loss,
                     candidate_displacement=self._last_candidate_displacement,
                     candidate_confidence=self._last_candidate_confidence,
+                    candidate_enable=self._last_candidate_enable,
                     pc_clean=clean_for_loss,
+                    branch_label=branch_label,
                     branch_valid=branch_valid,
                     branch_normal=branch_normal,
                 )
